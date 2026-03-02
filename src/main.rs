@@ -38,6 +38,8 @@ enum Commands {
     Go { name: String },
     /// Intelligently chunk and land your work
     Land,
+    /// Instantly revert the last land operation
+    Undo,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -58,6 +60,7 @@ async fn main() -> Result<()> {
     match &cli.command {
         Some(Commands::Go { name }) => go(name),
         Some(Commands::Land) => land().await,
+        Some(Commands::Undo) => undo(),
         None => save(),
     }
 }
@@ -235,6 +238,55 @@ fn manual_fallback(files: HashSet<String>) -> Result<()> {
 
     execute_git(&["commit", "-m", msg])?;
     println!("  {}\n", "└─ Landed".green());
+    Ok(())
+}
+
+// ==========================================
+// THE ESCAPE HATCH (UNDO)
+// ==========================================
+fn undo() -> Result<()> {
+    let pre_land_sha = match check_ref("refs/kite/pre_land") {
+        Some(sha) => sha,
+        None => {
+            println!("{} Nothing to undo. No previous land operation found.", "·".yellow());
+            return Ok(())
+        }
+    };
+
+    // Safety check: ensure the working directory is clean so we don't nuke post-land work
+    let status = execute_git(&["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        anyhow::bail!("Working directory is not clean. Please `kt save` or stash your changes before undoing.");
+    }
+
+    print!("{} Rewinding timeline... ", "·".cyan());
+    io::stdout().flush()?;
+
+    // Instantly teleport back to the exact messy saves
+    execute_git(&["reset", "--hard", &pre_land_sha])?;
+
+    // Clear the marker so we don't accidentally double-undo later
+    execute_git(&["update-ref", "-d", "refs/kite/pre_land"])?;
+    println!("Done");
+
+    if has_remote() {
+        let current_branch = get_current_branch()?;
+        print!("{} Reverting remote... ", "·".cyan());
+        io::stdout().flush()?;
+
+        // Force push the messy state back up to synchronize the remote
+        match Command::new("git")
+            .args(["push", "--force-with-lease", "origin", &current_branch])
+            .stderr(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            {
+                Ok(status) if status.success() => println!("Done"),
+                _ => println!("{}", "Failed (Rmote may have diverged)".yellow()),
+            }
+    }
+
+    println!("  {}\n", "└─ Restored previous saves".green());
     Ok(())
 }
 
@@ -551,6 +603,20 @@ fn has_remote() -> bool {
         .output()
         .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
         .unwrap_or(false)
+}
+
+fn check_ref(ref_name: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", ref_name])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
 }
 
 fn get_kite_base() -> Result<Option<String>> {
