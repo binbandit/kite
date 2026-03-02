@@ -7,15 +7,23 @@ use std::collections::HashSet;
 use std::env;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
-use std::thread::current;
 use std::time::Duration;
 
 const SYSTEM_PROMPT: &str = "\
-You are a version control synthesis engine. Analyze the git diff. 
+You are an expert version control synthesis engine. Analyze the git diff.
 Group the changed files into distinct, atomic commits based on logical purpose.
-Write a Conventional Commit message for each group.
+Write a strict Conventional Commit message for each group.
+
+Rules for commit messages:
+1. Format: <type>(<optional scope>): <description>
+2. Types allowed: feat, fix, docs, style, refactor, perf, test, chore.
+3. Use the imperative, present tense: 'add' not 'added' or 'adds'.
+4. Do not capitalize the first letter of the description.
+5. No trailing periods.
+6. Be highly specific about the technical intent (e.g., 'feat(api): add stripe webhook endpoint', not 'feat: update api').
+
 Return ONLY a valid JSON array of objects. Absolutely no markdown or conversational text.
-Schema: [ { \"message\": \"feat(core): add routing logic\", \"files\": [\"src/router.rs\"] } ]";
+Schema: [ { \"message\": \"feat(auth): implement JWT validation\", \"files\": [\"src/auth.rs\"] } ]";
 
 #[derive(Parser)]
 #[command(name = "kt", about = "Zero-thought continuous synthesis", version)]
@@ -58,14 +66,14 @@ async fn main() -> Result<()> {
 // THE QUICKSAVE
 // ==========================================
 fn save() -> Result<()> {
-    let status = execute_git(&["status", "--porcelain"], false)?;
+    let status = execute_git(&["status", "--porcelain"])?;
     if status.trim().is_empty() {
         return Ok(());
     }
 
-    execute_git(&["add", "-A"], false)?;
+    execute_git(&["add", "-A"])?;
     let msg = format!("[kite] save {}", Local::now().format("%H:%M:%S"));
-    execute_git(&["commit", "-m", &msg, "--no-verify"], false)?;
+    execute_git(&["commit", "-m", &msg, "--no-verify"])?;
 
     println!("{} {}", "·".dimmed(), "saved".dimmed());
     Ok(())
@@ -73,18 +81,19 @@ fn save() -> Result<()> {
 
 fn go(name: &str) -> Result<()> {
     let default_branch = get_default_branch()?;
-    let _ = execute_git(&["fetch", "origin", &default_branch], true);
 
-    execute_git(
-        &[
+    if has_remote() {
+        let _ = execute_git(&["fetch", "origin", &default_branch]);
+        execute_git(&[
             "checkout",
             "-b",
             name,
             &format!("origin/{}", default_branch),
-        ],
-        false,
-    )
-    .or_else(|_| execute_git(&["checkout", "-b", name, &default_branch], false))?;
+        ])
+        .or_else(|_| execute_git(&["checkout", "-b", name, &default_branch]))?;
+    } else {
+        execute_git(&["checkout", "-b", name, &default_branch])?;
+    }
 
     println!("{} Flow started: {}", "·".cyan(), name.bold());
     Ok(())
@@ -102,14 +111,20 @@ async fn land() -> Result<()> {
         return Ok(());
     }
 
-    let default_branch = get_default_branch()?;
+    // 1. unwind ONLY contiguous kite saves
+    if let Some(base) = get_kite_base()? {
+        if base == "root" {
+            // Edge case: Unwinding all the way to before the very first commit
+            execute_git(&["update-ref", "-d", "HEAD"])?;
+        } else {
+            execute_git(&["reset", "--soft", &base])?;
+        }
+    }
 
-    // 1. Soft reset to merge base to squash saves
-    let merge_base = execute_git(&["merge-base", "HEAD", &default_branch], false)?;
-    execute_git(&["reset", "--soft", merge_base.trim()], false)?;
-    execute_git(&["add", "-A"], false)?;
+    // Stage everything (from the squashed saves + any uncommitted working directory changes)
+    execute_git(&["add", "-A"])?;
 
-    let status_output = execute_git(&["diff", "--cached", "--name-only"], false)?;
+    let status_output = execute_git(&["diff", "--cached", "--name-only"])?;
     let mut actual_files: HashSet<String> = status_output
         .lines()
         .map(|s| s.trim().to_string())
@@ -121,8 +136,8 @@ async fn land() -> Result<()> {
         return Ok(());
     }
 
-    let diff = execute_git(&["diff", "--cached"], false)?;
-    execute_git(&["reset"], false)?; // Unstage for surgical commits
+    let diff = execute_git(&["diff", "--cached"])?;
+    execute_git(&["reset"])?; // Unstage for surgical commits
 
     print!("{} Synthesizing... ", "·".cyan());
     io::stdout().flush()?;
@@ -141,11 +156,7 @@ async fn land() -> Result<()> {
             Err(openai_err) => {
                 println!("(manual)");
                 println!("{} Local provider failed: {}", "·".yellow(), local_err);
-                println!(
-                    "{} OpenAI provider failed: {:#}",
-                    "·".yellow(),
-                    openai_err
-                );
+                println!("{} OpenAI provider failed: {:#}", "·".yellow(), openai_err);
                 return manual_fallback(actual_files);
             }
         },
@@ -158,14 +169,14 @@ async fn land() -> Result<()> {
         let mut staged_any = false;
         for file in group.files {
             if actual_files.contains(&file) {
-                execute_git(&["add", &file], false)?;
+                execute_git(&["add", &file])?;
                 actual_files.remove(&file);
                 staged_any = true;
             }
         }
 
         if staged_any {
-            execute_git(&["commit", "-m", &group.message], false)?;
+            execute_git(&["commit", "-m", &group.message])?;
             println!("  {} {}", "│".dimmed(), group.message);
         }
     }
@@ -173,22 +184,29 @@ async fn land() -> Result<()> {
     // 4. Catch remaining unclassified files
     if !actual_files.is_empty() {
         for file in &actual_files {
-            execute_git(&["add", file], false)?;
+            execute_git(&["add", file])?;
         }
-        execute_git(&["commit", "-m", "chore: unclassified updates"], false)?;
+        execute_git(&["commit", "-m", "chore: unclassified updates"])?;
         println!("  {} chore: unclassified updates", "│".dimmed());
     }
 
     // 5. Publish the history to remote
-    let current_branch = get_current_branch()?;
-    print!("{} Publishing to remote... ", "·".cyan());
-    io::stdout().flush()?;
+    if has_remote() {
+        let current_branch = get_current_branch()?;
+        print!("{} Publishing to remote... ", "·".cyan());
+        io::stdout().flush()?;
 
-    // We use force-with-lease because `land` rewrites the local history.
-    // over the top of any previous messy pushes (if you ever pushed your saves).
-    match execute_git(&["push", "--set-upstream", "origin", &current_branch, "--force-with-lease"], false) {
-        Ok(_) => println!("Done"),
-        Err(_) => println!("{}", "Failed (You may need to push manually)".yellow())
+        // We use force-with-lease because `land` rewrites the local history.
+        match execute_git(&[
+            "push",
+            "--set-upstream",
+            "origin",
+            &current_branch,
+            "--force-with-lease",
+        ]) {
+            Ok(_) => println!("Done"),
+            Err(_) => println!("{}", "Failed (You may need to push manually)".yellow()),
+        }
     }
 
     println!("  {}\n", "└─ Landed".green());
@@ -201,7 +219,7 @@ fn manual_fallback(files: HashSet<String>) -> Result<()> {
         "·".yellow()
     );
     for file in files {
-        execute_git(&["add", &file], false)?;
+        execute_git(&["add", &file])?;
     }
 
     print!("{} Commit message: ", "·".cyan());
@@ -215,7 +233,7 @@ fn manual_fallback(files: HashSet<String>) -> Result<()> {
         return Ok(());
     }
 
-    execute_git(&["commit", "-m", msg], false)?;
+    execute_git(&["commit", "-m", msg])?;
     println!("  {}\n", "└─ Landed".green());
     Ok(())
 }
@@ -381,7 +399,8 @@ fn parse_openai_groups(json: &serde_json::Value) -> Result<Vec<CommitGroup>> {
             if let Some(content_items) = item.get("content").and_then(|v| v.as_array()) {
                 for content_item in content_items {
                     if let Some(structured) = content_item.get("json") {
-                        let parsed: CommitGroupsEnvelope = serde_json::from_value(structured.clone())?;
+                        let parsed: CommitGroupsEnvelope =
+                            serde_json::from_value(structured.clone())?;
                         if !parsed.groups.is_empty() {
                             return Ok(parsed.groups);
                         }
@@ -486,28 +505,24 @@ fn extract_first_json_array(raw: &str) -> Option<String> {
 // ==========================================
 // GIT HELPERS
 // ==========================================
-fn execute_git(args: &[&str], silent: bool) -> Result<String> {
-    let mut command = Command::new("git");
-    command.args(args);
-    if silent {
-        command.stderr(Stdio::null()).stdout(Stdio::null());
-        let _ = command.status();
-        return Ok("".to_string());
-    }
-    let output = command
+fn execute_git(args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
         .output()
         .with_context(|| format!("Failed 'git {}'", args.join(" ")))?;
+
     if !output.status.success() {
         anyhow::bail!(
             "Git error: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn get_default_branch() -> Result<String> {
-    let output = execute_git(&["branch", "--list", "main", "master"], false)?;
+    let output = execute_git(&["branch", "--list", "main", "master"])?;
     if output.contains("main") {
         Ok("main".to_string())
     } else {
@@ -526,6 +541,48 @@ fn has_head_commit() -> bool {
 }
 
 fn get_current_branch() -> Result<String> {
-    let output = execute_git(&["rev-parse", "--abbrev-ref", "HEAD"], false)?;
+    let output = execute_git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
     Ok(output.trim().to_string())
+}
+
+fn has_remote() -> bool {
+    Command::new("git")
+        .args(["remote"])
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn get_kite_base() -> Result<Option<String>> {
+    let log_output = match execute_git(&["log", "--format=%H %s"]) {
+        Ok(out) => out,
+        Err(_) => return Ok(None),
+    };
+
+    let mut save_count = 0;
+    let mut base_hash = None;
+
+    for line in log_output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let Some((hash, msg)) = line.split_once(' ') else {
+            continue;
+        };
+
+        if msg.starts_with("[kite] save") {
+            save_count += 1;
+        } else {
+            base_hash = Some(hash.to_string());
+            break;
+        }
+    }
+
+    if save_count > 0 {
+        Ok(Some(base_hash.unwrap_or_else(|| "root".to_string())))
+    } else {
+        Ok(None)
+    }
 }
