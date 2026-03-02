@@ -586,3 +586,79 @@ fn get_kite_base() -> Result<Option<String>> {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn assert_single_group(groups: Vec<CommitGroup>, message: &str, file: &str) {
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].message, message);
+        assert_eq!(groups[0].files, vec![file.to_string()]);
+    }
+
+    #[test]
+    fn extract_first_json_array_ignores_brackets_inside_strings() {
+        let raw = r#"noise "[ignore]" before [{"message":"feat: add parser","files":["src/main.rs"]}] after"#;
+        let extracted = extract_first_json_array(raw).expect("array should be extracted");
+
+        assert_eq!(
+            extracted,
+            r#"[{"message":"feat: add parser","files":["src/main.rs"]}]"#
+        );
+    }
+
+    #[test]
+    fn parse_json_accepts_groups_envelope_shape() {
+        let raw = r#"{"groups":[{"message":"fix: tighten parsing","files":["src/main.rs"]}]}"#;
+        let parsed = parse_json(raw).expect("groups envelope should parse");
+
+        assert_single_group(parsed, "fix: tighten parsing", "src/main.rs");
+    }
+
+    #[test]
+    fn parse_json_extracts_array_from_mixed_text() {
+        let raw = "Result:\n```json\n[{\"message\":\"chore: update deps\",\"files\":[\"Cargo.toml\"]}]\n```";
+        let parsed = parse_json(raw).expect("embedded json array should parse");
+
+        assert_single_group(parsed, "chore: update deps", "Cargo.toml");
+    }
+
+    #[test]
+    fn parse_openai_groups_uses_structured_json_when_present() {
+        let payload = json!({
+            "output": [
+                {
+                    "content": [
+                        {
+                            "json": {
+                                "groups": [
+                                    {
+                                        "message": "feat(cli): add flow command",
+                                        "files": ["src/main.rs"]
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let parsed = parse_openai_groups(&payload).expect("structured output should parse");
+
+        assert_single_group(parsed, "feat(cli): add flow command", "src/main.rs");
+    }
+
+    #[test]
+    fn parse_openai_groups_falls_back_to_output_text() {
+        let payload = json!({
+            "output_text": "[{\"message\":\"docs: clarify readme\",\"files\":[\"README.md\"]}]"
+        });
+
+        let parsed = parse_openai_groups(&payload).expect("output_text should parse");
+
+        assert_single_group(parsed, "docs: clarify readme", "README.md");
+    }
+}
