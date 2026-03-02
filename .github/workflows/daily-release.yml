@@ -1,0 +1,187 @@
+name: Daily Release
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag="$(date -u +'%Y.%m.%d')"
+          cargo_version="$(date -u +'%Y.%-m.%-d')"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+          latest_tag="$(git tag --list '[0-9][0-9][0-9][0-9].[0-1][0-9].[0-3][0-9]' --sort=-version:refname | head -n 1)"
+          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$latest_tag" ]; then
+            range="HEAD"
+          else
+            range="$latest_tag..HEAD"
+          fi
+
+          echo "range=$range" >> "$GITHUB_OUTPUT"
+
+          meaningful_count="$(git log "$range" --pretty=format:'%an%x09%s' | awk -F'\t' '$1 != "github-actions[bot]" && $2 !~ /^chore\(release\): / {count++} END {print count+0}')"
+          echo "meaningful_count=$meaningful_count" >> "$GITHUB_OUTPUT"
+
+          existing_release_commit="$(git log --format='%H' --author='github-actions\[bot\]' --grep="^chore(release): $release_tag " -n 1 || true)"
+          echo "existing_release_commit=$existing_release_commit" >> "$GITHUB_OUTPUT"
+
+          if [ "$meaningful_count" -gt 0 ] || [ -n "$existing_release_commit" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git rev-parse --verify --quiet "refs/tags/$release_tag" >/dev/null; then
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate release notes
+        if: steps.meta.outputs.changed == 'true' && steps.meta.outputs.tag_exists == 'false' && steps.meta.outputs.meaningful_count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          range='${{ steps.meta.outputs.range }}'
+
+          {
+            echo "## Changes"
+            echo
+            git log "$range" --pretty=format:'%H%x09%an%x09%s' --reverse \
+              | awk -F'\t' -v repo_url="$repo_url" '$2 != "github-actions[bot]" && $3 !~ /^chore\(release\): / {
+                  short_sha = substr($1, 1, 7)
+                  printf("- %s ([`%s`](%s/commit/%s))\n", $3, short_sha, repo_url, $1)
+                }'
+          } > release_notes.md
+
+      - name: Update Cargo metadata and changelog
+        if: steps.meta.outputs.changed == 'true' && steps.meta.outputs.tag_exists == 'false' && steps.meta.outputs.meaningful_count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          cargo_version = "${{ steps.meta.outputs.cargo_version }}"
+          release_tag = "${{ steps.meta.outputs.release_tag }}"
+
+          cargo_toml = Path("Cargo.toml")
+          content = cargo_toml.read_text()
+
+          package_block = re.compile(r"(\[package\][\s\S]*?\nversion\s*=\s*\")([^"]+)(\")", re.MULTILINE)
+          updated, count = package_block.subn(rf"\g<1>{cargo_version}\g<3>", content, count=1)
+          if count != 1:
+              raise SystemExit("Failed to update [package] version in Cargo.toml")
+
+          cargo_toml.write_text(updated)
+
+          notes = Path("release_notes.md").read_text().strip()
+          changelog = Path("CHANGELOG.md")
+
+          if changelog.exists():
+              existing = changelog.read_text()
+          else:
+              existing = "# Changelog\n"
+
+          if existing.startswith("# Changelog"):
+              remainder = existing.split("\n", 1)[1].lstrip("\n")
+          else:
+              remainder = existing
+
+          section = f"## {release_tag}\n\n{notes}\n"
+          final = "# Changelog\n\n" + section
+          if remainder.strip():
+              final += "\n" + remainder.rstrip() + "\n"
+
+          changelog.write_text(final)
+          PY
+
+          cargo generate-lockfile
+
+      - name: Validate release files
+        if: steps.meta.outputs.changed == 'true' && steps.meta.outputs.tag_exists == 'false' && steps.meta.outputs.meaningful_count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked
+
+      - name: Commit and push release files
+        id: commit
+        if: steps.meta.outputs.changed == 'true' && steps.meta.outputs.tag_exists == 'false' && steps.meta.outputs.meaningful_count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+
+          if git diff --cached --quiet; then
+            echo "commit_sha=" >> "$GITHUB_OUTPUT"
+            echo "No release file changes detected; skipping commit and release."
+            exit 0
+          fi
+
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "chore(release): ${{ steps.meta.outputs.release_tag }} [skip release]"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release (new artifacts)
+        if: steps.meta.outputs.changed == 'true' && steps.meta.outputs.tag_exists == 'false' && steps.commit.outputs.commit_sha != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: Release ${{ steps.meta.outputs.release_tag }}
+          target_commitish: ${{ steps.commit.outputs.commit_sha }}
+          body_path: release_notes.md
+          generate_release_notes: false
+
+      - name: Create GitHub release (retry mode)
+        if: steps.meta.outputs.changed == 'true' && steps.meta.outputs.tag_exists == 'false' && steps.meta.outputs.meaningful_count == '0' && steps.meta.outputs.existing_release_commit != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: Release ${{ steps.meta.outputs.release_tag }}
+          target_commitish: ${{ steps.meta.outputs.existing_release_commit }}
+          generate_release_notes: true
+
+      - name: Skip release
+        if: steps.meta.outputs.changed != 'true' || steps.meta.outputs.tag_exists == 'true'
+        shell: bash
+        run: |
+          if [ "${{ steps.meta.outputs.tag_exists }}" = "true" ]; then
+            echo "Release tag ${{ steps.meta.outputs.release_tag }} already exists. Skipping."
+          elif [ "${{ steps.meta.outputs.changed }}" != "true" ]; then
+            echo "No non-release commits since the latest release tag. Skipping."
+          else
+            echo "Workflow conditions did not match release criteria. Skipping."
+          fi
