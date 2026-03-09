@@ -23,6 +23,8 @@ kt
 
 That’s it. Kite instantly stages everything and creates a silent snapshot (`[kite] save 14:02`). It executes in milliseconds. You literally cannot lose work, and your flow state is never broken.
 
+Quicksaves intentionally skip Git hooks to stay instant. Landing commits use normal `git commit` behavior, so your repository's configured Git hooks still run before polished history is written.
+
 ### 2. Delivering: Semantic Auto-Staging
 
 When you are done with a feature, your history is full of messy quicksaves. You type:
@@ -118,4 +120,3 @@ Kite is built to be utterly bulletproof:
 ---
 
 *Built for developers who just want to write code.*
-
