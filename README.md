@@ -56,6 +56,34 @@ cargo install --path .
 
 ```
 
+## Install The Agent Skill
+
+This repo also ships an installable agent skill at `skills/use-kite`.
+
+Install it from GitHub with the `skills` CLI:
+
+```bash
+npx skills add https://github.com/binbandit/kite --skill use-kite
+```
+
+Install it specifically for Codex:
+
+```bash
+npx skills add https://github.com/binbandit/kite --skill use-kite -a codex
+```
+
+Install it globally so it is available across projects:
+
+```bash
+npx skills add https://github.com/binbandit/kite --skill use-kite -a codex -g
+```
+
+If you are testing from a local checkout, install from the current directory instead:
+
+```bash
+npx skills add . --skill use-kite -a codex
+```
+
 ## Usage
 
 ### `kt go <idea>`
