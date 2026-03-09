@@ -182,7 +182,10 @@ async fn land() -> Result<()> {
 
         if staged_any {
             commit_git(&group.message)?;
-            println!("  {} {}", "│".dimmed(), group.message);
+            println!(
+                "{}",
+                render_tree_line(&format!("{}", "│".dimmed()), &group.message)
+            );
         }
     }
 
@@ -192,13 +195,19 @@ async fn land() -> Result<()> {
             execute_git(&["add", file])?;
         }
         commit_git("chore: unclassified updates")?;
-        println!("  {} chore: unclassified updates", "│".dimmed());
+        println!(
+            "{}",
+            render_tree_line(&format!("{}", "│".dimmed()), "chore: unclassified updates")
+        );
     }
 
     // 5. Publish the history to remote
     if has_remote() {
         let current_branch = get_current_branch()?;
-        print!("{} Publishing to remote... ", "·".cyan());
+        print!(
+            "{} ",
+            render_tree_line(&format!("{}", "│".dimmed()), "Publishing to remote...")
+        );
         io::stdout().flush()?;
 
         // We use force-with-lease because `land` rewrites the local history.
@@ -214,7 +223,7 @@ async fn land() -> Result<()> {
         }
     }
 
-    println!("  {}\n", "└─ Landed".green());
+    println!("{}\n", render_tree_tail("Landed").green());
     Ok(())
 }
 
@@ -239,7 +248,7 @@ fn manual_fallback(files: HashSet<String>) -> Result<()> {
     }
 
     commit_git(msg)?;
-    println!("  {}\n", "└─ Landed".green());
+    println!("{}\n", render_tree_tail("Landed").green());
     Ok(())
 }
 
@@ -666,6 +675,14 @@ fn indent_block(text: &str) -> String {
         .join("\n")
 }
 
+fn render_tree_line(prefix: &str, message: &str) -> String {
+    format!("  {} {}", prefix, message)
+}
+
+fn render_tree_tail(message: &str) -> String {
+    format!("  └─ {}", message)
+}
+
 fn get_default_branch() -> Result<String> {
     let output = execute_git(&["branch", "--list", "main", "master"])?;
     if output.contains("main") {
@@ -845,5 +862,14 @@ mod tests {
         let parsed = parse_openai_groups(&payload).expect("output_text should parse");
 
         assert_single_group(parsed, "docs: clarify readme", "README.md");
+    }
+
+    #[test]
+    fn render_tree_lines_match_land_summary_layout() {
+        assert_eq!(
+            render_tree_line("│", "Publishing to remote... Done"),
+            "  │ Publishing to remote... Done"
+        );
+        assert_eq!(render_tree_tail("Landed"), "  └─ Landed");
     }
 }
