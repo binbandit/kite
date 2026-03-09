@@ -12,7 +12,9 @@
 
 - Run `git status --porcelain`.
 - If the worktree is clean, exit without creating a commit.
+- If the index already contains staged changes, create a quicksave from only that staged selection.
 - Otherwise run `git add -A` and create a quicksave commit with message `[kite] save HH:MM:SS`.
+- The normal recommended workflow is still to let Kite quicksave everything; staged-only quicksaves are an explicit override.
 - Pass `--no-verify`, so Git hooks do not run for quicksaves.
 
 ### `kt land`

@@ -76,7 +76,9 @@ fn save() -> Result<()> {
         return Ok(());
     }
 
-    execute_git(&["add", "-A"])?;
+    if !has_staged_changes(&status) {
+        execute_git(&["add", "-A"])?;
+    }
     let msg = format!("[kite] save {}", Local::now().format("%H:%M:%S"));
     execute_git(&["commit", "-m", &msg, "--no-verify"])?;
 
@@ -589,6 +591,14 @@ fn execute_git(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn has_staged_changes(status: &str) -> bool {
+    status.lines().any(|line| {
+        line.chars()
+            .next()
+            .is_some_and(|status_code| status_code != ' ' && status_code != '?')
+    })
+}
+
 fn commit_git(message: &str) -> Result<()> {
     let output = Command::new("git")
         .args(["commit", "-m", message])
@@ -767,11 +777,89 @@ fn get_kite_base() -> Result<Option<String>> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn assert_single_group(groups: Vec<CommitGroup>, message: &str, file: &str) {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].message, message);
         assert_eq!(groups[0].files, vec![file.to_string()]);
+    }
+
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct TempRepo {
+        path: PathBuf,
+    }
+
+    impl TempRepo {
+        fn new() -> Self {
+            let unique = format!(
+                "kite-test-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time should be after unix epoch")
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique);
+            fs::create_dir_all(&path).expect("temp repo directory should be created");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git command should run");
+
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    fn write_file(repo: &Path, path: &str, contents: &str) {
+        fs::write(repo.join(path), contents).expect("test file should be written");
+    }
+
+    fn run_save_in_repo(repo: &Path) -> Result<()> {
+        let original_dir = std::env::current_dir().expect("current dir should resolve");
+        std::env::set_current_dir(repo).expect("should enter temp repo");
+        let result = save();
+        std::env::set_current_dir(&original_dir).expect("should restore original cwd");
+        result
+    }
+
+    fn init_repo() -> TempRepo {
+        let repo = TempRepo::new();
+        git(&repo.path, &["init"]);
+        git(&repo.path, &["config", "user.name", "Kite Test"]);
+        git(&repo.path, &["config", "user.email", "kite@example.com"]);
+
+        write_file(&repo.path, "tracked.txt", "base\n");
+        write_file(&repo.path, "other.txt", "base\n");
+        git(&repo.path, &["add", "tracked.txt", "other.txt"]);
+        git(&repo.path, &["commit", "-m", "chore: initial"]);
+
+        repo
     }
 
     #[test]
@@ -871,5 +959,64 @@ mod tests {
             "  │ Publishing to remote... Done"
         );
         assert_eq!(render_tree_tail("Landed"), "  └─ Landed");
+    }
+
+    #[test]
+    fn has_staged_changes_detects_index_entries() {
+        assert!(has_staged_changes("M  src/main.rs\n"));
+        assert!(has_staged_changes("A  new.rs\n"));
+        assert!(has_staged_changes("MM src/main.rs\n"));
+    }
+
+    #[test]
+    fn has_staged_changes_ignores_only_unstaged_and_untracked_entries() {
+        assert!(!has_staged_changes(" M src/main.rs\n"));
+        assert!(!has_staged_changes("?? scratch.txt\n"));
+        assert!(!has_staged_changes(" M src/main.rs\n?? scratch.txt\n"));
+    }
+
+    #[test]
+    fn save_commits_only_pre_staged_changes() {
+        let _lock = cwd_lock().lock().expect("cwd lock should be acquired");
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "staged change\n");
+        write_file(&repo.path, "other.txt", "left unstaged\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+
+        run_save_in_repo(&repo.path).expect("save should succeed");
+
+        let saved_files = git(
+            &repo.path,
+            &["show", "--name-only", "--pretty=format:", "HEAD"],
+        );
+        assert_eq!(saved_files.trim(), "tracked.txt");
+
+        let status = git(&repo.path, &["status", "--porcelain"]);
+        assert!(status.contains(" M other.txt"));
+    }
+
+    #[test]
+    fn save_stages_everything_when_index_is_empty() {
+        let _lock = cwd_lock().lock().expect("cwd lock should be acquired");
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "modified without staging\n");
+        write_file(&repo.path, "new.txt", "brand new file\n");
+
+        run_save_in_repo(&repo.path).expect("save should succeed");
+
+        let saved_files = git(
+            &repo.path,
+            &["show", "--name-only", "--pretty=format:", "HEAD"],
+        );
+        assert!(saved_files.lines().any(|line| line == "tracked.txt"));
+        assert!(saved_files.lines().any(|line| line == "new.txt"));
+
+        let status = git(&repo.path, &["status", "--porcelain"]);
+        assert!(
+            status.trim().is_empty(),
+            "expected clean status, got: {status}"
+        );
     }
 }

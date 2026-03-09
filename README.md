@@ -21,7 +21,9 @@ kt
 
 ```
 
-That’s it. Kite instantly stages everything and creates a silent snapshot (`[kite] save 14:02`). It executes in milliseconds. You literally cannot lose work, and your flow state is never broken.
+That’s it. By default, Kite instantly stages everything and creates a silent snapshot (`[kite] save 14:02`). It executes in milliseconds. You literally cannot lose work, and your flow state is never broken.
+
+If you have already staged a specific subset yourself, Kite respects that selection and quicksaves only the staged changes. That path is there for deliberate exceptions; the normal recommended workflow is still to let Kite capture everything for you.
 
 Quicksaves intentionally skip Git hooks to stay instant. Landing commits use normal `git commit` behavior, so your repository's configured Git hooks still run before polished history is written.
 
