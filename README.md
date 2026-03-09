@@ -134,8 +134,11 @@ If your local model is offline, Kite seamlessly falls back to OpenAI.
 
 ```bash
 export OPENAI_API_KEY="sk-..."
+export KITE_OPENAI_MODEL="gpt-5-mini"
 
 ```
+
+Kite reads the OpenAI model from `KITE_OPENAI_MODEL` or `OPENAI_MODEL`. If neither is set, it defaults to `gpt-5-nano`.
 
 **3. Manual Fallback**
 If you have no internet and no local model, Kite instantly drops you into a minimal manual prompt. You are never blocked from landing your code.
