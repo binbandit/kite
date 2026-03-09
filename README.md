@@ -52,7 +52,7 @@ It automatically stages specific files together and writes atomic, Conventional 
 Ensure you have Rust installed, then build and install the binary globally:
 
 ```bash
-git clone <your-repo-url> kite
+git clone https://github.com/binbandit/kite.git kite
 cd kite
 cargo install --path .
 
