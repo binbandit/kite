@@ -9,6 +9,8 @@ use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+const MAX_COMMIT_FAILURE_LINES: usize = 12;
+
 const SYSTEM_PROMPT: &str = "\
 You are an expert version control synthesis engine. Analyze the git diff.
 Group the changed files into distinct, atomic commits based on logical purpose.
@@ -179,7 +181,7 @@ async fn land() -> Result<()> {
         }
 
         if staged_any {
-            execute_git(&["commit", "-m", &group.message])?;
+            commit_git(&group.message)?;
             println!("  {} {}", "│".dimmed(), group.message);
         }
     }
@@ -189,7 +191,7 @@ async fn land() -> Result<()> {
         for file in &actual_files {
             execute_git(&["add", file])?;
         }
-        execute_git(&["commit", "-m", "chore: unclassified updates"])?;
+        commit_git("chore: unclassified updates")?;
         println!("  {} chore: unclassified updates", "│".dimmed());
     }
 
@@ -236,7 +238,7 @@ fn manual_fallback(files: HashSet<String>) -> Result<()> {
         return Ok(());
     }
 
-    execute_git(&["commit", "-m", msg])?;
+    commit_git(msg)?;
     println!("  {}\n", "└─ Landed".green());
     Ok(())
 }
@@ -248,15 +250,20 @@ fn undo() -> Result<()> {
     let pre_land_sha = match check_ref("refs/kite/pre_land") {
         Some(sha) => sha,
         None => {
-            println!("{} Nothing to undo. No previous land operation found.", "·".yellow());
-            return Ok(())
+            println!(
+                "{} Nothing to undo. No previous land operation found.",
+                "·".yellow()
+            );
+            return Ok(());
         }
     };
 
     // Safety check: ensure the working directory is clean so we don't nuke post-land work
     let status = execute_git(&["status", "--porcelain"])?;
     if !status.trim().is_empty() {
-        anyhow::bail!("Working directory is not clean. Please `kt save` or stash your changes before undoing.");
+        anyhow::bail!(
+            "Working directory is not clean. Please `kt save` or stash your changes before undoing."
+        );
     }
 
     print!("{} Rewinding timeline... ", "·".cyan());
@@ -280,10 +287,10 @@ fn undo() -> Result<()> {
             .stderr(Stdio::null())
             .stdout(Stdio::null())
             .status()
-            {
-                Ok(status) if status.success() => println!("Done"),
-                _ => println!("{}", "Failed (Rmote may have diverged)".yellow()),
-            }
+        {
+            Ok(status) if status.success() => println!("Done"),
+            _ => println!("{}", "Failed (Rmote may have diverged)".yellow()),
+        }
     }
 
     println!("  {}\n", "└─ Restored previous saves".green());
@@ -573,6 +580,92 @@ fn execute_git(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn commit_git(message: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["commit", "-m", message])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed 'git commit -m {}'", message))?;
+
+    let output = output
+        .wait_with_output()
+        .with_context(|| format!("Failed while waiting on 'git commit -m {}'", message))?;
+
+    if !output.status.success() {
+        let rendered_output = compact_command_output(
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        );
+        anyhow::bail!("{}", render_commit_failure(message, &rendered_output));
+    }
+
+    Ok(())
+}
+
+fn compact_command_output(stdout: &str, stderr: &str) -> String {
+    let lines: Vec<String> = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let visible_lines = if lines.len() > MAX_COMMIT_FAILURE_LINES {
+        let omitted = lines.len() - MAX_COMMIT_FAILURE_LINES;
+        let mut trimmed = vec![format!("... {} earlier line(s) omitted", omitted)];
+        trimmed.extend(
+            lines[lines.len() - MAX_COMMIT_FAILURE_LINES..]
+                .iter()
+                .cloned(),
+        );
+        trimmed
+    } else {
+        lines
+    };
+
+    visible_lines.join("\n")
+}
+
+fn render_commit_failure(message: &str, details: &str) -> String {
+    let details_lower = details.to_ascii_lowercase();
+    let summary = if ["hook", "pre-commit", "commit-msg", "pre-push"]
+        .iter()
+        .any(|marker| details_lower.contains(marker))
+    {
+        "Git hook blocked the commit"
+    } else {
+        "Git rejected the commit"
+    };
+
+    if details.is_empty() {
+        return format!(
+            "{} for `{}`. Staged changes were left in place.",
+            summary, message
+        );
+    }
+
+    format!(
+        "{} for `{}`. Staged changes were left in place.\n\n{}",
+        summary,
+        message,
+        indent_block(details)
+    )
+}
+
+fn indent_block(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("  {}", line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn get_default_branch() -> Result<String> {
     let output = execute_git(&["branch", "--list", "main", "master"])?;
     if output.contains("main") {
@@ -662,6 +755,32 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].message, message);
         assert_eq!(groups[0].files, vec![file.to_string()]);
+    }
+
+    #[test]
+    fn compact_command_output_keeps_last_lines_and_truncates_noise() {
+        let stderr = (1..=14)
+            .map(|line| format!("stderr line {}", line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let compacted = compact_command_output("", &stderr);
+
+        assert!(compacted.contains("... 2 earlier line(s) omitted"));
+        assert!(compacted.contains("stderr line 14"));
+        assert!(!compacted.contains("stderr line 1\n"));
+    }
+
+    #[test]
+    fn render_commit_failure_marks_hook_rejections() {
+        let rendered = render_commit_failure(
+            "feat(cli): tighten hooks",
+            "pre-commit: cargo fmt --check failed",
+        );
+
+        assert!(rendered.contains("Git hook blocked the commit"));
+        assert!(rendered.contains("Staged changes were left in place."));
+        assert!(rendered.contains("  pre-commit: cargo fmt --check failed"));
     }
 
     #[test]
