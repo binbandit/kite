@@ -206,6 +206,18 @@ async fn land() -> Result<()> {
     // 5. Publish the history to remote
     if has_remote() {
         let current_branch = get_current_branch()?;
+
+        // Pull remote changes before pushing so we don't diverge.
+        print!(
+            "{} ",
+            render_tree_line(&format!("{}", "│".dimmed()), "Pulling remote changes...")
+        );
+        io::stdout().flush()?;
+        match execute_git(&["pull", "--rebase", "origin", &current_branch]) {
+            Ok(_) => println!("Done"),
+            Err(_) => println!("{}", "Skipped (no upstream or nothing to pull)".dimmed()),
+        }
+
         print!(
             "{} ",
             render_tree_line(&format!("{}", "│".dimmed()), "Publishing to remote...")
