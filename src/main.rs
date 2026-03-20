@@ -155,15 +155,13 @@ async fn land() -> Result<()> {
             println!("(local)");
             g
         }
-        Err(local_err) => match try_openai(&diff).await {
+        Err(_) => match try_openai(&diff).await {
             Ok(g) => {
                 println!("(cloud)");
                 g
             }
-            Err(openai_err) => {
-                println!("(manual)");
-                println!("{} Local provider failed: {}", "·".yellow(), local_err);
-                println!("{} OpenAI provider failed: {:#}", "·".yellow(), openai_err);
+            Err(_) => {
+                println!("{}", "unavailable".dimmed());
                 return manual_fallback(actual_files);
             }
         },
@@ -242,10 +240,7 @@ async fn land() -> Result<()> {
 }
 
 fn manual_fallback(files: HashSet<String>) -> Result<()> {
-    println!(
-        "\n{} AI synthesis unavailable. Performing manual squash.",
-        "·".yellow()
-    );
+    println!();
     for file in files {
         execute_git(&["add", &file])?;
     }
@@ -424,7 +419,7 @@ fn get_openai_env_config() -> Result<(String, String, String)> {
     .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
     let model = first_non_empty_env(&["KITE_OPENAI_MODEL", "OPENAI_MODEL"])
-        .unwrap_or_else(|| "gpt-5-nano".to_string());
+        .unwrap_or_else(|| "gpt-5.4-mini".to_string());
 
     let api_key = first_non_empty_env(&[
         "KITE_OPENAI_API_KEY",
