@@ -26,9 +26,11 @@
   1. Local Ollama at `http://localhost:11434/api/chat` with `KITE_LOCAL_MODEL` or default `llama3`
   2. OpenAI Responses API using the configured base URL, model, and API key
   3. Manual fallback that asks for one Conventional Commit message and squashes everything into it
+- If both AI providers fail, Kite suppresses the provider error details and drops straight to the manual fallback prompt.
 - Create grouped commits from the provider output. Leftover files become `chore: unclassified updates`.
 - Run normal `git commit`, so hooks do run during landing.
-- If a remote exists, push the current branch with `--set-upstream origin <branch> --force-with-lease`.
+- If a remote exists, first try `git pull --rebase origin <branch>`.
+- After that, push the current branch with `--set-upstream origin <branch> --force-with-lease`.
 
 ### `kt undo`
 
@@ -42,7 +44,12 @@
 - Base URL: `KITE_OPENAI_URL`, `KITE_OPENAI_BASE_URL`, `OPENAI_URL`, `OPENAI_BASE_URL`
 - Model: `KITE_OPENAI_MODEL`, `OPENAI_MODEL`
 - API key: `KITE_OPENAI_API_KEY`, `OPENAI_API_KEY`, `KITE_API_KEY`, `OPENAI_KEY`
-- If the base URL does not end in `/v1`, Kite normalizes it before calling `/responses`.
+- Default base URL: `https://api.openai.com/v1`
+- Default model: `gpt-5.4-mini`
+- Kite normalizes base URLs before calling `/responses`:
+  - strips a trailing `/responses`
+  - strips a trailing `/chat/completions`
+  - appends `/v1` when it is missing
 
 ## Practical preflight checks
 
