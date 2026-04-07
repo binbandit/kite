@@ -10,25 +10,30 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const MAX_COMMIT_FAILURE_LINES: usize = 12;
+const MAX_COMMIT_STYLE_EXAMPLES: usize = 6;
 
 const SYSTEM_PROMPT: &str = "\
 You are an expert version control synthesis engine. Analyze the git diff.
 Group the changed files into distinct, atomic commits based on logical purpose.
-Write a strict Conventional Commit message for each group.
+Write commit messages that match the repository's recent style examples when they show a clear pattern. If the examples are mixed or absent, fall back to a Conventional Commit style.
 
 Rules for commit messages:
-1. Format: <type>(<optional scope>): <description>
-2. Types allowed: feat, fix, docs, style, refactor, perf, test, chore.
+1. Match the repository's recent wording, prefixes, and scope style when those examples are consistent.
+2. If no clear style emerges from the examples, use: <type>(<optional scope>): <description>
 3. Use the imperative, present tense: 'add' not 'added' or 'adds'.
-4. Do not capitalize the first letter of the description.
+4. Keep the message concise and specific about technical intent.
 5. No trailing periods.
-6. Be highly specific about the technical intent (e.g., 'feat(api): add stripe webhook endpoint', not 'feat: update api').
+6. Never emit `[kite] save` as a landed commit message.
 
 Return ONLY a valid JSON array of objects. Absolutely no markdown or conversational text.
 Schema: [ { \"message\": \"feat(auth): implement JWT validation\", \"files\": [\"src/auth.rs\"] } ]";
 
 #[derive(Parser)]
-#[command(name = "kt", about = "Zero-thought continuous synthesis", version)]
+#[command(
+    name = "kt",
+    about = "Fast quicksaves and inspectable AI-assisted landing",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -38,8 +43,17 @@ struct Cli {
 enum Commands {
     /// Start a new flow
     Go { name: String },
-    /// Intelligently chunk and land your work
-    Land,
+    /// Intelligently chunk Kite saves into local commits
+    Land {
+        /// Publish the rewritten branch after landing
+        #[arg(long)]
+        push: bool,
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Publish the current branch after reviewing local history
+    Publish,
     /// Instantly revert the last land operation
     Undo,
 }
@@ -55,13 +69,33 @@ struct CommitGroupsEnvelope {
     groups: Vec<CommitGroup>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum KiteBase {
+    Root,
+    Commit(String),
+}
+
+#[derive(Clone, Debug)]
+struct LandScope {
+    base: KiteBase,
+    diff: String,
+    actual_files: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderFailure {
+    provider: &'static str,
+    error: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
         Some(Commands::Go { name }) => go(name),
-        Some(Commands::Land) => land().await,
+        Some(Commands::Land { push, yes }) => land(*push, *yes).await,
+        Some(Commands::Publish) => publish_current_branch(),
         Some(Commands::Undo) => undo(),
         None => save(),
     }
@@ -109,155 +143,337 @@ fn go(name: &str) -> Result<()> {
 // ==========================================
 // SYNTHESIS & LANDING
 // ==========================================
-async fn land() -> Result<()> {
+async fn land(push: bool, auto_confirm: bool) -> Result<()> {
+    let Some(scope) = collect_land_scope()? else {
+        return Ok(());
+    };
+
+    print!("{} Synthesizing... ", "·".cyan());
+    io::stdout().flush()?;
+
+    let (raw_groups, provider_label) = match synthesize_groups(&scope.diff).await {
+        Ok((groups, provider_label)) => {
+            println!("({provider_label})");
+            (groups, provider_label)
+        }
+        Err(failures) => {
+            println!("{}", "unavailable".dimmed());
+            let Some(message) = prompt_manual_commit_message(&failures)? else {
+                println!("{} Aborted. No history changed.", "·".red());
+                return Ok(());
+            };
+            (
+                vec![CommitGroup {
+                    message,
+                    files: sorted_files(&scope.actual_files),
+                }],
+                "manual",
+            )
+        }
+    };
+
+    let groups = normalize_groups(raw_groups, &scope.actual_files);
+    if groups.is_empty() {
+        anyhow::bail!("No changed files were assigned to landed commit groups.");
+    }
+
+    println!();
+    print_land_plan(&groups, provider_label);
+
+    if !auto_confirm && !confirm_land(push)? {
+        println!("{} Aborted. No history changed.", "·".red());
+        return Ok(());
+    }
+
+    execute_land(&scope.base, &groups)?;
+
+    if push {
+        publish_current_branch()?;
+        println!("{}\n", render_tree_tail("Landed and published").green());
+    } else {
+        if has_remote() {
+            let current_branch = get_current_branch()?;
+            println!(
+                "{} Review the rewritten history, then run `kt publish` or `git push --force-with-lease origin {}`.",
+                "·".dimmed(),
+                current_branch
+            );
+        }
+        println!("{}\n", render_tree_tail("Landed locally").green());
+    }
+
+    Ok(())
+}
+
+fn collect_land_scope() -> Result<Option<LandScope>> {
     if !has_head_commit() {
         println!(
             "{} Repository has no commits yet. Create an initial commit before running `kt land`.",
             "·".yellow()
         );
-        return Ok(());
+        return Ok(None);
     }
 
-    // 1. unwind ONLY contiguous kite saves
-    if let Some(base) = get_kite_base()? {
-        if base == "root" {
-            // Edge case: Unwinding all the way to before the very first commit
-            execute_git(&["update-ref", "-d", "HEAD"])?;
-        } else {
-            execute_git(&["reset", "--soft", &base])?;
-        }
+    let status = execute_git(&["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        anyhow::bail!(
+            "Working directory must be clean before `kt land`. Run `kt` to snapshot current work or stash unrelated changes first."
+        );
     }
 
-    // Stage everything (from the squashed saves + any uncommitted working directory changes)
-    execute_git(&["add", "-A"])?;
-
-    let status_output = execute_git(&["diff", "--cached", "--name-only"])?;
-    let mut actual_files: HashSet<String> = status_output
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if actual_files.is_empty() {
-        println!("{} Working directory clean.", "·".dimmed());
-        return Ok(());
-    }
-
-    let diff = execute_git(&["diff", "--cached"])?;
-    execute_git(&["reset"])?; // Unstage for surgical commits
-
-    print!("{} Synthesizing... ", "·".cyan());
-    io::stdout().flush()?;
-
-    // 2. Cascade through AI providers
-    let groups = match try_local_ollama(&diff).await {
-        Ok(g) => {
-            println!("(local)");
-            g
-        }
-        Err(_) => match try_openai(&diff).await {
-            Ok(g) => {
-                println!("(cloud)");
-                g
-            }
-            Err(_) => {
-                println!("{}", "unavailable".dimmed());
-                return manual_fallback(actual_files);
-            }
-        },
+    let Some(base) = get_kite_base()? else {
+        println!(
+            "{} Nothing to land. Create one or more contiguous `[kite] save` commits first.",
+            "·".dimmed()
+        );
+        return Ok(None);
     };
 
-    println!(); // Spacing
+    let diff = diff_for_base(&base)?;
+    let actual_files = changed_files_for_base(&base)?;
 
-    // 3. Execution
+    if actual_files.is_empty() {
+        println!(
+            "{} Nothing to land. No file changes were found.",
+            "·".dimmed()
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(LandScope {
+        base,
+        diff,
+        actual_files,
+    }))
+}
+
+async fn synthesize_groups(
+    diff: &str,
+) -> std::result::Result<(Vec<CommitGroup>, &'static str), Vec<ProviderFailure>> {
+    match try_local_ollama(diff).await {
+        Ok(groups) => return Ok((groups, "local")),
+        Err(local_error) => match try_openai(diff).await {
+            Ok(groups) => return Ok((groups, "cloud")),
+            Err(openai_error) => {
+                return Err(vec![
+                    ProviderFailure {
+                        provider: "local",
+                        error: format!("{local_error:#}"),
+                    },
+                    ProviderFailure {
+                        provider: "cloud",
+                        error: format!("{openai_error:#}"),
+                    },
+                ]);
+            }
+        },
+    }
+}
+
+fn normalize_groups(groups: Vec<CommitGroup>, actual_files: &HashSet<String>) -> Vec<CommitGroup> {
+    let mut remaining = actual_files.clone();
+    let mut normalized = Vec::new();
+
     for group in groups {
-        let mut staged_any = false;
+        let mut files = Vec::new();
         for file in group.files {
-            if actual_files.contains(&file) {
-                execute_git(&["add", &file])?;
-                actual_files.remove(&file);
-                staged_any = true;
+            if remaining.remove(&file) {
+                files.push(file);
             }
         }
 
-        if staged_any {
-            commit_git(&group.message)?;
+        if !files.is_empty() {
+            normalized.push(CommitGroup {
+                message: group.message.trim().to_string(),
+                files,
+            });
+        }
+    }
+
+    if !remaining.is_empty() {
+        normalized.push(CommitGroup {
+            message: "chore: unclassified updates".to_string(),
+            files: sorted_files(&remaining),
+        });
+    }
+
+    normalized
+}
+
+fn print_land_plan(groups: &[CommitGroup], provider_label: &str) {
+    println!(
+        "{} Proposed history using {} synthesis:",
+        "·".cyan(),
+        provider_label
+    );
+
+    for group in groups {
+        println!(
+            "{}",
+            render_tree_line(
+                &format!("{}", "│".dimmed()),
+                &format!(
+                    "{} ({})",
+                    group.message,
+                    pluralize(group.files.len(), "file")
+                ),
+            )
+        );
+        for file in &group.files {
             println!(
                 "{}",
-                render_tree_line(&format!("{}", "│".dimmed()), &group.message)
+                render_tree_line(&format!("{} {}", "│".dimmed(), "├─".dimmed()), file)
             );
         }
     }
-
-    // 4. Catch remaining unclassified files
-    if !actual_files.is_empty() {
-        for file in &actual_files {
-            execute_git(&["add", file])?;
-        }
-        commit_git("chore: unclassified updates")?;
-        println!(
-            "{}",
-            render_tree_line(&format!("{}", "│".dimmed()), "chore: unclassified updates")
-        );
-    }
-
-    // 5. Publish the history to remote
-    if has_remote() {
-        let current_branch = get_current_branch()?;
-
-        // Pull remote changes before pushing so we don't diverge.
-        print!(
-            "{} ",
-            render_tree_line(&format!("{}", "│".dimmed()), "Pulling remote changes...")
-        );
-        io::stdout().flush()?;
-        match execute_git(&["pull", "--rebase", "origin", &current_branch]) {
-            Ok(_) => println!("Done"),
-            Err(_) => println!("{}", "Skipped (no upstream or nothing to pull)".dimmed()),
-        }
-
-        print!(
-            "{} ",
-            render_tree_line(&format!("{}", "│".dimmed()), "Publishing to remote...")
-        );
-        io::stdout().flush()?;
-
-        // We use force-with-lease because `land` rewrites the local history.
-        match execute_git(&[
-            "push",
-            "--set-upstream",
-            "origin",
-            &current_branch,
-            "--force-with-lease",
-        ]) {
-            Ok(_) => println!("Done"),
-            Err(_) => println!("{}", "Failed (You may need to push manually)".yellow()),
-        }
-    }
-
-    println!("{}\n", render_tree_tail("Landed").green());
-    Ok(())
 }
 
-fn manual_fallback(files: HashSet<String>) -> Result<()> {
+fn confirm_land(push: bool) -> Result<bool> {
+    let action = if push {
+        "rewrite local history and publish it"
+    } else {
+        "rewrite local history"
+    };
+
+    print!("{} Proceed and {}? [y/N]: ", "·".cyan(), action);
+    io::stdout().flush()?;
+
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+
+    Ok(matches!(response.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+fn prompt_manual_commit_message(failures: &[ProviderFailure]) -> Result<Option<String>> {
     println!();
-    for file in files {
-        execute_git(&["add", &file])?;
+    println!("{} Automatic synthesis was unavailable:", "·".yellow());
+
+    for failure in failures {
+        println!(
+            "{}",
+            render_tree_line(
+                &format!("{}", "│".dimmed()),
+                &format!("{}: {}", failure.provider, flatten_error(&failure.error)),
+            )
+        );
     }
 
-    print!("{} Commit message: ", "·".cyan());
+    print!(
+        "{} Single commit message (leave blank to abort): ",
+        "·".cyan()
+    );
     io::stdout().flush()?;
+
     let mut msg = String::new();
     io::stdin().read_line(&mut msg)?;
 
     let msg = msg.trim();
     if msg.is_empty() {
-        println!("{} Aborted. Files left staged.", "·".red());
+        return Ok(None);
+    }
+
+    Ok(Some(msg.to_string()))
+}
+
+fn execute_land(base: &KiteBase, groups: &[CommitGroup]) -> Result<()> {
+    let original_branch = get_current_branch()?;
+    let pre_land_sha = execute_git(&["rev-parse", "HEAD"])?;
+    let temp_branch = format!("kite-land-{}", Local::now().format("%Y%m%d%H%M%S"));
+
+    execute_git(&["update-ref", "refs/kite/pre_land", pre_land_sha.trim()])?;
+
+    if let Err(err) = prepare_landing_branch(base, &temp_branch).and_then(|_| {
+        commit_groups(groups)?;
+        finalize_landed_branch(&original_branch, &temp_branch)
+    }) {
+        anyhow::bail!(
+            "{}\n\nOriginal branch `{}` still points at the pre-land history. Temporary branch `{}` contains the in-progress landing state. Recovery ref: `refs/kite/pre_land`.",
+            err,
+            original_branch,
+            temp_branch
+        );
+    }
+
+    Ok(())
+}
+
+fn prepare_landing_branch(base: &KiteBase, temp_branch: &str) -> Result<()> {
+    match base {
+        KiteBase::Commit(base_sha) => {
+            execute_git(&["checkout", "-b", temp_branch])?;
+            execute_git(&["reset", "--soft", base_sha])?;
+            execute_git(&["reset"])?;
+        }
+        KiteBase::Root => {
+            execute_git(&["checkout", "--orphan", temp_branch, "HEAD"])?;
+            execute_git(&["read-tree", "--empty"])?;
+        }
+    }
+
+    Ok(())
+}
+
+fn commit_groups(groups: &[CommitGroup]) -> Result<()> {
+    for group in groups {
+        for file in &group.files {
+            execute_git(&["add", "--", file])?;
+        }
+        commit_git(&group.message)?;
+        println!(
+            "{}",
+            render_tree_line(&format!("{}", "│".dimmed()), &group.message)
+        );
+    }
+
+    Ok(())
+}
+
+fn finalize_landed_branch(original_branch: &str, temp_branch: &str) -> Result<()> {
+    let new_head = execute_git(&["rev-parse", "HEAD"])?;
+    execute_git(&["branch", "-f", original_branch, new_head.trim()])?;
+    execute_git(&["checkout", original_branch])?;
+    execute_git(&["branch", "-D", temp_branch])?;
+    Ok(())
+}
+
+fn publish_current_branch() -> Result<()> {
+    if !has_remote() {
+        println!(
+            "{} No remote configured. Landed history is local only.",
+            "·".dimmed()
+        );
         return Ok(());
     }
 
-    commit_git(msg)?;
-    println!("{}\n", render_tree_tail("Landed").green());
+    let current_branch = get_current_branch()?;
+
+    print!(
+        "{} ",
+        render_tree_line(&format!("{}", "│".dimmed()), "Pulling remote changes...")
+    );
+    io::stdout().flush()?;
+    match execute_git(&["pull", "--rebase", "origin", &current_branch]) {
+        Ok(_) => println!("Done"),
+        Err(_) => println!("{}", "Skipped (no upstream or nothing to pull)".dimmed()),
+    }
+
+    print!(
+        "{} ",
+        render_tree_line(&format!("{}", "│".dimmed()), "Publishing to remote...")
+    );
+    io::stdout().flush()?;
+
+    match execute_git(&[
+        "push",
+        "--set-upstream",
+        "origin",
+        &current_branch,
+        "--force-with-lease",
+    ]) {
+        Ok(_) => println!("Done"),
+        Err(_) => println!("{}", "Failed (You may need to push manually)".yellow()),
+    }
+
     Ok(())
 }
 
@@ -319,6 +535,7 @@ fn undo() -> Result<()> {
 // AI PROVIDERS
 // ==========================================
 async fn try_local_ollama(diff: &str) -> Result<Vec<CommitGroup>> {
+    let prompt = build_synthesis_input(diff, 15_000)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()?;
@@ -327,7 +544,7 @@ async fn try_local_ollama(diff: &str) -> Result<Vec<CommitGroup>> {
         "model": env::var("KITE_LOCAL_MODEL").unwrap_or_else(|_| "llama3".to_string()),
         "messages": [
             { "role": "system", "content": SYSTEM_PROMPT },
-            { "role": "user", "content": format!("Diff:\n{}", &diff[..diff.len().min(15000)]) }
+            { "role": "user", "content": prompt }
         ],
         "stream": false,
         "format": "json"
@@ -353,9 +570,9 @@ async fn try_openai(diff: &str) -> Result<Vec<CommitGroup>> {
         .build()?;
 
     let prompt = format!(
-        "{}\nFor this provider, return an object exactly like: {{ \"groups\": [{{\"message\":\"...\",\"files\":[\"...\"]}}] }}\n\nDiff:\n{}",
+        "{}\nFor this provider, return an object exactly like: {{ \"groups\": [{{\"message\":\"...\",\"files\":[\"...\"]}}] }}\n\n{}",
         SYSTEM_PROMPT,
-        &diff[..diff.len().min(20000)]
+        build_synthesis_input(diff, 20_000)?
     );
 
     let body = serde_json::json!({
@@ -407,6 +624,25 @@ async fn try_openai(diff: &str) -> Result<Vec<CommitGroup>> {
 
     let json: serde_json::Value = res.json().await?;
     parse_openai_groups(&json)
+}
+
+fn build_synthesis_input(diff: &str, max_diff_bytes: usize) -> Result<String> {
+    let mut prompt = String::new();
+    let examples = recent_commit_style_examples(MAX_COMMIT_STYLE_EXAMPLES)?;
+
+    if !examples.is_empty() {
+        prompt.push_str("Recent non-Kite commit message examples from this repository:\n");
+        for example in examples {
+            prompt.push_str("- ");
+            prompt.push_str(&example);
+            prompt.push('\n');
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str("Diff:\n");
+    prompt.push_str(truncate_for_prompt(diff, max_diff_bytes));
+    Ok(prompt)
 }
 
 fn get_openai_env_config() -> Result<(String, String, String)> {
@@ -701,11 +937,37 @@ fn render_tree_tail(message: &str) -> String {
 }
 
 fn get_default_branch() -> Result<String> {
+    if has_remote() {
+        if let Ok(output) = execute_git(&[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ]) {
+            if let Some(branch) = output.trim().rsplit('/').next() {
+                if !branch.is_empty() {
+                    return Ok(branch.to_string());
+                }
+            }
+        }
+    }
+
     let output = execute_git(&["branch", "--list", "main", "master"])?;
     if output.contains("main") {
-        Ok("main".to_string())
+        return Ok("main".to_string());
+    }
+    if output.contains("master") {
+        return Ok("master".to_string());
+    }
+
+    let current = execute_git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let current = current.trim();
+    if !current.is_empty() && current != "HEAD" {
+        Ok(current.to_string())
     } else {
-        Ok("master".to_string())
+        anyhow::bail!(
+            "Could not determine a default branch. Expected origin/HEAD, `main`, or `master`."
+        )
     }
 }
 
@@ -746,7 +1008,107 @@ fn check_ref(ref_name: &str) -> Option<String> {
     }
 }
 
-fn get_kite_base() -> Result<Option<String>> {
+fn diff_for_base(base: &KiteBase) -> Result<String> {
+    match base {
+        KiteBase::Commit(hash) => {
+            let range = format!("{hash}..HEAD");
+            execute_git(&["diff", &range])
+        }
+        KiteBase::Root => {
+            execute_git(&["diff-tree", "--root", "--no-commit-id", "-r", "-p", "HEAD"])
+        }
+    }
+}
+
+fn changed_files_for_base(base: &KiteBase) -> Result<HashSet<String>> {
+    let output = match base {
+        KiteBase::Commit(hash) => {
+            let range = format!("{hash}..HEAD");
+            execute_git(&["diff", "--name-only", &range])?
+        }
+        KiteBase::Root => execute_git(&[
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "-r",
+            "--name-only",
+            "HEAD",
+        ])?,
+    };
+
+    Ok(output
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect())
+}
+
+fn recent_commit_style_examples(limit: usize) -> Result<Vec<String>> {
+    let output = match execute_git(&["log", "--format=%s", "-n", "30"]) {
+        Ok(output) => output,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut seen = HashSet::new();
+    let mut examples = Vec::new();
+
+    for line in output.lines() {
+        let message = line.trim();
+        if message.is_empty() || message.starts_with("[kite] save") || message.starts_with("Merge ")
+        {
+            continue;
+        }
+
+        let owned = message.to_string();
+        if seen.insert(owned.clone()) {
+            examples.push(owned);
+        }
+
+        if examples.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(examples)
+}
+
+fn sorted_files(files: &HashSet<String>) -> Vec<String> {
+    let mut files: Vec<String> = files.iter().cloned().collect();
+    files.sort();
+    files
+}
+
+fn truncate_for_prompt(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+
+    let mut cutoff = max_bytes;
+    while cutoff > 0 && !text.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+
+    &text[..cutoff]
+}
+
+fn flatten_error(error: &str) -> String {
+    error
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn pluralize(count: usize, singular: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {singular}s")
+    }
+}
+
+fn get_kite_base() -> Result<Option<KiteBase>> {
     let log_output = match execute_git(&["log", "--format=%H %s"]) {
         Ok(out) => out,
         Err(_) => return Ok(None),
@@ -774,7 +1136,10 @@ fn get_kite_base() -> Result<Option<String>> {
     }
 
     if save_count > 0 {
-        Ok(Some(base_hash.unwrap_or_else(|| "root".to_string())))
+        Ok(Some(match base_hash {
+            Some(hash) => KiteBase::Commit(hash),
+            None => KiteBase::Root,
+        }))
     } else {
         Ok(None)
     }
@@ -798,6 +1163,12 @@ mod tests {
     fn cwd_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn acquire_cwd_lock() -> std::sync::MutexGuard<'static, ()> {
+        cwd_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     struct TempRepo {
@@ -847,12 +1218,28 @@ mod tests {
         fs::write(repo.join(path), contents).expect("test file should be written");
     }
 
-    fn run_save_in_repo(repo: &Path) -> Result<()> {
+    fn with_repo_cwd<T>(repo: &Path, f: impl FnOnce() -> T) -> T {
         let original_dir = std::env::current_dir().expect("current dir should resolve");
         std::env::set_current_dir(repo).expect("should enter temp repo");
-        let result = save();
+        let result = f();
         std::env::set_current_dir(&original_dir).expect("should restore original cwd");
         result
+    }
+
+    fn run_save_in_repo(repo: &Path) -> Result<()> {
+        with_repo_cwd(repo, save)
+    }
+
+    fn collect_land_scope_in_repo(repo: &Path) -> Result<Option<LandScope>> {
+        with_repo_cwd(repo, collect_land_scope)
+    }
+
+    fn execute_land_in_repo(repo: &Path, base: &KiteBase, groups: &[CommitGroup]) -> Result<()> {
+        with_repo_cwd(repo, || execute_land(base, groups))
+    }
+
+    fn undo_in_repo(repo: &Path) -> Result<()> {
+        with_repo_cwd(repo, undo)
     }
 
     fn init_repo() -> TempRepo {
@@ -865,6 +1252,19 @@ mod tests {
         write_file(&repo.path, "other.txt", "base\n");
         git(&repo.path, &["add", "tracked.txt", "other.txt"]);
         git(&repo.path, &["commit", "-m", "chore: initial"]);
+
+        repo
+    }
+
+    fn init_root_kite_repo() -> TempRepo {
+        let repo = TempRepo::new();
+        git(&repo.path, &["init"]);
+        git(&repo.path, &["config", "user.name", "Kite Test"]);
+        git(&repo.path, &["config", "user.email", "kite@example.com"]);
+
+        write_file(&repo.path, "tracked.txt", "base\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
 
         repo
     }
@@ -984,7 +1384,7 @@ mod tests {
 
     #[test]
     fn save_commits_only_pre_staged_changes() {
-        let _lock = cwd_lock().lock().expect("cwd lock should be acquired");
+        let _lock = acquire_cwd_lock();
         let repo = init_repo();
 
         write_file(&repo.path, "tracked.txt", "staged change\n");
@@ -1005,7 +1405,7 @@ mod tests {
 
     #[test]
     fn save_stages_everything_when_index_is_empty() {
-        let _lock = cwd_lock().lock().expect("cwd lock should be acquired");
+        let _lock = acquire_cwd_lock();
         let repo = init_repo();
 
         write_file(&repo.path, "tracked.txt", "modified without staging\n");
@@ -1024,6 +1424,190 @@ mod tests {
         assert!(
             status.trim().is_empty(),
             "expected clean status, got: {status}"
+        );
+    }
+
+    #[test]
+    fn normalize_groups_deduplicates_files_and_catches_leftovers() {
+        let actual_files: HashSet<String> = ["src/main.rs", "README.md"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let normalized = normalize_groups(
+            vec![CommitGroup {
+                message: "feat(cli): tighten landing".to_string(),
+                files: vec![
+                    "src/main.rs".to_string(),
+                    "src/main.rs".to_string(),
+                    "missing.txt".to_string(),
+                ],
+            }],
+            &actual_files,
+        );
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].files, vec!["src/main.rs".to_string()]);
+        assert_eq!(normalized[1].message, "chore: unclassified updates");
+        assert_eq!(normalized[1].files, vec!["README.md".to_string()]);
+    }
+
+    #[test]
+    fn collect_land_scope_rejects_dirty_worktree() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "dirty\n");
+
+        let err = collect_land_scope_in_repo(&repo.path).expect_err("dirty repos should fail");
+        assert!(format!("{err:#}").contains("Working directory must be clean"));
+    }
+
+    #[test]
+    fn execute_land_records_pre_land_ref_and_rewrites_non_root_history() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let original_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let original_branch = original_branch.trim().to_string();
+        let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
+        let pre_land_sha = pre_land_sha.trim().to_string();
+
+        let scope = collect_land_scope_in_repo(&repo.path)
+            .expect("land scope should collect")
+            .expect("kites saves should be landable");
+        assert!(matches!(scope.base, KiteBase::Commit(_)));
+
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[CommitGroup {
+                message: "feat: land tracked change".to_string(),
+                files: vec!["tracked.txt".to_string()],
+            }],
+        )
+        .expect("land should succeed");
+
+        let head_message = git(&repo.path, &["log", "-1", "--pretty=%s"]);
+        assert_eq!(head_message.trim(), "feat: land tracked change");
+
+        let recorded_pre_land = git(&repo.path, &["rev-parse", "refs/kite/pre_land"]);
+        assert_eq!(recorded_pre_land.trim(), pre_land_sha);
+
+        let current_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(current_branch.trim(), original_branch);
+
+        let temp_branches = git(&repo.path, &["branch", "--list", "kite-land-*"]);
+        assert!(temp_branches.trim().is_empty());
+    }
+
+    #[test]
+    fn undo_restores_the_previous_kite_saves_after_land() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
+        let pre_land_sha = pre_land_sha.trim().to_string();
+
+        let scope = collect_land_scope_in_repo(&repo.path)
+            .expect("land scope should collect")
+            .expect("kites saves should be landable");
+
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[CommitGroup {
+                message: "feat: land tracked change".to_string(),
+                files: vec!["tracked.txt".to_string()],
+            }],
+        )
+        .expect("land should succeed");
+
+        undo_in_repo(&repo.path).expect("undo should succeed");
+
+        let restored_head = git(&repo.path, &["rev-parse", "HEAD"]);
+        assert_eq!(restored_head.trim(), pre_land_sha);
+
+        let status = git(&repo.path, &["status", "--porcelain"]);
+        assert!(status.trim().is_empty());
+    }
+
+    #[test]
+    fn execute_land_supports_root_only_kite_history() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_root_kite_repo();
+
+        let original_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let original_branch = original_branch.trim().to_string();
+        let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
+        let pre_land_sha = pre_land_sha.trim().to_string();
+
+        let scope = collect_land_scope_in_repo(&repo.path)
+            .expect("land scope should collect")
+            .expect("root kite save should be landable");
+        assert!(matches!(scope.base, KiteBase::Root));
+
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[CommitGroup {
+                message: "feat: bootstrap project".to_string(),
+                files: vec!["tracked.txt".to_string()],
+            }],
+        )
+        .expect("root land should succeed");
+
+        let head_message = git(&repo.path, &["log", "-1", "--pretty=%s"]);
+        assert_eq!(head_message.trim(), "feat: bootstrap project");
+
+        let recorded_pre_land = git(&repo.path, &["rev-parse", "refs/kite/pre_land"]);
+        assert_eq!(recorded_pre_land.trim(), pre_land_sha);
+
+        let current_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(current_branch.trim(), original_branch);
+    }
+
+    #[test]
+    fn recent_commit_style_examples_skip_kite_saves_and_deduplicate() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "first\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "fix(cli): tighten landing"]);
+
+        write_file(&repo.path, "tracked.txt", "second\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        write_file(&repo.path, "tracked.txt", "third\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "fix(cli): tighten landing"]);
+
+        write_file(&repo.path, "tracked.txt", "fourth\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "docs: refresh usage"]);
+
+        let examples = with_repo_cwd(&repo.path, || {
+            recent_commit_style_examples(MAX_COMMIT_STYLE_EXAMPLES)
+        })
+        .expect("examples should load");
+
+        assert_eq!(
+            examples,
+            vec![
+                "docs: refresh usage".to_string(),
+                "fix(cli): tighten landing".to_string(),
+                "chore: initial".to_string()
+            ]
         );
     }
 }

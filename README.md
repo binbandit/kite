@@ -1,51 +1,60 @@
 # 🪁 Kite (`kt`)
 
-**Zero-thought continuous synthesis version control.**
+**Fast quicksaves and inspectable AI-assisted landing for Git.**
 
-Most Git tools are just wrappers. They put a colorful UI over the same old mental model: staging files, writing WIP commits, and managing branch state. 
+Kite splits version control into two phases:
 
-Kite abandons manual versioning entirely. You write the code. Kite writes the history.
+- `kt` creates instant `[kite] save` snapshots while you are coding.
+- `kt land` rewrites contiguous Kite saves into reviewable commits.
+- `kt publish` pushes the rewritten branch when you are ready.
 
-It acts as an instantaneous quicksave while you are in the flow state, and intelligently synthesizes your messy saves into a pristine, semantic Git history only when you are ready to share it.
+The tool is intentionally opinionated about safety:
 
+- landing only operates on committed Kite saves
+- the plan is shown before history is rewritten
+- landing is local by default
+- every land records a rollback marker for `kt undo`
 
+## The Workflow
 
-## The Paradigm: Quicksaves and Landing
+### 1. Quicksave While You Work
 
-As a power user, your workflow is binary: you are either **in the zone**, or you are **delivering**. Kite isolates these two states completely.
+When you are coding, run:
 
-### 1. In the Zone: The Quicksave
-When you are coding, you don't stage files. You don't write commit messages. You just type:
 ```bash
 kt
-
 ```
 
-That’s it. By default, Kite instantly stages everything and creates a silent snapshot (`[kite] save 14:02:37`). It executes in milliseconds. You literally cannot lose work, and your flow state is never broken.
+By default, Kite stages everything and creates a snapshot like `[kite] save 14:02:37`.
 
-If you have already staged a specific subset yourself, Kite respects that selection and quicksaves only the staged changes. That path is there for deliberate exceptions; the normal recommended workflow is still to let Kite capture everything for you.
+If you already staged a deliberate subset yourself, Kite respects that selection and saves only the staged changes. That path is there for exceptions; the normal workflow is still to let Kite capture everything for you.
 
-Quicksaves intentionally skip Git hooks to stay instant. Landing commits use normal `git commit` behavior, so your repository's configured Git hooks still run before polished history is written.
+Quicksaves intentionally skip Git hooks to stay fast. Landed commits use normal `git commit` behavior, so hooks do run when polished history is written.
 
-### 2. Delivering: Semantic Auto-Staging
+### 2. Land Saved Work Into Reviewable Commits
 
-When you are done with a feature, your history is full of messy quicksaves. You type:
+When your branch is full of contiguous Kite saves, run:
 
 ```bash
 kt land
-
 ```
 
-Kite does not just squash your commits. It rewinds your quicksaves, analyzes the total diff of what you built, and tries providers in order: local Ollama, then the OpenAI Responses API, then a manual fallback prompt if AI is unavailable.
+Kite analyzes the diff introduced by those saves, proposes logical commit groups, and only rewrites history after you confirm the plan.
 
-It automatically stages specific files together and writes atomic, Conventional Commits for each logical group:
+When AI is available, Kite tries providers in this order:
 
-* `feat(api): add stripe webhook endpoints` *(contains the 3 backend files)*
-* `feat(ui): build checkout modal component` *(contains the 5 frontend files)*
+1. Local Ollama
+2. OpenAI Responses API
+3. Manual fallback prompt
 
-**Zero thought. Perfect history. No errors.**
+Kite also feeds recent non-Kite commit messages from the current repository into the prompt so landed messages follow the repo's existing style when possible. If the repo does not show a clear pattern, Kite falls back to Conventional Commit style.
 
----
+Typical landed output looks like:
+
+- `feat(api): add stripe webhook endpoints`
+- `feat(ui): build checkout modal component`
+
+If AI is unavailable, Kite shows the provider failures and asks for one manual commit message before any history is changed.
 
 ## Installation
 
@@ -55,7 +64,6 @@ Ensure you have Rust installed, then build and install the binary globally:
 git clone https://github.com/binbandit/kite.git kite
 cd kite
 cargo install --path .
-
 ```
 
 ## Install The Agent Skill
@@ -90,14 +98,13 @@ npx skills add . --skill use-kite -a codex
 
 ### `kt go <idea>`
 
-Starts a new flow. Kite checks for `main` first, otherwise `master`. If `origin` exists, it fetches that default branch and creates your new branch from `origin/<default>` when possible, otherwise from the local default branch.
+Starts a new flow. Kite prefers `origin/HEAD` when it exists, otherwise falls back to `main`, `master`, or the current branch.
 
 ```bash
 kt go stripe-webhooks
-
 ```
 
-### `kt` (Save)
+### `kt`
 
 The zero-friction quicksave. Run this constantly while you work.
 
@@ -108,21 +115,46 @@ The zero-friction quicksave. Run this constantly while you work.
 
 ```bash
 kt
-
 ```
 
 ### `kt land`
 
-Synthesizes contiguous Kite quicksaves into a polished history.
+Synthesizes contiguous Kite quicksaves into a polished local history.
 
 - Requires an existing `HEAD` commit.
-- Rewinds only contiguous `[kite] save` commits at the top of history.
-- Re-stages the full diff, groups files into logical commits, then creates normal `git commit`s so hooks do run during landing.
-- If a remote exists, Kite first tries `git pull --rebase origin <current-branch>`, then pushes with `--set-upstream origin <current-branch> --force-with-lease`.
+- Requires a clean working tree. If you still have WIP changes, run `kt` first or stash them.
+- Only rewrites contiguous `[kite] save` commits at the top of history.
+- Shows the proposed commit plan before rewriting anything.
+- Stores the pre-land `HEAD` in `refs/kite/pre_land` so `kt undo` can restore it later.
+- Creates normal `git commit`s, so hooks do run during landing.
+- Lands locally by default. Use `kt publish` afterward, or pass `--push` to publish immediately after landing.
 
 ```bash
 kt land
+```
 
+Skip the confirmation prompt:
+
+```bash
+kt land --yes
+```
+
+Land and publish in one step:
+
+```bash
+kt land --push
+```
+
+### `kt publish`
+
+Publishes the current branch after you review the rewritten local history.
+
+- If a remote exists, Kite first tries `git pull --rebase origin <current-branch>`.
+- Then it pushes with `--set-upstream origin <current-branch> --force-with-lease`.
+- If no remote exists, Kite exits without error and leaves the history local.
+
+```bash
+kt publish
 ```
 
 ### `kt undo`
@@ -131,14 +163,11 @@ Attempts to restore the pre-land state.
 
 - Requires a clean working tree.
 - Hard-resets to `refs/kite/pre_land` and force-pushes if a remote exists.
-- Current caveat: the CLI checks for `refs/kite/pre_land`, but the current `kt land` implementation does not obviously write that ref. Verify your build records it before relying on `kt undo` as a recovery path.
+- Deletes the rollback marker after a successful undo so you do not accidentally replay it twice.
 
 ```bash
 kt undo
-
 ```
-
----
 
 ## Configuration & AI Providers
 
@@ -170,16 +199,18 @@ export KITE_OPENAI_MODEL="gpt-5.4-mini"
 
 **3. Manual fallback**
 
-If neither AI provider is available, Kite drops into a single commit-message prompt and lands the staged diff manually.
+If neither AI provider is available, Kite shows the provider failures and asks for one manual commit message. Leaving the prompt blank aborts the land without changing history.
 
-## Why Kite is Safe
+## Why Kite Is Safe
 
-Kite is built to be utterly bulletproof:
+Kite keeps the risky parts explicit:
 
-* **Branch Agnostic:** Kite uses a contiguous log walker. When you run `kt land`, it only rewinds continuous `[kite] save` commits. It will never overwrite a coworker's commits or touch your pre-existing history.
-* **No Lost Files:** Even if the AI hallucinates, Kite cross-references the AI's output with your *actual* changed files. If the AI misses a file, Kite sweeps it up into a fallback commit. Absolutely no code is ever lost or left behind.
-* **Remote Safety:** When publishing, Kite tries to rebase on the current remote branch first and then pushes with `--force-with-lease`, not a blind force-push.
+- **Clean-worktree landing:** `kt land` refuses to run with staged or unstaged WIP, so scratch files do not get swept into a landed commit by surprise.
+- **Preview before rewrite:** Kite shows the proposed commit plan before it rewrites history.
+- **Rollback marker:** Every successful land records the previous `HEAD` at `refs/kite/pre_land`.
+- **No dropped files:** If the AI misses files, Kite adds a `chore: unclassified updates` commit rather than silently omitting them.
+- **Explicit publish:** Landing is local by default. Publishing remains a separate step unless you opt into `--push`.
 
 ---
 
-*Built for developers who just want to write code.*
+*Built for developers who want cheap quicksaves and cleaner review history.*

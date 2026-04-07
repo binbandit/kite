@@ -4,8 +4,9 @@
 
 ### `kt go <name>`
 
-- Detect the default branch by checking for `main`; otherwise fall back to `master`.
-- If a remote exists, fetch `origin/<default-branch>` and create the branch from it when possible.
+- Prefer `origin/HEAD` when it exists.
+- Otherwise fall back to `main`, `master`, or the current branch.
+- If a remote exists, fetch `origin/<default-branch>` and create the new branch from it when possible.
 - If that remote checkout fails, create the branch from the local default branch.
 
 ### `kt`
@@ -17,27 +18,35 @@
 - The normal recommended workflow is still to let Kite quicksave everything; staged-only quicksaves are an explicit override.
 - Pass `--no-verify`, so Git hooks do not run for quicksaves.
 
-### `kt land`
+### `kt land [--push] [--yes]`
 
 - Require an existing `HEAD` commit. If the repo has no commits yet, Kite prints a warning and exits.
-- Rewind only contiguous `[kite] save` commits at the top of history.
-- Stage all changes, inspect the cached diff, then unstage so Kite can create surgical commits.
+- Require a clean working tree. If the user still has WIP changes, they should `kt` them first or stash them.
+- Operate only on contiguous `[kite] save` commits at the top of history.
+- Build the synthesis prompt from:
+  - the diff introduced by those saves
+  - recent non-Kite commit messages from the current repo as style examples
 - Try providers in this order:
   1. Local Ollama at `http://localhost:11434/api/chat` with `KITE_LOCAL_MODEL` or default `llama3`
   2. OpenAI Responses API using the configured base URL, model, and API key
-  3. Manual fallback that asks for one Conventional Commit message and squashes everything into it
-- If both AI providers fail, Kite suppresses the provider error details and drops straight to the manual fallback prompt.
-- Create grouped commits from the provider output. Leftover files become `chore: unclassified updates`.
-- Run normal `git commit`, so hooks do run during landing.
-- If a remote exists, first try `git pull --rebase origin <branch>`.
-- After that, push the current branch with `--set-upstream origin <branch> --force-with-lease`.
+  3. Manual fallback that asks for one commit message before rewriting history
+- Show the proposed grouped commit plan before rewriting anything, unless `--yes` is passed.
+- Record the pre-land `HEAD` at `refs/kite/pre_land`.
+- Rewrite history locally by default.
+- If `--push` is passed, publish immediately after a successful local land.
+- If AI misses files, add a final `chore: unclassified updates` commit for the leftovers.
+
+### `kt publish`
+
+- If no remote exists, print a note and exit successfully.
+- Otherwise try `git pull --rebase origin <branch>`.
+- Then push the current branch with `--set-upstream origin <branch> --force-with-lease`.
 
 ### `kt undo`
 
 - Require a clean working tree.
 - Reset hard to `refs/kite/pre_land`, then delete that ref.
-- If a remote exists, force-push the current branch.
-- Current caveat: `src/main.rs` checks for `refs/kite/pre_land`, but the same file does not obviously write that ref during `kt land`. Verify the implementation before relying on `kt undo` as a recovery path.
+- If a remote exists, force-push the current branch with `--force-with-lease`.
 
 ## OpenAI environment variables
 

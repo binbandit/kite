@@ -2,7 +2,7 @@
 name = "kite"
 version = "0.1.0"
 edition = "2024"
-description = "Zero-thought continuous synthesis"
+description = "Fast quicksaves and inspectable AI-assisted landing"
 
 [[bin]]
 name = "kt"
