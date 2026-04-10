@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 const MAX_COMMIT_FAILURE_LINES: usize = 12;
@@ -10,8 +11,32 @@ pub(crate) enum KiteBase {
     Commit(String),
 }
 
-pub(crate) fn execute_git(args: &[&str]) -> Result<String> {
+fn resolve_repo_root() -> Result<PathBuf> {
     let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("Failed to resolve Git repository root")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Kite must be run inside a Git repository: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+}
+
+fn git_command() -> Result<Command> {
+    let mut command = Command::new("git");
+    command.current_dir(resolve_repo_root()?);
+    Ok(command)
+}
+
+pub(crate) fn execute_git(args: &[&str]) -> Result<String> {
+    let output = git_command()?
         .args(args)
         .output()
         .with_context(|| format!("Failed 'git {}'", args.join(" ")))?;
@@ -27,7 +52,7 @@ pub(crate) fn execute_git(args: &[&str]) -> Result<String> {
 }
 
 pub(crate) fn execute_git_quiet(args: &[&str]) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()?
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -53,7 +78,7 @@ pub(crate) fn has_staged_changes(status: &str) -> bool {
 }
 
 pub(crate) fn commit_git(message: &str) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()?
         .args(["commit", "-m", message])
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
@@ -174,11 +199,15 @@ pub(crate) fn get_default_branch() -> Result<String> {
 }
 
 pub(crate) fn has_head_commit() -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    git_command()
+        .and_then(|mut command| {
+            command
+                .args(["rev-parse", "--verify", "HEAD"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .context("Failed 'git rev-parse --verify HEAD'")
+        })
         .map(|status| status.success())
         .unwrap_or(false)
 }
@@ -189,15 +218,20 @@ pub(crate) fn get_current_branch() -> Result<String> {
 }
 
 pub(crate) fn has_remote() -> bool {
-    Command::new("git")
-        .args(["remote"])
-        .output()
-        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+    git_command()
+        .and_then(|mut command| {
+            command
+                .args(["remote"])
+                .output()
+                .context("Failed 'git remote'")
+        })
+        .map(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
         .unwrap_or(false)
 }
 
 pub(crate) fn check_ref(ref_name: &str) -> Option<String> {
-    let output = Command::new("git")
+    let output = git_command()
+        .ok()?
         .args(["rev-parse", "--verify", ref_name])
         .stderr(Stdio::null())
         .output()
