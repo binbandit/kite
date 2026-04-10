@@ -289,23 +289,44 @@ fn prompt_manual_commit_message(failures: &[ProviderFailure]) -> Result<Option<S
 fn execute_land(base: &KiteBase, groups: &[CommitGroup]) -> Result<()> {
     let original_branch = get_current_branch()?;
     let pre_land_sha = execute_git(&["rev-parse", "HEAD"])?;
-    let temp_branch = format!("kite-land-{}", Local::now().format("%Y%m%d%H%M%S"));
+    let recovery_branch = format!("kite-recovery-{}", Local::now().format("%Y%m%d%H%M%S"));
 
     execute_git(&["update-ref", "refs/kite/pre_land", pre_land_sha.trim()])?;
 
-    if let Err(err) = prepare_landing_branch(base, &temp_branch).and_then(|_| {
+    if let Err(err) = prepare_landing_branch(base, &recovery_branch).and_then(|_| {
         commit_groups(groups)?;
-        finalize_landed_branch(&original_branch, &temp_branch)
+        finalize_landed_branch(&original_branch, &recovery_branch)
     }) {
         anyhow::bail!(
-            "{}\n\nOriginal branch `{}` still points at the pre-land history. Temporary branch `{}` contains the in-progress landing state. Recovery ref: `refs/kite/pre_land`.",
-            err,
-            original_branch,
-            temp_branch
+            "{}",
+            render_land_failure(&err, &original_branch, &recovery_branch)
         );
     }
 
     Ok(())
+}
+
+fn render_land_failure(
+    err: &anyhow::Error,
+    original_branch: &str,
+    recovery_branch: &str,
+) -> String {
+    let mut message = format!(
+        "{err}\n\nLanding stopped before updating `{original_branch}`.\nKite kept the in-progress landing state on recovery branch `{recovery_branch}` so partial commits or staged changes are not lost."
+    );
+
+    if get_current_branch()
+        .map(|branch| branch == recovery_branch)
+        .unwrap_or(false)
+    {
+        message.push_str(&format!("\nYou are currently on `{recovery_branch}`."));
+    }
+
+    message.push_str(&format!(
+        "\nFix the issue there and rerun `kt land`, or run `git switch {original_branch}` if you want to abandon this landing attempt.\nRecovery ref: `refs/kite/pre_land`."
+    ));
+
+    message
 }
 
 fn prepare_landing_branch(base: &KiteBase, temp_branch: &str) -> Result<()> {
@@ -444,8 +465,8 @@ mod tests {
         let current_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(current_branch.trim(), original_branch);
 
-        let temp_branches = git(&repo.path, &["branch", "--list", "kite-land-*"]);
-        assert!(temp_branches.trim().is_empty());
+        let recovery_branches = git(&repo.path, &["branch", "--list", "kite-recovery-*"]);
+        assert!(recovery_branches.trim().is_empty());
     }
 
     #[test]
@@ -516,5 +537,71 @@ mod tests {
 
         let current_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(current_branch.trim(), original_branch);
+    }
+
+    #[test]
+    fn execute_land_succeeds_from_a_nested_directory() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let nested = repo.path.join("nested");
+
+        std::fs::create_dir_all(&nested).expect("nested directory should exist");
+        write_file(&repo.path, "nested/feature.txt", "saved change\n");
+        git(&repo.path, &["add", "nested/feature.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let scope = with_repo_cwd(&nested, collect_land_scope)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+
+        with_repo_cwd(&nested, || {
+            execute_land(
+                &scope.base,
+                &[CommitGroup {
+                    message: "feat: land nested change".to_string(),
+                    files: vec!["nested/feature.txt".to_string()],
+                }],
+            )
+        })
+        .expect("land should succeed from a nested directory");
+
+        let head_message = git(&repo.path, &["log", "-1", "--pretty=%s"]);
+        assert_eq!(head_message.trim(), "feat: land nested change");
+    }
+
+    #[test]
+    fn execute_land_failure_explains_recovery_branch_usage() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let original_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let original_branch = original_branch.trim().to_string();
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let scope = collect_land_scope_in_repo(&repo.path)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+
+        let err = execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[CommitGroup {
+                message: "feat: land tracked change".to_string(),
+                files: vec!["missing.txt".to_string()],
+            }],
+        )
+        .expect_err("land should fail when a grouped file cannot be staged");
+
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(&format!(
+            "Landing stopped before updating `{original_branch}`"
+        )));
+        assert!(rendered.contains("recovery branch `kite-recovery-"));
+        assert!(rendered.contains("Fix the issue there and rerun `kt land`"));
+
+        let current_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert!(current_branch.trim().starts_with("kite-recovery-"));
     }
 }
