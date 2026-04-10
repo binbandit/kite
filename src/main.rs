@@ -28,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start a new flow
+    /// Create and checkout a new flow branch
     Go { name: String },
     /// Intelligently chunk Kite saves into local commits
     Land {
@@ -97,7 +97,7 @@ fn go(name: &str) -> Result<()> {
         execute_git(&["checkout", "-b", name, &default_branch])?;
     }
 
-    println!("{} Flow started: {}", "·".cyan(), name.bold());
+    println!("{} Switched to flow branch: {}", "·".cyan(), name.bold());
     Ok(())
 }
 
