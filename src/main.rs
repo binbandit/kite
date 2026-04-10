@@ -7,11 +7,12 @@ mod test_support;
 
 use anyhow::Result;
 use chrono::Local;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use colored::*;
 
 use crate::git::{
     execute_git, execute_git_quiet, get_default_branch, has_remote, has_staged_changes,
+    is_inside_git_repository,
 };
 use crate::land::{land, publish_current_branch, undo};
 
@@ -49,12 +50,21 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
+        None if !is_inside_git_repository()? => {
+            print!("{}", render_help());
+            Ok(())
+        }
         Some(Commands::Go { name }) => go(name),
         Some(Commands::Land { push, yes }) => run_land(*push, *yes),
         Some(Commands::Publish) => publish_current_branch(),
         Some(Commands::Undo) => undo(),
         None => save(),
     }
+}
+
+fn render_help() -> String {
+    let mut command = Cli::command();
+    format!("{}\n", command.render_help())
 }
 
 fn run_land(push: bool, auto_confirm: bool) -> Result<()> {
@@ -105,9 +115,36 @@ fn go(name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::{acquire_cwd_lock, git, init_repo, write_file};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn run_save_in_repo(repo: &std::path::Path) -> Result<()> {
         crate::test_support::with_repo_cwd(repo, save)
+    }
+
+    fn run_default_in_cwd(path: &std::path::Path) -> Result<Option<String>> {
+        crate::test_support::with_repo_cwd(path, || {
+            if !is_inside_git_repository()? {
+                return Ok(Some(render_help()));
+            }
+
+            save()?;
+            Ok(None)
+        })
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        let unique = format!(
+            "kite-test-non-repo-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&path).expect("temp dir should be created");
+        path
     }
 
     #[test]
@@ -153,5 +190,20 @@ mod tests {
             status.trim().is_empty(),
             "expected clean status, got: {status}"
         );
+    }
+
+    #[test]
+    fn default_command_shows_help_outside_git_repo() {
+        let _lock = acquire_cwd_lock();
+        let dir = temp_dir();
+
+        let help = run_default_in_cwd(&dir)
+            .expect("default command should succeed outside a git repo")
+            .expect("non-git repo should render help");
+
+        assert!(help.contains("Fast quicksaves and inspectable AI-assisted landing"));
+        assert!(help.contains("Usage: kt [COMMAND]"));
+
+        fs::remove_dir_all(dir).expect("temp dir should be removed");
     }
 }
