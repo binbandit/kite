@@ -29,6 +29,15 @@ fn resolve_repo_root() -> Result<PathBuf> {
     ))
 }
 
+pub(crate) fn is_inside_git_repository() -> Result<bool> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("Failed to resolve Git repository root")?;
+
+    Ok(output.status.success())
+}
+
 fn git_command() -> Result<Command> {
     let mut command = Command::new("git");
     command.current_dir(resolve_repo_root()?);
