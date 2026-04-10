@@ -8,6 +8,8 @@ Kite splits version control into two phases:
 - `kt land` rewrites contiguous Kite saves into reviewable commits.
 - `kt publish` pushes the rewritten branch when you are ready.
 
+`kt go` is optional. It just creates and checks out a fresh branch for a new piece of work. If you are already on the branch you want, keep using `kt`, `kt land`, and `kt publish` there.
+
 The tool is intentionally opinionated about safety:
 
 - landing only operates on committed Kite saves
@@ -98,7 +100,11 @@ npx skills add . --skill use-kite -a codex
 
 ### `kt go <idea>`
 
-Starts a new flow. Kite prefers `origin/HEAD` when it exists, otherwise falls back to `main`, `master`, or the current branch.
+Creates and checks out a new flow branch. Use it when you want to start a fresh branch for a new piece of work. If you are already on the right branch, skip this command entirely.
+
+`kt go` does not change how landing works. After it switches branches, you keep working normally with `kt`, `kt land`, and `kt publish` on that branch.
+
+Kite prefers `origin/HEAD` when it exists, otherwise falls back to `main`, `master`, or the current branch.
 
 ```bash
 kt go stripe-webhooks
@@ -127,6 +133,7 @@ Synthesizes contiguous Kite quicksaves into a polished local history.
 - Shows the proposed commit plan before rewriting anything.
 - Stores the pre-land `HEAD` in `refs/kite/pre_land` so `kt undo` can restore it later.
 - Creates normal `git commit`s, so hooks do run during landing.
+- If landing fails after rewriting starts, Kite keeps the partial state on a `kite-recovery-*` branch so partial landed commits or staged changes are not lost.
 - Lands locally by default. Use `kt publish` afterward, or pass `--push` to publish immediately after landing.
 
 ```bash

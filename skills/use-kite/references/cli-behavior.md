@@ -4,6 +4,8 @@
 
 ### `kt go <name>`
 
+- This command is optional. It only creates and checks out a new branch for a fresh flow.
+- `kt`, `kt land`, and `kt publish` all operate on the current branch whether or not `kt go` was used.
 - Prefer `origin/HEAD` when it exists.
 - Otherwise fall back to `main`, `master`, or the current branch.
 - If a remote exists, fetch `origin/<default-branch>` and create the new branch from it when possible.
@@ -32,6 +34,7 @@
   3. Manual fallback that asks for one commit message before rewriting history
 - Show the proposed grouped commit plan before rewriting anything, unless `--yes` is passed.
 - Record the pre-land `HEAD` at `refs/kite/pre_land`.
+- If rewriting fails mid-land, keep the in-progress state on a `kite-recovery-*` branch so partial commits or staged changes are preserved.
 - Rewrite history locally by default.
 - If `--push` is passed, publish immediately after a successful local land.
 - If AI misses files, add a final `chore: unclassified updates` commit for the leftovers.

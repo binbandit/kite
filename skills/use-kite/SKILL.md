@@ -17,7 +17,7 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 
 2. Choose the command that matches the user's intent.
 
-- Use `kt go <name>` to start a new flow branch.
+- Use `kt go <name>` only when the user explicitly wants a fresh branch or the current branch is clearly the wrong place to start the work.
 - Use `kt` to quicksave tracked and untracked changes without hooks.
 - Use `kt land` to preview and rewrite contiguous Kite saves into grouped local commits.
 - Use `kt publish` to push a landed branch after review.
@@ -34,6 +34,7 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 
 - Prefer Kite commands over manual `git add` plus throwaway commits when the repo is actively using Kite.
 - Before `kt land`, confirm the feature is ready and the worktree is clean.
+- Do not call `kt go` automatically just because the user mentioned an issue or task. If they are already on the right branch, stay there.
 - Treat `kt land` as a local rewrite unless the user explicitly asked to publish or passed `--push`.
 - If landing falls back to manual mode, provide a commit message that matches the repo's existing style when possible.
 - If a landed commit is blocked by hooks, leave the staged changes intact and help fix the hook failure.
