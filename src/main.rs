@@ -36,6 +36,9 @@ enum Commands {
         /// Publish the rewritten branch after landing
         #[arg(long)]
         push: bool,
+        /// Preserve local worktree changes by stashing them while landing
+        #[arg(long)]
+        allow_dirty: bool,
         /// Skip the confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
@@ -55,7 +58,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Go { name }) => go(name),
-        Some(Commands::Land { push, yes }) => run_land(*push, *yes),
+        Some(Commands::Land {
+            push,
+            allow_dirty,
+            yes,
+        }) => run_land(*push, *yes, *allow_dirty),
         Some(Commands::Publish) => publish_current_branch(),
         Some(Commands::Undo) => undo(),
         None => save(),
@@ -67,11 +74,11 @@ fn render_help() -> String {
     format!("{}\n", command.render_help())
 }
 
-fn run_land(push: bool, auto_confirm: bool) -> Result<()> {
+fn run_land(push: bool, auto_confirm: bool, allow_dirty: bool) -> Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(land(push, auto_confirm))
+        .block_on(land(push, auto_confirm, allow_dirty))
 }
 
 fn save() -> Result<()> {

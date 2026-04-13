@@ -128,7 +128,8 @@ kt
 Synthesizes contiguous Kite quicksaves into a polished local history.
 
 - Requires an existing `HEAD` commit.
-- Requires a clean working tree. If you still have WIP changes, run `kt` first or stash them.
+- By default, requires a clean working tree. If you still have WIP changes, run `kt` first or stash them.
+- Use `--allow-dirty` to land while your worktree is dirty; `kt` temporarily stashes and restores those changes.
 - Only rewrites contiguous `[kite] save` commits at the top of history.
 - Shows the proposed commit plan before rewriting anything.
 - Stores the pre-land `HEAD` in `refs/kite/pre_land` so `kt undo` can restore it later.
@@ -145,6 +146,13 @@ Skip the confirmation prompt:
 ```bash
 kt land --yes
 ```
+
+Land without a clean worktree:
+
+```bash
+kt land --allow-dirty
+```
+
 
 Land and publish in one step:
 
@@ -212,7 +220,8 @@ If neither AI provider is available, Kite shows the provider failures and asks f
 
 Kite keeps the risky parts explicit:
 
-- **Clean-worktree landing:** `kt land` refuses to run with staged or unstaged WIP, so scratch files do not get swept into a landed commit by surprise.
+- **Clean-worktree landing by default:** `kt land` refuses to run with staged or unstaged WIP, so scratch files do not get swept into a landed commit by surprise.
+- **Dirty worktree override:** `kt land --allow-dirty` temporarily stashes uncommitted changes, lands saved commits, then restores those changes.
 - **Preview before rewrite:** Kite shows the proposed commit plan before it rewrites history.
 - **Rollback marker:** Every successful land records the previous `HEAD` at `refs/kite/pre_land`.
 - **No dropped files:** If the AI misses files, Kite adds a `chore: unclassified updates` commit rather than silently omitting them.

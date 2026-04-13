@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::Local;
 use colored::*;
 use std::collections::HashSet;
@@ -20,67 +20,89 @@ struct LandScope {
     actual_files: HashSet<String>,
 }
 
-pub(crate) async fn land(push: bool, auto_confirm: bool) -> Result<()> {
-    let Some(scope) = collect_land_scope()? else {
-        return Ok(());
+pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> Result<()> {
+    let stashed = if allow_dirty {
+        stash_dirty_worktree_for_land()?
+    } else {
+        false
     };
 
-    print!("{} Synthesizing... ", "·".cyan());
-    io::stdout().flush()?;
-
-    let (raw_groups, provider_label) =
-        match synthesize_groups(&scope.diff, &scope.actual_files).await {
-            Ok((groups, provider_label)) => {
-                println!("({provider_label})");
-                (groups, provider_label)
-            }
-            Err(failures) => {
-                println!("{}", "unavailable".dimmed());
-                let Some(message) = prompt_manual_commit_message(&failures)? else {
-                    println!("{} Aborted. No history changed.", "·".red());
-                    return Ok(());
-                };
-                (
-                    vec![CommitGroup {
-                        message,
-                        files: sorted_files(&scope.actual_files),
-                    }],
-                    "manual",
-                )
-            }
+    let land_result = (async {
+        let Some(scope) = collect_land_scope(allow_dirty)? else {
+            return Ok(());
         };
 
-    let groups = normalize_groups(raw_groups, &scope.actual_files);
-    if groups.is_empty() {
-        anyhow::bail!("No changed files were assigned to landed commit groups.");
-    }
+        print!("{} Synthesizing... ", "·".cyan());
+        io::stdout().flush()?;
 
-    println!();
-    print_land_plan(&groups, provider_label);
+        let (raw_groups, provider_label) =
+            match synthesize_groups(&scope.diff, &scope.actual_files).await {
+                Ok((groups, provider_label)) => {
+                    println!("({provider_label})");
+                    (groups, provider_label)
+                }
+                Err(failures) => {
+                    println!("{}", "unavailable".dimmed());
+                    let Some(message) = prompt_manual_commit_message(&failures)? else {
+                        println!("{} Aborted. No history changed.", "·".red());
+                        return Ok(());
+                    };
+                    (
+                        vec![CommitGroup {
+                            message,
+                            files: sorted_files(&scope.actual_files),
+                        }],
+                        "manual",
+                    )
+                }
+            };
 
-    if !auto_confirm && !confirm_land(push)? {
-        println!("{} Aborted. No history changed.", "·".red());
-        return Ok(());
-    }
-
-    execute_land(&scope.base, &groups)?;
-
-    if push {
-        publish_current_branch()?;
-        println!("{}\n", render_tree_tail("Landed and published").green());
-    } else {
-        if has_remote() {
-            let current_branch = get_current_branch()?;
-            println!(
-                "{} Review the rewritten history, then run `kt publish` or `git push --force-with-lease origin {}`.",
-                "·".dimmed(),
-                current_branch
-            );
+        let groups = normalize_groups(raw_groups, &scope.actual_files);
+        if groups.is_empty() {
+            anyhow::bail!("No changed files were assigned to landed commit groups.");
         }
-        println!("{}\n", render_tree_tail("Landed locally").green());
+
+        println!();
+        print_land_plan(&groups, provider_label);
+
+        if !auto_confirm && !confirm_land(push)? {
+            println!("{} Aborted. No history changed.", "·".red());
+            return Ok(());
+        }
+
+        execute_land(&scope.base, &groups)?;
+
+        if push {
+            publish_current_branch()?;
+            println!("{}\n", render_tree_tail("Landed and published").green());
+        } else {
+            if has_remote() {
+                let current_branch = get_current_branch()?;
+                println!(
+                    "{} Review the rewritten history, then run `kt publish` or `git push --force-with-lease origin {}`.",
+                    "·".dimmed(),
+                    current_branch
+                );
+            }
+            println!("{}\n", render_tree_tail("Landed locally").green());
+        }
+
+        Ok(())
+    })
+    .await;
+
+    if stashed {
+        if let Err(restore_error) = restore_dirty_worktree_for_land() {
+            return match land_result {
+                Ok(_) => Err(restore_error),
+                Err(land_error) => Err(anyhow!(
+                    "{land_error}\n\nIn addition, restoring your stashed changes failed: {restore_error}"
+                )),
+            };
+        }
     }
 
-    Ok(())
+    land_result
 }
 
 pub(crate) fn publish_current_branch() -> Result<()> {
@@ -169,7 +191,7 @@ pub(crate) fn undo() -> Result<()> {
     Ok(())
 }
 
-fn collect_land_scope() -> Result<Option<LandScope>> {
+fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
     if !has_head_commit() {
         println!(
             "{} Repository has no commits yet. Create an initial commit before running `kt land`.",
@@ -178,11 +200,13 @@ fn collect_land_scope() -> Result<Option<LandScope>> {
         return Ok(None);
     }
 
-    let status = execute_git(&["status", "--porcelain"])?;
-    if !status.trim().is_empty() {
-        anyhow::bail!(
-            "Working directory must be clean before `kt land`. Run `kt` to snapshot current work or stash unrelated changes first."
-        );
+    if !allow_dirty {
+        let status = execute_git(&["status", "--porcelain"])?;
+        if !status.trim().is_empty() {
+            anyhow::bail!(
+                "Working directory must be clean before `kt land`. Run `kt` to snapshot current work or stash unrelated changes first."
+            );
+        }
     }
 
     let Some(base) = get_kite_base()? else {
@@ -209,6 +233,26 @@ fn collect_land_scope() -> Result<Option<LandScope>> {
         diff,
         actual_files,
     }))
+}
+
+fn stash_dirty_worktree_for_land() -> Result<bool> {
+    let status = execute_git(&["status", "--porcelain"])?;
+    if status.trim().is_empty() {
+        return Ok(false);
+    }
+
+    execute_git(&[
+        "stash",
+        "push",
+        "--include-untracked",
+        "-m",
+        "kt land: temporary stash",
+    ])?;
+    Ok(true)
+}
+
+fn restore_dirty_worktree_for_land() -> Result<()> {
+    execute_git(&["stash", "pop", "--index"])
 }
 
 fn print_land_plan(groups: &[CommitGroup], provider_label: &str) {
@@ -391,8 +435,11 @@ mod tests {
         acquire_cwd_lock, git, init_repo, init_root_kite_repo, with_repo_cwd, write_file,
     };
 
-    fn collect_land_scope_in_repo(repo: &std::path::Path) -> Result<Option<LandScope>> {
-        with_repo_cwd(repo, collect_land_scope)
+    fn collect_land_scope_in_repo(
+        repo: &std::path::Path,
+        allow_dirty: bool,
+    ) -> Result<Option<LandScope>> {
+        with_repo_cwd(repo, || collect_land_scope(allow_dirty))
     }
 
     fn execute_land_in_repo(
@@ -423,8 +470,27 @@ mod tests {
 
         write_file(&repo.path, "tracked.txt", "dirty\n");
 
-        let err = collect_land_scope_in_repo(&repo.path).expect_err("dirty repos should fail");
+        let err = collect_land_scope_in_repo(&repo.path, false)
+            .expect_err("dirty repos should fail without allow_dirty");
         assert!(format!("{err:#}").contains("Working directory must be clean"));
+    }
+
+    #[test]
+    fn collect_land_scope_allows_dirty_worktree_with_allow_dirty() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        write_file(&repo.path, "other.txt", "local worktree change\n");
+
+        let scope = collect_land_scope_in_repo(&repo.path, true)
+            .expect("land scope should collect when allow_dirty is true")
+            .expect("kite saves should be landable");
+        assert!(matches!(scope.base, KiteBase::Commit(_)));
+        assert!(scope.actual_files.contains("tracked.txt"));
     }
 
     #[test]
@@ -441,7 +507,7 @@ mod tests {
         let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
         let pre_land_sha = pre_land_sha.trim().to_string();
 
-        let scope = collect_land_scope_in_repo(&repo.path)
+        let scope = collect_land_scope_in_repo(&repo.path, false)
             .expect("land scope should collect")
             .expect("kite saves should be landable");
         assert!(matches!(scope.base, KiteBase::Commit(_)));
@@ -481,7 +547,7 @@ mod tests {
         let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
         let pre_land_sha = pre_land_sha.trim().to_string();
 
-        let scope = collect_land_scope_in_repo(&repo.path)
+        let scope = collect_land_scope_in_repo(&repo.path, false)
             .expect("land scope should collect")
             .expect("kite saves should be landable");
 
@@ -514,7 +580,7 @@ mod tests {
         let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
         let pre_land_sha = pre_land_sha.trim().to_string();
 
-        let scope = collect_land_scope_in_repo(&repo.path)
+        let scope = collect_land_scope_in_repo(&repo.path, false)
             .expect("land scope should collect")
             .expect("root kite save should be landable");
         assert!(matches!(scope.base, KiteBase::Root));
@@ -580,7 +646,7 @@ mod tests {
         git(&repo.path, &["add", "tracked.txt"]);
         git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
 
-        let scope = collect_land_scope_in_repo(&repo.path)
+        let scope = collect_land_scope_in_repo(&repo.path, false)
             .expect("land scope should collect")
             .expect("kite saves should be landable");
 

@@ -33,7 +33,7 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 ## Operating Rules
 
 - Prefer Kite commands over manual `git add` plus throwaway commits when the repo is actively using Kite.
-- Before `kt land`, confirm the feature is ready and the worktree is clean.
+- Before `kt land`, confirm the feature is ready and the worktree is either clean or explicitly handled by `--allow-dirty`.
 - Do not call `kt go` automatically just because the user mentioned an issue or task. If they are already on the right branch, stay there.
 - Treat `kt land` as a local rewrite unless the user explicitly asked to publish or passed `--push`.
 - If landing falls back to manual mode, provide a commit message that matches the repo's existing style when possible.

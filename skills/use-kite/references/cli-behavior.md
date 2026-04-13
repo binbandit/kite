@@ -20,10 +20,11 @@
 - The normal recommended workflow is still to let Kite quicksave everything; staged-only quicksaves are an explicit override.
 - Pass `--no-verify`, so Git hooks do not run for quicksaves.
 
-### `kt land [--push] [--yes]`
+### `kt land [--push] [--yes] [--allow-dirty]`
 
 - Require an existing `HEAD` commit. If the repo has no commits yet, Kite prints a warning and exits.
-- Require a clean working tree. If the user still has WIP changes, they should `kt` them first or stash them.
+- By default, require a clean working tree. If the user still has WIP changes, they should `kt` them first or stash them.
+- `--allow-dirty` temporarily stashes local changes before landing and restores them afterward so only contiguous `[kite] save` commits are rewritten.
 - Operate only on contiguous `[kite] save` commits at the top of history.
 - Build the synthesis prompt from:
   - the diff introduced by those saves
