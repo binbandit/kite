@@ -252,7 +252,8 @@ fn stash_dirty_worktree_for_land() -> Result<bool> {
 }
 
 fn restore_dirty_worktree_for_land() -> Result<()> {
-    execute_git(&["stash", "pop", "--index"])
+    execute_git(&["stash", "pop", "--index"])?;
+    Ok(())
 }
 
 fn print_land_plan(groups: &[CommitGroup], provider_label: &str) {
