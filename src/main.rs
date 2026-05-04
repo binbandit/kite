@@ -11,7 +11,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use colored::*;
 
 use crate::git::{
-    execute_git, execute_git_quiet, get_default_branch, has_remote, has_staged_changes,
+    check_ref, execute_git, execute_git_quiet, get_default_branch, has_remote, has_staged_changes,
     is_inside_git_repository,
 };
 use crate::land::{land, publish_current_branch, undo};
@@ -29,7 +29,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create and checkout a new flow branch
+    /// Create or checkout a flow branch
     Go { name: String },
     /// Intelligently chunk Kite saves into local commits
     Land {
@@ -99,6 +99,18 @@ fn save() -> Result<()> {
 }
 
 fn go(name: &str) -> Result<()> {
+    let local_ref = format!("refs/heads/{name}");
+    if check_ref(&local_ref).is_some() {
+        execute_git(&["checkout", name])?;
+        println!(
+            "{} Switched to existing flow branch: {} {}",
+            "·".cyan(),
+            name.bold(),
+            "(no new branch created)".dimmed()
+        );
+        return Ok(());
+    }
+
     let default_branch = get_default_branch()?;
 
     if has_remote() {
@@ -127,6 +139,10 @@ mod tests {
 
     fn run_save_in_repo(repo: &std::path::Path) -> Result<()> {
         crate::test_support::with_repo_cwd(repo, save)
+    }
+
+    fn run_go_in_repo(repo: &std::path::Path, name: &str) -> Result<()> {
+        crate::test_support::with_repo_cwd(repo, || go(name))
     }
 
     fn run_default_in_cwd(path: &std::path::Path) -> Result<Option<String>> {
@@ -197,6 +213,29 @@ mod tests {
             status.trim().is_empty(),
             "expected clean status, got: {status}"
         );
+    }
+
+    #[test]
+    fn go_switches_to_existing_branch_without_recreating_it() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let default_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let default_branch = default_branch.trim();
+
+        git(&repo.path, &["checkout", "-b", "existing-flow"]);
+        write_file(&repo.path, "tracked.txt", "existing branch work\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "feat: existing flow work"]);
+        let existing_head = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        git(&repo.path, &["checkout", default_branch]);
+
+        run_go_in_repo(&repo.path, "existing-flow").expect("go should switch branches");
+
+        let current_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let current_head = git(&repo.path, &["rev-parse", "HEAD"]);
+        assert_eq!(current_branch.trim(), "existing-flow");
+        assert_eq!(current_head, existing_head);
     }
 
     #[test]

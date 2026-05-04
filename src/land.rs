@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::Local;
 use colored::*;
 use std::collections::HashSet;
@@ -617,7 +617,7 @@ mod tests {
         git(&repo.path, &["add", "nested/feature.txt"]);
         git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
 
-        let scope = with_repo_cwd(&nested, collect_land_scope)
+        let scope = with_repo_cwd(&nested, || collect_land_scope(false))
             .expect("land scope should collect")
             .expect("kite saves should be landable");
 

@@ -8,7 +8,7 @@ Kite splits version control into two phases:
 - `kt land` rewrites contiguous Kite saves into reviewable commits.
 - `kt publish` pushes the rewritten branch when you are ready.
 
-`kt go` is optional. It just creates and checks out a fresh branch for a new piece of work. If you are already on the branch you want, keep using `kt`, `kt land`, and `kt publish` there.
+`kt go` is optional. It creates and checks out a fresh branch for a new piece of work, or switches to the named branch when it already exists. If you are already on the branch you want, keep using `kt`, `kt land`, and `kt publish` there.
 
 The tool is intentionally opinionated about safety:
 
@@ -100,7 +100,7 @@ npx skills add . --skill use-kite -a codex
 
 ### `kt go <idea>`
 
-Creates and checks out a new flow branch. Use it when you want to start a fresh branch for a new piece of work. If you are already on the right branch, skip this command entirely.
+Creates and checks out a new flow branch. If the branch already exists locally, Kite switches to it and prints a note that no new branch was created. Use it when you want to start or resume a branch for a piece of work. If you are already on the right branch, skip this command entirely.
 
 `kt go` does not change how landing works. After it switches branches, you keep working normally with `kt`, `kt land`, and `kt publish` on that branch.
 
