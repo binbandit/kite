@@ -7,6 +7,8 @@ use std::time::Duration;
 use crate::git::{recent_commit_style_examples, sorted_files};
 
 const MAX_COMMIT_STYLE_EXAMPLES: usize = 6;
+const DEFAULT_LOCAL_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 120;
 
 const SYSTEM_PROMPT: &str = "\
 You are an expert version control synthesis engine. Analyze the git diff.
@@ -118,9 +120,8 @@ pub(crate) fn flatten_error(error: &str) -> String {
 
 async fn try_local_ollama(diff: &str, actual_files: &HashSet<String>) -> Result<Vec<CommitGroup>> {
     let prompt = build_synthesis_input(diff, actual_files, 15_000)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()?;
+    let timeout = env_duration_secs(&["KITE_LOCAL_TIMEOUT_SECS"], DEFAULT_LOCAL_TIMEOUT_SECS)?;
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
 
     let body = serde_json::json!({
         "model": env::var("KITE_LOCAL_MODEL").unwrap_or_else(|_| "llama3".to_string()),
@@ -146,9 +147,10 @@ async fn try_local_ollama(diff: &str, actual_files: &HashSet<String>) -> Result<
 
 async fn try_openai(diff: &str, actual_files: &HashSet<String>) -> Result<Vec<CommitGroup>> {
     let (base_url, model, api_key) = get_openai_env_config()?;
+    let timeout = env_duration_secs(&["KITE_OPENAI_TIMEOUT_SECS"], DEFAULT_OPENAI_TIMEOUT_SECS)?;
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
+        .timeout(timeout)
         .build()?;
 
     let prompt = format!(
@@ -392,6 +394,24 @@ fn first_non_empty_env(keys: &[&str]) -> Option<String> {
     })
 }
 
+fn env_duration_secs(keys: &[&str], default_secs: u64) -> Result<Duration> {
+    let Some(raw) = first_non_empty_env(keys) else {
+        return Ok(Duration::from_secs(default_secs));
+    };
+
+    parse_timeout_secs(&raw)
+        .map(Duration::from_secs)
+        .with_context(|| format!("Invalid timeout in {}", keys.join(", ")))
+}
+
+fn parse_timeout_secs(raw: &str) -> Result<u64> {
+    let seconds: u64 = raw.trim().parse()?;
+    if seconds == 0 {
+        anyhow::bail!("timeout must be greater than zero seconds");
+    }
+    Ok(seconds)
+}
+
 fn parse_json(raw: &str) -> Result<Vec<CommitGroup>> {
     if let Ok(groups) = serde_json::from_str::<Vec<CommitGroup>>(raw.trim()) {
         if !groups.is_empty() {
@@ -552,6 +572,27 @@ mod tests {
         let parsed = parse_openai_groups(&payload).expect("output_text should parse");
 
         assert_single_group(parsed, "docs: clarify readme", "README.md");
+    }
+
+    #[test]
+    fn parse_timeout_secs_accepts_positive_integer_seconds() {
+        assert_eq!(
+            parse_timeout_secs("120").expect("timeout should parse"),
+            120
+        );
+        assert_eq!(
+            parse_timeout_secs(" 45 ").expect("trimmed timeout should parse"),
+            45
+        );
+    }
+
+    #[test]
+    fn parse_timeout_secs_rejects_zero_and_invalid_values() {
+        let zero = parse_timeout_secs("0").expect_err("zero should fail");
+        assert!(format!("{zero:#}").contains("greater than zero"));
+
+        let invalid = parse_timeout_secs("slow").expect_err("non-number should fail");
+        assert!(format!("{invalid:#}").contains("invalid digit"));
     }
 
     #[test]
