@@ -31,8 +31,8 @@
   - the diff introduced by those saves
   - recent non-Kite commit messages from the current repo as style examples
 - Try providers in this order:
-  1. Local Ollama at `http://localhost:11434/api/chat` with `KITE_LOCAL_MODEL` or default `llama3`
-  2. OpenAI Responses API using the configured base URL, model, and API key
+  1. Local Ollama at `http://localhost:11434/api/chat` with `KITE_LOCAL_MODEL` or default `llama3`, and `KITE_LOCAL_TIMEOUT_SECS` or default 30 seconds
+  2. OpenAI Responses API using the configured base URL, model, API key, and `KITE_OPENAI_TIMEOUT_SECS` or default 120 seconds
   3. Manual fallback that asks for one commit message before rewriting history
 - Show the proposed grouped commit plan before rewriting anything, unless `--yes` is passed.
 - Record the pre-land `HEAD` at `refs/kite/pre_land`.
@@ -58,8 +58,10 @@
 - Base URL: `KITE_OPENAI_URL`, `KITE_OPENAI_BASE_URL`, `OPENAI_URL`, `OPENAI_BASE_URL`
 - Model: `KITE_OPENAI_MODEL`, `OPENAI_MODEL`
 - API key: `KITE_OPENAI_API_KEY`, `OPENAI_API_KEY`, `KITE_API_KEY`, `OPENAI_KEY`
+- Timeout: `KITE_OPENAI_TIMEOUT_SECS`
 - Default base URL: `https://api.openai.com/v1`
 - Default model: `gpt-5.4-mini`
+- Default timeout: 120 seconds
 - Kite normalizes base URLs before calling `/responses`:
   - strips a trailing `/responses`
   - strips a trailing `/chat/completions`

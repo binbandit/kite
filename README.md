@@ -192,10 +192,13 @@ Kite uses a local-first cascade and falls back without blocking the landing flow
 
 - Endpoint: `http://localhost:11434/api/chat`
 - Model env: `KITE_LOCAL_MODEL`
+- Timeout env: `KITE_LOCAL_TIMEOUT_SECS`
 - Default model: `llama3`
+- Default timeout: 30 seconds
 
 ```bash
 export KITE_LOCAL_MODEL="llama3"
+export KITE_LOCAL_TIMEOUT_SECS="30"
 ```
 
 **2. OpenAI Responses API**
@@ -203,13 +206,16 @@ export KITE_LOCAL_MODEL="llama3"
 - Base URL env precedence: `KITE_OPENAI_URL`, `KITE_OPENAI_BASE_URL`, `OPENAI_URL`, `OPENAI_BASE_URL`
 - Model env precedence: `KITE_OPENAI_MODEL`, `OPENAI_MODEL`
 - API key env precedence: `KITE_OPENAI_API_KEY`, `OPENAI_API_KEY`, `KITE_API_KEY`, `OPENAI_KEY`
+- Timeout env: `KITE_OPENAI_TIMEOUT_SECS`
 - Default base URL: `https://api.openai.com/v1`
 - Default model: `gpt-5.4-mini`
+- Default timeout: 120 seconds
 - Kite normalizes base URLs that end in `/responses`, `/chat/completions`, or omit `/v1`
 
 ```bash
 export OPENAI_API_KEY="sk-..."
 export KITE_OPENAI_MODEL="gpt-5.4-mini"
+export KITE_OPENAI_TIMEOUT_SECS="120"
 ```
 
 **3. Manual fallback**
