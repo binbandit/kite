@@ -384,10 +384,10 @@ fn parse_openai_groups(json: &serde_json::Value) -> Result<Vec<CommitGroup>> {
     }
 
     let content = extract_openai_output_text(json);
-    if let Ok(parsed) = serde_json::from_str::<CommitGroupsEnvelope>(content.trim()) {
-        if !parsed.groups.is_empty() {
-            return Ok(parsed.groups);
-        }
+    if let Ok(parsed) = serde_json::from_str::<CommitGroupsEnvelope>(content.trim())
+        && !parsed.groups.is_empty()
+    {
+        return Ok(parsed.groups);
     }
 
     parse_json(&content)
@@ -421,18 +421,18 @@ fn parse_timeout_secs(raw: &str) -> Result<u64> {
 }
 
 fn parse_json(raw: &str) -> Result<Vec<CommitGroup>> {
-    if let Ok(groups) = serde_json::from_str::<Vec<CommitGroup>>(raw.trim()) {
-        if !groups.is_empty() {
-            return Ok(groups);
-        }
+    if let Ok(groups) = serde_json::from_str::<Vec<CommitGroup>>(raw.trim())
+        && !groups.is_empty()
+    {
+        return Ok(groups);
     }
 
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
-        if let Some(groups_value) = value.get("groups") {
-            let groups: Vec<CommitGroup> = serde_json::from_value(groups_value.clone())?;
-            if !groups.is_empty() {
-                return Ok(groups);
-            }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim())
+        && let Some(groups_value) = value.get("groups")
+    {
+        let groups: Vec<CommitGroup> = serde_json::from_value(groups_value.clone())?;
+        if !groups.is_empty() {
+            return Ok(groups);
         }
     }
 
@@ -480,10 +480,10 @@ fn extract_first_json_array(raw: &str) -> Option<String> {
                     continue;
                 }
                 depth -= 1;
-                if depth == 0 {
-                    if let Some(start) = start_idx {
-                        return Some(raw[start..=idx].to_string());
-                    }
+                if depth == 0
+                    && let Some(start) = start_idx
+                {
+                    return Some(raw[start..=idx].to_string());
                 }
             }
             _ => {}
