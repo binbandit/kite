@@ -74,7 +74,7 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
 
         if push {
             publish_current_branch()?;
-            println!("{}\n", render_tree_tail("Landed and published").green());
+            println!("{}\n", tree_tail("Landed and published").green());
         } else {
             if has_remote() {
                 let current_branch = get_current_branch()?;
@@ -84,7 +84,7 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
                     current_branch
                 );
             }
-            println!("{}\n", render_tree_tail("Landed locally").green());
+            println!("{}\n", tree_tail("Landed locally").green());
         }
 
         Ok(())
@@ -116,20 +116,14 @@ pub(crate) fn publish_current_branch() -> Result<()> {
 
     let current_branch = get_current_branch()?;
 
-    print!(
-        "{} ",
-        render_tree_line(&format!("{}", "│".dimmed()), "Pulling remote changes...")
-    );
+    print!("{} ", tree_line("Pulling remote changes..."));
     io::stdout().flush()?;
     match execute_git(&["pull", "--rebase", "origin", &current_branch]) {
         Ok(_) => println!("Done"),
         Err(_) => println!("{}", "Skipped (no upstream or nothing to pull)".dimmed()),
     }
 
-    print!(
-        "{} ",
-        render_tree_line(&format!("{}", "│".dimmed()), "Publishing to remote...")
-    );
+    print!("{} ", tree_line("Publishing to remote..."));
     io::stdout().flush()?;
 
     match execute_git(&[
@@ -266,20 +260,14 @@ fn print_land_plan(groups: &[CommitGroup], provider_label: &str) {
     for group in groups {
         println!(
             "{}",
-            render_tree_line(
-                &format!("{}", "│".dimmed()),
-                &format!(
-                    "{} ({})",
-                    group.message,
-                    pluralize(group.files.len(), "file")
-                ),
-            )
+            tree_line(&format!(
+                "{} ({})",
+                group.message,
+                pluralize(group.files.len(), "file")
+            ))
         );
         for file in &group.files {
-            println!(
-                "{}",
-                render_tree_line(&format!("{} {}", "│".dimmed(), "├─".dimmed()), file)
-            );
+            println!("{}", tree_branch(file));
         }
     }
 }
@@ -307,10 +295,11 @@ fn prompt_manual_commit_message(failures: &[ProviderFailure]) -> Result<Option<S
     for failure in failures {
         println!(
             "{}",
-            render_tree_line(
-                &format!("{}", "│".dimmed()),
-                &format!("{}: {}", failure.provider, flatten_error(&failure.error)),
-            )
+            tree_line(&format!(
+                "{}: {}",
+                failure.provider,
+                flatten_error(&failure.error)
+            ))
         );
     }
 
@@ -396,10 +385,7 @@ fn commit_groups(groups: &[CommitGroup]) -> Result<()> {
             execute_git(&["add", "--", file])?;
         }
         commit_git(&group.message)?;
-        println!(
-            "{}",
-            render_tree_line(&format!("{}", "│".dimmed()), &group.message)
-        );
+        println!("{}", tree_line(&group.message));
     }
 
     Ok(())
@@ -413,11 +399,19 @@ fn finalize_landed_branch(original_branch: &str, temp_branch: &str) -> Result<()
     Ok(())
 }
 
-fn render_tree_line(prefix: &str, message: &str) -> String {
-    format!("  {} {}", prefix, message)
+// The land summary is drawn as a small tree: each step hangs off a dimmed
+// vertical trunk, file entries branch from it, and the summary closes on a tail.
+// Defining the glyphs here keeps the shape in one place so every call site reads
+// as intent rather than ASCII art.
+fn tree_line(message: &str) -> String {
+    format!("  {} {}", "│".dimmed(), message)
 }
 
-fn render_tree_tail(message: &str) -> String {
+fn tree_branch(file: &str) -> String {
+    format!("  {} {} {}", "│".dimmed(), "├─".dimmed(), file)
+}
+
+fn tree_tail(message: &str) -> String {
     format!("  └─ {}", message)
 }
 
@@ -456,12 +450,16 @@ mod tests {
     }
 
     #[test]
-    fn render_tree_lines_match_land_summary_layout() {
+    fn tree_lines_match_land_summary_layout() {
+        // Pin colors off so we assert the structural layout, not ANSI codes.
+        colored::control::set_override(false);
+
         assert_eq!(
-            render_tree_line("│", "Publishing to remote... Done"),
+            tree_line("Publishing to remote... Done"),
             "  │ Publishing to remote... Done"
         );
-        assert_eq!(render_tree_tail("Landed"), "  └─ Landed");
+        assert_eq!(tree_branch("src/main.rs"), "  │ ├─ src/main.rs");
+        assert_eq!(tree_tail("Landed"), "  └─ Landed");
     }
 
     #[test]
