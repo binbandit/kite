@@ -196,10 +196,14 @@ async fn try_openai(diff: &str, actual_files: &HashSet<String>) -> Result<Vec<Co
     });
 
     let responses_url = format!("{}/responses", base_url.trim_end_matches('/'));
-    let res = client
-        .post(responses_url)
-        .bearer_auth(api_key)
-        .json(&body)
+    let mut request = client.post(&responses_url).bearer_auth(api_key).json(&body);
+    if url_uses_portkey(&responses_url) {
+        let portkey_api_key = first_non_empty_env(&["PORTKEY_API_KEY"])
+            .context("PORTKEY_API_KEY is required when the OpenAI URL routes through portkey")?;
+        request = request.header("x-portkey-api-key", portkey_api_key);
+    }
+
+    let res = request
         .send()
         .await
         .with_context(|| "Failed to send request to OpenAI Responses API")?
@@ -208,6 +212,10 @@ async fn try_openai(diff: &str, actual_files: &HashSet<String>) -> Result<Vec<Co
 
     let json: serde_json::Value = res.json().await?;
     parse_openai_groups(&json).and_then(|groups| validate_group_coverage(groups, actual_files))
+}
+
+fn url_uses_portkey(url: &str) -> bool {
+    url.to_ascii_lowercase().contains("portkey")
 }
 
 fn build_synthesis_input(
@@ -593,6 +601,12 @@ mod tests {
 
         let invalid = parse_timeout_secs("slow").expect_err("non-number should fail");
         assert!(format!("{invalid:#}").contains("invalid digit"));
+    }
+
+    #[test]
+    fn url_uses_portkey_detects_portkey_hosts_case_insensitively() {
+        assert!(url_uses_portkey("https://example.PortKey.ai/v1/responses"));
+        assert!(!url_uses_portkey("https://api.openai.com/v1/responses"));
     }
 
     #[test]
