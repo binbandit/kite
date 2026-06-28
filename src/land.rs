@@ -91,15 +91,15 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
     })
     .await;
 
-    if stashed {
-        if let Err(restore_error) = restore_dirty_worktree_for_land() {
-            return match land_result {
-                Ok(_) => Err(restore_error),
-                Err(land_error) => Err(anyhow!(
-                    "{land_error}\n\nIn addition, restoring your stashed changes failed: {restore_error}"
-                )),
-            };
-        }
+    if stashed
+        && let Err(restore_error) = restore_dirty_worktree_for_land()
+    {
+        return match land_result {
+            Ok(_) => Err(restore_error),
+            Err(land_error) => Err(anyhow!(
+                "{land_error}\n\nIn addition, restoring your stashed changes failed: {restore_error}"
+            )),
+        };
     }
 
     land_result
