@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 const MAX_COMMIT_FAILURE_LINES: usize = 12;
 
@@ -11,7 +12,25 @@ pub(crate) enum KiteBase {
     Commit(String),
 }
 
+/// Memoizes the repo root for the current working directory so we don't spawn an
+/// extra `git rev-parse --show-toplevel` before every git invocation. The cache is
+/// keyed on the cwd, so it stays correct if the process changes directories (e.g.
+/// across test repositories).
 fn resolve_repo_root() -> Result<PathBuf> {
+    static CACHE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+
+    let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
+
+    {
+        let guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_cwd, cached_root)) = guard.as_ref()
+            && *cached_cwd == cwd
+        {
+            return Ok(cached_root.clone());
+        }
+    }
+
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -24,9 +43,12 @@ fn resolve_repo_root() -> Result<PathBuf> {
         );
     }
 
-    Ok(PathBuf::from(
-        String::from_utf8_lossy(&output.stdout).trim(),
-    ))
+    let root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some((cwd, root.clone()));
+
+    Ok(root)
 }
 
 pub(crate) fn is_inside_git_repository() -> Result<bool> {
@@ -173,19 +195,17 @@ fn indent_block(text: &str) -> String {
 }
 
 pub(crate) fn get_default_branch() -> Result<String> {
-    if has_remote() {
-        if let Ok(output) = execute_git(&[
+    if has_remote()
+        && let Ok(output) = execute_git(&[
             "symbolic-ref",
             "--quiet",
             "--short",
             "refs/remotes/origin/HEAD",
-        ]) {
-            if let Some(branch) = output.trim().rsplit('/').next() {
-                if !branch.is_empty() {
-                    return Ok(branch.to_string());
-                }
-            }
-        }
+        ])
+        && let Some(branch) = output.trim().rsplit('/').next()
+        && !branch.is_empty()
+    {
+        return Ok(branch.to_string());
     }
 
     let output = execute_git(&["branch", "--list", "main", "master"])?;
