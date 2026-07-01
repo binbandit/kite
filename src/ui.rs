@@ -6,32 +6,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::ai::{ProviderFailure, flatten_error};
+
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_TICK: Duration = Duration::from_millis(80);
 
-/// Animates `message` on the current line while a slow step (usually an AI
-/// call) runs, then replaces itself with the final outcome. Falls back to a
-/// single plain line when stdout is not a terminal.
+/// Transient activity indicator for slow steps (AI calls, pushes). It animates
+/// `message` on the current line and erases itself on `stop`, so the lines
+/// printed afterwards are the only record of what happened. When stdout is not
+/// a terminal it prints nothing at all.
 pub(crate) struct Spinner {
-    message: String,
     animation: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
 }
 
 impl Spinner {
     pub(crate) fn start(message: impl Into<String>) -> Self {
-        let message = message.into();
-
         if !io::stdout().is_terminal() {
-            return Self {
-                message,
-                animation: None,
-            };
+            return Self { animation: None };
         }
 
+        let message = message.into();
         let stop = Arc::new(AtomicBool::new(false));
         let animation = {
             let stop = stop.clone();
-            let message = message.clone();
             std::thread::spawn(move || {
                 for frame in SPINNER_FRAMES.iter().cycle() {
                     if stop.load(Ordering::Relaxed) {
@@ -45,18 +42,17 @@ impl Spinner {
         };
 
         Self {
-            message,
             animation: Some((stop, animation)),
         }
     }
 
-    pub(crate) fn finish(self, outcome: &str) {
+    pub(crate) fn stop(self) {
         if let Some((stop, animation)) = self.animation {
             stop.store(true, Ordering::Relaxed);
             let _ = animation.join();
             print!("\r\x1b[2K");
+            let _ = io::stdout().flush();
         }
-        println!("{} {}... {}", "·".cyan(), self.message, outcome);
     }
 }
 
@@ -85,6 +81,28 @@ pub(crate) fn prompt_line(question: &str) -> Result<Option<String>> {
 
     let answer = answer.trim();
     Ok((!answer.is_empty()).then(|| answer.to_string()))
+}
+
+pub(crate) fn print_provider_failures(failures: &[ProviderFailure]) {
+    println!("{} AI unavailable", "·".yellow());
+    for failure in failures {
+        println!(
+            "  {} {}: {}",
+            "-".dimmed(),
+            failure.provider,
+            summarize_provider_error(&failure.error).dimmed()
+        );
+    }
+}
+
+/// Collapses well-known failure shapes into one human sentence; anything
+/// unrecognized is flattened but kept intact for debugging.
+fn summarize_provider_error(error: &str) -> String {
+    let flat = flatten_error(error);
+    if flat.contains("Connection refused") && flat.contains("11434") {
+        return "Ollama is not running at localhost:11434".to_string();
+    }
+    flat
 }
 
 pub(crate) fn pluralize(count: usize, singular: &str) -> String {

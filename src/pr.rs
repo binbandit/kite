@@ -13,14 +13,14 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::ai::{self, extract_json_block, flatten_error};
+use crate::ai::{self, extract_json_block};
 use crate::git::{
     SAVE_PREFIX, check_ref, execute_git, get_current_branch, get_default_branch, has_remote,
     kite_save_stack, repo_root,
 };
 use crate::land::publish_current_branch;
 use crate::synth::truncate_for_prompt;
-use crate::ui::{Spinner, confirm, pluralize};
+use crate::ui::{Spinner, confirm, pluralize, print_provider_failures};
 
 const MAX_COMMIT_SUBJECTS: usize = 50;
 const MAX_PR_TITLE_EXAMPLES: usize = 8;
@@ -99,41 +99,41 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
         );
     }
 
+    println!(
+        "{} {} {} {}",
+        "·".cyan(),
+        branch.bold(),
+        "→".dimmed(),
+        base.bold()
+    );
+
     sync_branch_to_remote(&branch)?;
 
     if let Some(url) = existing_pr_url() {
-        println!("{} A pull request is already open: {}", "·".cyan(), url);
+        println!("{} Already open: {url}", "·".cyan());
         return Ok(());
     }
 
     let context = collect_pr_context(branch, base)?;
     announce_guidance(&context);
 
-    let spinner = Spinner::start("Drafting pull request");
-    let draft = match draft_with_ai(&context).await {
-        Ok((draft, provider_label)) => {
-            spinner.finish(&format!("done ({provider_label})"));
-            draft
-        }
+    let spinner = Spinner::start("Drafting");
+    let drafted = draft_with_ai(&context).await;
+    spinner.stop();
+
+    let (draft, provider_label) = match drafted {
+        Ok(result) => result,
         Err(failures) => {
-            spinner.finish(&"unavailable".dimmed().to_string());
-            for failure in &failures {
-                println!(
-                    "  {} {}: {}",
-                    "-".dimmed(),
-                    failure.provider,
-                    flatten_error(&failure.error)
-                );
-            }
-            println!("{} Falling back to a deterministic draft.", "·".yellow());
-            fallback_draft(&context)
+            print_provider_failures(&failures);
+            (fallback_draft(&context), "manual")
         }
     };
 
+    println!("{} Draft ({provider_label}):", "·".cyan());
     print!("{}", render_preview(&draft));
 
-    if !options.yes && !confirm("Open this pull request?")? {
-        println!("{} Aborted. No pull request created.", "·".red());
+    if !options.yes && !confirm("Create pull request?")? {
+        println!("{} Aborted — no pull request created", "·".red());
         return Ok(());
     }
 
@@ -231,19 +231,12 @@ fn collect_pr_context(branch: String, base: String) -> Result<PrContext> {
 }
 
 fn announce_guidance(context: &PrContext) {
-    println!(
-        "{} Opening a pull request: {} {} {}",
-        "·".cyan(),
-        context.branch.bold(),
-        "→".dimmed(),
-        context.base.bold()
-    );
-
     if let Some(template) = &context.template {
-        println!("{} Using template {}", "·".cyan(), template.label);
+        println!("{} Template {}", "·".cyan(), template.label.dimmed());
     }
-    for skill in &context.skills {
-        println!("{} Using skill guidance {}", "·".cyan(), skill.label);
+    if !context.skills.is_empty() {
+        let names: Vec<&str> = context.skills.iter().map(|s| s.label.as_str()).collect();
+        println!("{} Skills {}", "·".cyan(), names.join(", ").dimmed());
     }
 }
 
@@ -291,10 +284,10 @@ fn find_pr_skills(root: &Path) -> Vec<Guidance> {
         ]);
     }
 
-    find_pr_skills_in(root, &skill_dirs)
+    find_pr_skills_in(&skill_dirs)
 }
 
-fn find_pr_skills_in(root: &Path, skill_dirs: &[PathBuf]) -> Vec<Guidance> {
+fn find_pr_skills_in(skill_dirs: &[PathBuf]) -> Vec<Guidance> {
     let mut seen = HashSet::new();
     let mut skills = Vec::new();
 
@@ -318,9 +311,10 @@ fn find_pr_skills_in(root: &Path, skill_dirs: &[PathBuf]) -> Vec<Guidance> {
             };
 
             if mentions_pull_requests(name, &content) && seen.insert(name.to_string()) {
-                if let Some(guidance) = read_guidance(root, &manifest, MAX_SKILL_BYTES) {
-                    skills.push(guidance);
-                }
+                skills.push(Guidance {
+                    label: name.to_string(),
+                    content: truncate_for_prompt(&content, MAX_SKILL_BYTES).to_string(),
+                });
                 if skills.len() >= MAX_SKILLS {
                     return skills;
                 }
@@ -632,10 +626,10 @@ mod tests {
             "---\nname: unrelated\ndescription: Formats SQL.\n---",
         );
 
-        let skills = find_pr_skills_in(&dir.path, &[project, user]);
+        let skills = find_pr_skills_in(&[project, user]);
 
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].label, ".claude/skills/write-prs/SKILL.md");
+        assert_eq!(skills[0].label, "write-prs");
         assert!(skills[0].content.contains("Always link issues."));
     }
 
@@ -712,7 +706,7 @@ mod tests {
             vec!["feat: add webhooks"],
         );
         ctx.skills.push(Guidance {
-            label: ".claude/skills/write-prs/SKILL.md".to_string(),
+            label: "write-prs".to_string(),
             content: "Always link issues.".to_string(),
         });
 
@@ -721,7 +715,7 @@ mod tests {
         assert!(input.contains("Branch: feat/add-webhooks"));
         assert!(input.contains("Recent pull request titles"));
         assert!(input.contains("follow its structure exactly:\n## Summary"));
-        assert!(input.contains("Guidance from skill .claude/skills/write-prs/SKILL.md"));
+        assert!(input.contains("Guidance from skill write-prs"));
         assert!(input.contains("- feat: add webhooks"));
         assert!(input.contains("Diff (may be truncated):"));
     }

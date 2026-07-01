@@ -1,15 +1,14 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use colored::*;
 use std::collections::HashSet;
 
-use crate::ai::{ProviderFailure, flatten_error};
 use crate::git::{
     KiteBase, changed_files_for_base, check_ref, commit_git, diff_for_base, execute_git,
     get_current_branch, has_head_commit, has_remote, kite_save_stack, sorted_files,
 };
 use crate::synth::{CommitGroup, normalize_groups, synthesize_groups};
-use crate::ui::{Spinner, confirm, pluralize, prompt_line};
+use crate::ui::{Spinner, confirm, pluralize, print_provider_failures, prompt_line};
 
 #[derive(Clone, Debug)]
 struct LandScope {
@@ -31,73 +30,56 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
             return Ok(());
         };
 
-        let spinner = Spinner::start(format!(
-            "Synthesizing a plan for {} ({})",
-            pluralize(scope.save_count, "save"),
-            pluralize(scope.actual_files.len(), "file")
-        ));
+        let spinner = Spinner::start("Synthesizing");
+        let synthesized = synthesize_groups(&scope.diff, &scope.actual_files).await;
+        spinner.stop();
 
-        let (raw_groups, provider_label) =
-            match synthesize_groups(&scope.diff, &scope.actual_files).await {
-                Ok((groups, provider_label)) => {
-                    spinner.finish(&format!("done ({provider_label})"));
-                    (groups, provider_label)
-                }
-                Err(failures) => {
-                    spinner.finish(&"unavailable".dimmed().to_string());
-                    let Some(message) = prompt_manual_commit_message(&failures)? else {
-                        println!("{} Aborted. No history changed.", "·".red());
-                        return Ok(());
-                    };
-                    (
-                        vec![CommitGroup {
-                            message,
-                            files: sorted_files(&scope.actual_files),
-                        }],
-                        "manual",
-                    )
-                }
-            };
+        let (raw_groups, provider_label) = match synthesized {
+            Ok(result) => result,
+            Err(failures) => {
+                print_provider_failures(&failures);
+                let Some(message) = prompt_line("One commit message (blank to abort)")? else {
+                    println!("{} Aborted — no history changed", "·".red());
+                    return Ok(());
+                };
+                (
+                    vec![CommitGroup {
+                        message,
+                        files: sorted_files(&scope.actual_files),
+                    }],
+                    "manual",
+                )
+            }
+        };
 
         let groups = normalize_groups(raw_groups, &scope.actual_files);
         if groups.is_empty() {
             anyhow::bail!("No changed files were assigned to landed commit groups.");
         }
 
-        print!("{}", render_land_plan(&groups, provider_label));
+        print!(
+            "{}",
+            render_land_plan(&groups, provider_label, scope.save_count)
+        );
 
-        let action = if push {
-            "Rewrite local history and publish it?"
-        } else {
-            "Rewrite local history?"
-        };
-        if !auto_confirm && !confirm(action)? {
-            println!("{} Aborted. No history changed.", "·".red());
+        if !auto_confirm && !confirm("Rewrite history?")? {
+            println!("{} Aborted — no history changed", "·".red());
             return Ok(());
         }
 
         execute_land(&scope.base, &groups)?;
 
-        if push {
-            publish_current_branch()?;
+        if push && has_remote() {
+            publish_current_branch().context("Landed locally, but publishing failed")?;
+        } else if has_remote() {
             println!(
-                "{} Landed {} and published\n",
+                "{} Landed — review, then {} or {}",
                 "✓".green(),
-                pluralize(groups.len(), "commit")
+                "kt publish".bold(),
+                "kt pr".bold()
             );
         } else {
-            println!(
-                "{} Landed {} locally",
-                "✓".green(),
-                pluralize(groups.len(), "commit")
-            );
-            if has_remote() {
-                println!(
-                    "{} Review the history, then `kt publish` (or `kt pr` to open a pull request).",
-                    "·".dimmed()
-                );
-            }
-            println!();
+            println!("{} Landed", "✓".green());
         }
 
         Ok(())
@@ -118,49 +100,31 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
 
 pub(crate) fn publish_current_branch() -> Result<()> {
     if !has_remote() {
-        println!(
-            "{} No remote configured. Landed history is local only.",
-            "·".dimmed()
-        );
+        println!("{} No remote — history stays local", "·".dimmed());
         return Ok(());
     }
 
-    let current_branch = get_current_branch()?;
+    let branch = get_current_branch()?;
 
-    let sync = Spinner::start(format!("Syncing {current_branch} with remote"));
-    match execute_git(&["pull", "--rebase", "origin", &current_branch]) {
-        Ok(_) => sync.finish("done"),
-        Err(_) => sync.finish(
-            &"skipped (no upstream or nothing to pull)"
-                .dimmed()
-                .to_string(),
-        ),
-    }
-
-    let publish = Spinner::start(format!("Publishing {current_branch}"));
-    match execute_git(&[
+    let spinner = Spinner::start(format!("Publishing {branch}"));
+    let _ = execute_git(&["pull", "--rebase", "origin", &branch]);
+    let pushed = execute_git(&[
         "push",
         "--set-upstream",
         "origin",
-        &current_branch,
+        &branch,
         "--force-with-lease",
-    ]) {
-        Ok(_) => publish.finish("done"),
-        Err(err) => {
-            publish.finish(&"failed".yellow().to_string());
-            println!("{} {}", "·".yellow(), flatten_error(&format!("{err:#}")));
-        }
-    }
+    ]);
+    spinner.stop();
 
+    pushed?;
+    println!("{} Published {}", "✓".green(), branch.bold());
     Ok(())
 }
 
 pub(crate) fn undo() -> Result<()> {
     let Some(pre_land_sha) = check_ref("refs/kite/pre_land") else {
-        println!(
-            "{} Nothing to undo. No previous land operation found.",
-            "·".yellow()
-        );
+        println!("{} Nothing to undo — no land recorded", "·".yellow());
         return Ok(());
     };
 
@@ -173,25 +137,28 @@ pub(crate) fn undo() -> Result<()> {
 
     execute_git(&["reset", "--hard", &pre_land_sha])?;
     execute_git(&["update-ref", "-d", "refs/kite/pre_land"])?;
-    println!("{} Rewound to the pre-land saves", "·".cyan());
 
     if has_remote() {
-        let current_branch = get_current_branch()?;
-        let revert = Spinner::start("Reverting remote");
-        match execute_git(&["push", "--force-with-lease", "origin", &current_branch]) {
-            Ok(_) => revert.finish("done"),
-            Err(_) => revert.finish(&"failed (remote may have diverged)".yellow().to_string()),
+        let branch = get_current_branch()?;
+        let spinner = Spinner::start("Reverting remote");
+        let reverted = execute_git(&["push", "--force-with-lease", "origin", &branch]);
+        spinner.stop();
+        if reverted.is_err() {
+            println!(
+                "{} Remote not reverted — it may have diverged",
+                "·".yellow()
+            );
         }
     }
 
-    println!("{} Restored previous saves\n", "✓".green());
+    println!("{} Restored pre-land saves", "✓".green());
     Ok(())
 }
 
 fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
     if !has_head_commit() {
         println!(
-            "{} Repository has no commits yet. Create an initial commit before running `kt land`.",
+            "{} No commits yet — make an initial commit before landing",
             "·".yellow()
         );
         return Ok(None);
@@ -208,8 +175,9 @@ fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
 
     let Some(stack) = kite_save_stack()? else {
         println!(
-            "{} Nothing to land. Create one or more contiguous `[kite] save` commits first.",
-            "·".dimmed()
+            "{} {}",
+            "·".dimmed(),
+            "nothing to land — create saves with `kt` first".dimmed()
         );
         return Ok(None);
     };
@@ -219,8 +187,9 @@ fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
 
     if actual_files.is_empty() {
         println!(
-            "{} Nothing to land. No file changes were found.",
-            "·".dimmed()
+            "{} {}",
+            "·".dimmed(),
+            "nothing to land — the saves contain no changes".dimmed()
         );
         return Ok(None);
     }
@@ -256,11 +225,13 @@ fn restore_dirty_worktree_for_land() -> Result<()> {
 
 /// Renders the proposed history as a numbered list of commits, each with a
 /// small file tree underneath.
-fn render_land_plan(groups: &[CommitGroup], provider_label: &str) -> String {
+fn render_land_plan(groups: &[CommitGroup], provider_label: &str, save_count: usize) -> String {
     let mut plan = format!(
-        "\n{} Proposed history ({} synthesis):\n\n",
+        "{} Plan ({provider_label}): {} {} {}\n\n",
         "·".cyan(),
-        provider_label
+        pluralize(save_count, "save"),
+        "→".dimmed(),
+        pluralize(groups.len(), "commit"),
     );
 
     for (index, group) in groups.iter().enumerate() {
@@ -277,22 +248,6 @@ fn render_land_plan(groups: &[CommitGroup], provider_label: &str) -> String {
 
     plan.push('\n');
     plan
-}
-
-fn prompt_manual_commit_message(failures: &[ProviderFailure]) -> Result<Option<String>> {
-    println!();
-    println!("{} Automatic synthesis was unavailable:", "·".yellow());
-
-    for failure in failures {
-        println!(
-            "  {} {}: {}",
-            "-".dimmed(),
-            failure.provider,
-            flatten_error(&failure.error)
-        );
-    }
-
-    prompt_line("Single commit message (leave blank to abort)")
 }
 
 fn execute_land(base: &KiteBase, groups: &[CommitGroup]) -> Result<()> {
@@ -360,7 +315,6 @@ fn commit_groups(groups: &[CommitGroup]) -> Result<()> {
             execute_git(&["add", "--", file])?;
         }
         commit_git(&group.message)?;
-        println!("  {} {}", "✓".green(), group.message);
     }
 
     Ok(())
@@ -417,9 +371,10 @@ mod tests {
                 },
             ],
             "local",
+            3,
         );
 
-        assert!(plan.contains("Proposed history (local synthesis):"));
+        assert!(plan.contains("Plan (local): 3 saves → 2 commits"));
         assert!(plan.contains("  1. feat(api): add webhooks\n"));
         assert!(plan.contains("     ├─ src/api.rs\n"));
         assert!(plan.contains("     └─ src/hooks.rs\n"));

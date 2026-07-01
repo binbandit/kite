@@ -5,7 +5,7 @@
 ### `kt go <name>`
 
 - This command is optional. It creates and checks out a new branch for a fresh flow, or switches to the named local branch when it already exists.
-- When switching to an existing branch, print a note that no new branch was created.
+- Prints `Switched to <name>` for an existing branch and `Created <name> from <base>` for a new one, so the verb tells you which happened.
 - `kt`, `kt land`, and `kt publish` all operate on the current branch whether or not `kt go` was used.
 - Prefer `origin/HEAD` when it exists.
 - Otherwise fall back to `main`, `master`, or the current branch.

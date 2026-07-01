@@ -159,31 +159,33 @@ fn go(name: &str) -> Result<()> {
     let local_ref = format!("refs/heads/{name}");
     if check_ref(&local_ref).is_some() {
         execute_git(&["checkout", name])?;
-        println!(
-            "{} Switched to existing flow branch: {} {}",
-            "·".cyan(),
-            name.bold(),
-            "(no new branch created)".dimmed()
-        );
+        println!("{} Switched to {}", "✓".green(), name.bold());
         return Ok(());
     }
 
     let default_branch = get_default_branch()?;
+    let remote_base = format!("origin/{default_branch}");
 
-    if has_remote() {
+    let base = if has_remote() {
         let _ = execute_git(&["fetch", "origin", &default_branch]);
-        execute_git(&[
-            "checkout",
-            "-b",
-            name,
-            &format!("origin/{}", default_branch),
-        ])
-        .or_else(|_| execute_git(&["checkout", "-b", name, &default_branch]))?;
+        match execute_git(&["checkout", "-b", name, &remote_base]) {
+            Ok(_) => remote_base,
+            Err(_) => {
+                execute_git(&["checkout", "-b", name, &default_branch])?;
+                default_branch
+            }
+        }
     } else {
         execute_git(&["checkout", "-b", name, &default_branch])?;
-    }
+        default_branch
+    };
 
-    println!("{} Switched to flow branch: {}", "·".cyan(), name.bold());
+    println!(
+        "{} Created {} {}",
+        "✓".green(),
+        name.bold(),
+        format!("from {base}").dimmed()
+    );
     Ok(())
 }
 
