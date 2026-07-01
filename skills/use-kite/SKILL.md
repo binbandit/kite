@@ -1,6 +1,6 @@
 ---
 name: use-kite
-description: Operate the Kite CLI (`kt`) for repositories that use Kite's quicksave-and-land workflow. Use when Codex needs to inspect Kite state, start a flow with `kt go`, create quicksaves with `kt`, land contiguous `[kite] save` commits into polished history with `kt land`, publish with `kt publish`, explain or troubleshoot Kite behavior, or configure Kite's Ollama/OpenAI fallback settings.
+description: Operate the Kite CLI (`kt`) for repositories that use Kite's quicksave-and-land workflow. Use when Codex needs to inspect Kite state, start a flow with `kt go`, create quicksaves with `kt`, land contiguous `[kite] save` commits into polished history with `kt land`, publish with `kt publish`, open a pull request with `kt pr`, explain or troubleshoot Kite behavior, or configure Kite's Ollama/OpenAI fallback settings.
 ---
 
 # Use Kite
@@ -21,12 +21,14 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 - Use `kt` to quicksave tracked and untracked changes without hooks.
 - Use `kt land` to preview and rewrite contiguous Kite saves into grouped local commits.
 - Use `kt publish` to push a landed branch after review.
+- Use `kt pr` to open a GitHub pull request for a landed branch. It requires the `gh` CLI, refuses to run with unlanded saves, and previews the AI-drafted title and body before creating anything.
 - Use `kt undo` only when the user explicitly wants to reverse a previous land.
 
 3. Treat history-rewriting commands as high-impact.
 
 - `kt land` rewrites recent Kite save history.
 - `kt publish` and `kt undo` may force-push.
+- `kt pr` publishes the branch when needed and creates a pull request on GitHub after user confirmation (or immediately with `--yes`).
 - `kt undo` performs a hard reset and may force-push.
 - If the user asked you to "use Kite" but did not explicitly ask for history rewriting, explain the effect before running `kt land` or `kt undo`.
 

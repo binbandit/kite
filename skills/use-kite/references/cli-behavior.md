@@ -15,9 +15,10 @@
 ### `kt`
 
 - Run `git status --porcelain`.
-- If the worktree is clean, exit without creating a commit.
+- If the worktree is clean, print how many saves are ready to land (or "nothing to save") and exit without creating a commit.
 - If the index already contains staged changes, create a quicksave from only that staged selection.
 - Otherwise run `git add -A` and create a quicksave commit with message `[kite] save HH:MM:SS`.
+- Print how many files were saved.
 - The normal recommended workflow is still to let Kite quicksave everything; staged-only quicksaves are an explicit override.
 - Pass `--no-verify`, so Git hooks do not run for quicksaves.
 
@@ -47,6 +48,21 @@
 - Otherwise try `git pull --rebase origin <branch>`.
 - Then push the current branch with `--set-upstream origin <branch> --force-with-lease`.
 
+### `kt pr [--draft] [--base <branch>] [--yes]`
+
+- Requires the GitHub CLI (`gh`) to be installed and authenticated, and a remote to exist.
+- Refuses to run on the base branch or with unlanded `[kite] save` commits (run `kt land` first).
+- Publishes the branch when `origin/<branch>` is missing or does not match `HEAD`.
+- If a pull request already exists for the branch, prints its URL and exits.
+- Gathers context for the draft:
+  - the commits and diff between the base branch and `HEAD`
+  - the repository's pull request template (checked case-insensitively in the root, `.github/`, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`)
+  - PR-related agent skills (`SKILL.md` files mentioning pull requests) from `.claude/skills`, `.agents/skills`, and `skills` in the repo, plus `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills`
+  - recent merged pull request titles as style examples
+- Drafts the title and body with the same Ollama → OpenAI cascade as `kt land`; without AI it falls back to a deterministic draft from the template and commit subjects.
+- Previews the draft and asks for confirmation before running `gh pr create` (skip with `--yes`).
+- `--draft` creates a draft pull request; `--base` overrides the detected default branch.
+
 ### `kt undo`
 
 - Require a clean working tree.
@@ -73,3 +89,4 @@
 - `git log --oneline -n 12`
 - `command -v kt`
 - `git remote -v`
+- `command -v gh` (before `kt pr`)
