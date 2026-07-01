@@ -1,6 +1,7 @@
 mod ai;
 mod git;
 mod land;
+mod pr;
 mod synth;
 mod ui;
 
@@ -18,6 +19,7 @@ use crate::git::{
     has_staged_changes, is_inside_git_repository, is_staged_status_line, kite_save_stack,
 };
 use crate::land::{land, publish_current_branch, undo};
+use crate::pr::{PrOptions, create_pull_request};
 use crate::ui::pluralize;
 
 const WORKFLOW_HELP: &str = "\
@@ -25,6 +27,7 @@ Everyday flow:
   kt              quicksave everything on the current branch
   kt land         rewrite your saves into reviewable commits
   kt publish      push the branch (force-with-lease)
+  kt pr           open a GitHub pull request with gh
 
 Run `kt <command> --help` for details.";
 
@@ -58,6 +61,18 @@ enum Commands {
     },
     /// Publish the current branch after reviewing local history
     Publish,
+    /// Open a GitHub pull request for the current branch (requires gh)
+    Pr {
+        /// Create the pull request as a draft
+        #[arg(long)]
+        draft: bool,
+        /// Target base branch (defaults to the repository's default branch)
+        #[arg(long)]
+        base: Option<String>,
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Instantly revert the last land operation
     Undo,
 }
@@ -78,6 +93,9 @@ fn main() -> ExitCode {
             yes,
         }) => block_on(land(push, yes, allow_dirty)),
         Some(Commands::Publish) => publish_current_branch(),
+        Some(Commands::Pr { draft, base, yes }) => {
+            block_on(create_pull_request(PrOptions { draft, base, yes }))
+        }
         Some(Commands::Undo) => undo(),
     };
 
