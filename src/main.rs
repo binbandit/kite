@@ -1,6 +1,8 @@
+mod ai;
 mod git;
 mod land;
 mod synth;
+mod ui;
 
 #[cfg(test)]
 mod test_support;
@@ -9,18 +11,29 @@ use anyhow::Result;
 use chrono::Local;
 use clap::{CommandFactory, Parser, Subcommand};
 use colored::*;
+use std::process::ExitCode;
 
 use crate::git::{
-    check_ref, execute_git, execute_git_quiet, get_default_branch, has_remote, has_staged_changes,
-    is_inside_git_repository,
+    SAVE_PREFIX, check_ref, execute_git, execute_git_quiet, get_default_branch, has_remote,
+    has_staged_changes, is_inside_git_repository, is_staged_status_line, kite_save_stack,
 };
 use crate::land::{land, publish_current_branch, undo};
+use crate::ui::pluralize;
+
+const WORKFLOW_HELP: &str = "\
+Everyday flow:
+  kt              quicksave everything on the current branch
+  kt land         rewrite your saves into reviewable commits
+  kt publish      push the branch (force-with-lease)
+
+Run `kt <command> --help` for details.";
 
 #[derive(Parser)]
 #[command(
     name = "kt",
     about = "Fast quicksaves and inspectable AI-assisted landing",
-    version
+    version,
+    after_help = WORKFLOW_HELP
 )]
 struct Cli {
     #[command(subcommand)]
@@ -49,24 +62,39 @@ enum Commands {
     Undo,
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    match &cli.command {
-        None if !is_inside_git_repository()? => {
+    let result = match cli.command {
+        None if !is_inside_git_repository() => {
             print!("{}", render_help());
             Ok(())
         }
-        Some(Commands::Go { name }) => go(name),
+        None => save(),
+        Some(Commands::Go { name }) => go(&name),
         Some(Commands::Land {
             push,
             allow_dirty,
             yes,
-        }) => run_land(*push, *yes, *allow_dirty),
+        }) => block_on(land(push, yes, allow_dirty)),
         Some(Commands::Publish) => publish_current_branch(),
         Some(Commands::Undo) => undo(),
-        None => save(),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{} {error:#}", "✗".red());
+            ExitCode::FAILURE
+        }
     }
+}
+
+fn block_on(future: impl Future<Output = Result<()>>) -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(future)
 }
 
 fn render_help() -> String {
@@ -74,27 +102,38 @@ fn render_help() -> String {
     format!("{}\n", command.render_help())
 }
 
-fn run_land(push: bool, auto_confirm: bool, allow_dirty: bool) -> Result<()> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(land(push, auto_confirm, allow_dirty))
-}
-
 fn save() -> Result<()> {
     let status = execute_git(&["status", "--porcelain"])?;
     if status.trim().is_empty() {
+        let note = match kite_save_stack()? {
+            Some(stack) => format!(
+                "nothing new — {} ready to land",
+                pluralize(stack.count, "save")
+            ),
+            None => "nothing to save".to_string(),
+        };
+        println!("{} {}", "·".dimmed(), note.dimmed());
         return Ok(());
     }
 
-    if !has_staged_changes(&status) {
+    let staged_only = has_staged_changes(&status);
+    if !staged_only {
         execute_git_quiet(&["add", "-A"])?;
     }
 
-    let msg = format!("[kite] save {}", Local::now().format("%H:%M:%S"));
+    let saved_files = status
+        .lines()
+        .filter(|line| !staged_only || is_staged_status_line(line))
+        .count();
+
+    let msg = format!("{SAVE_PREFIX} {}", Local::now().format("%H:%M:%S"));
     execute_git_quiet(&["commit", "-m", &msg, "--no-verify"])?;
 
-    println!("{} {}", "·".dimmed(), "saved".dimmed());
+    println!(
+        "{} {}",
+        "·".dimmed(),
+        format!("saved {}", pluralize(saved_files, "file")).dimmed()
+    );
     Ok(())
 }
 
@@ -147,7 +186,7 @@ mod tests {
 
     fn run_default_in_cwd(path: &std::path::Path) -> Result<Option<String>> {
         crate::test_support::with_repo_cwd(path, || {
-            if !is_inside_git_repository()? {
+            if !is_inside_git_repository() {
                 return Ok(Some(render_help()));
             }
 
@@ -216,6 +255,18 @@ mod tests {
     }
 
     #[test]
+    fn save_on_clean_tree_is_a_safe_no_op() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let head_before = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        run_save_in_repo(&repo.path).expect("clean-tree save should succeed");
+
+        let head_after = git(&repo.path, &["rev-parse", "HEAD"]);
+        assert_eq!(head_before, head_after);
+    }
+
+    #[test]
     fn go_switches_to_existing_branch_without_recreating_it() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
@@ -249,6 +300,7 @@ mod tests {
 
         assert!(help.contains("Fast quicksaves and inspectable AI-assisted landing"));
         assert!(help.contains("Usage: kt [COMMAND]"));
+        assert!(help.contains("Everyday flow:"));
 
         fs::remove_dir_all(dir).expect("temp dir should be removed");
     }

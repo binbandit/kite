@@ -15,14 +15,14 @@ pub(crate) fn acquire_cwd_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-pub(crate) struct TempRepo {
+pub(crate) struct TempDir {
     pub(crate) path: PathBuf,
 }
 
-impl TempRepo {
-    fn new() -> Self {
+impl TempDir {
+    pub(crate) fn new(prefix: &str) -> Self {
         let unique = format!(
-            "kite-test-{}-{}",
+            "{prefix}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -30,14 +30,34 @@ impl TempRepo {
                 .as_nanos()
         );
         let path = std::env::temp_dir().join(unique);
-        fs::create_dir_all(&path).expect("temp repo directory should be created");
+        fs::create_dir_all(&path).expect("temp directory should be created");
         Self { path }
     }
 }
 
-impl Drop for TempRepo {
+impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+pub(crate) struct TempRepo {
+    dir: TempDir,
+}
+
+impl TempRepo {
+    fn new() -> Self {
+        Self {
+            dir: TempDir::new("kite-test"),
+        }
+    }
+}
+
+impl std::ops::Deref for TempRepo {
+    type Target = TempDir;
+
+    fn deref(&self) -> &TempDir {
+        &self.dir
     }
 }
 

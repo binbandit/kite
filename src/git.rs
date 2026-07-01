@@ -5,25 +5,38 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 const MAX_COMMIT_FAILURE_LINES: usize = 12;
+const LOG_PAGE_SIZE: usize = 100;
 
+pub(crate) const SAVE_PREFIX: &str = "[kite] save";
+
+/// Where the contiguous run of Kite saves at the top of history begins.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum KiteBase {
     Root,
     Commit(String),
 }
 
+/// The contiguous `[kite] save` commits at the top of history.
+#[derive(Clone, Debug)]
+pub(crate) struct SaveStack {
+    pub(crate) base: KiteBase,
+    pub(crate) count: usize,
+}
+
 /// Memoizes the repo root for the current working directory so we don't spawn an
 /// extra `git rev-parse --show-toplevel` before every git invocation. The cache is
 /// keyed on the cwd, so it stays correct if the process changes directories (e.g.
 /// across test repositories).
-fn resolve_repo_root() -> Result<PathBuf> {
+pub(crate) fn repo_root() -> Result<PathBuf> {
     static CACHE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
 
     let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
 
     {
-        let guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some((cached_cwd, cached_root)) = guard.as_ref()
             && *cached_cwd == cwd
         {
@@ -45,24 +58,21 @@ fn resolve_repo_root() -> Result<PathBuf> {
 
     let root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
 
-    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = Some((cwd, root.clone()));
 
     Ok(root)
 }
 
-pub(crate) fn is_inside_git_repository() -> Result<bool> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .context("Failed to resolve Git repository root")?;
-
-    Ok(output.status.success())
+pub(crate) fn is_inside_git_repository() -> bool {
+    repo_root().is_ok()
 }
 
 fn git_command() -> Result<Command> {
     let mut command = Command::new("git");
-    command.current_dir(resolve_repo_root()?);
+    command.current_dir(repo_root()?);
     Ok(command)
 }
 
@@ -101,11 +111,13 @@ pub(crate) fn execute_git_quiet(args: &[&str]) -> Result<()> {
 }
 
 pub(crate) fn has_staged_changes(status: &str) -> bool {
-    status.lines().any(|line| {
-        line.chars()
-            .next()
-            .is_some_and(|status_code| status_code != ' ' && status_code != '?')
-    })
+    status.lines().any(is_staged_status_line)
+}
+
+pub(crate) fn is_staged_status_line(line: &str) -> bool {
+    line.chars()
+        .next()
+        .is_some_and(|status_code| status_code != ' ' && status_code != '?')
 }
 
 pub(crate) fn commit_git(message: &str) -> Result<()> {
@@ -228,17 +240,7 @@ pub(crate) fn get_default_branch() -> Result<String> {
 }
 
 pub(crate) fn has_head_commit() -> bool {
-    git_command()
-        .and_then(|mut command| {
-            command
-                .args(["rev-parse", "--verify", "HEAD"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .context("Failed 'git rev-parse --verify HEAD'")
-        })
-        .map(|status| status.success())
-        .unwrap_or(false)
+    check_ref("HEAD").is_some()
 }
 
 pub(crate) fn get_current_branch() -> Result<String> {
@@ -319,8 +321,7 @@ pub(crate) fn recent_commit_style_examples(limit: usize) -> Result<Vec<String>> 
 
     for line in output.lines() {
         let message = line.trim();
-        if message.is_empty() || message.starts_with("[kite] save") || message.starts_with("Merge ")
-        {
+        if message.is_empty() || message.starts_with(SAVE_PREFIX) || message.starts_with("Merge ") {
             continue;
         }
 
@@ -343,37 +344,47 @@ pub(crate) fn sorted_files(files: &HashSet<String>) -> Vec<String> {
     files
 }
 
-pub(crate) fn get_kite_base() -> Result<Option<KiteBase>> {
-    let log_output = match execute_git(&["log", "--format=%H %s"]) {
-        Ok(out) => out,
-        Err(_) => return Ok(None),
-    };
+/// Walks history from `HEAD` in pages until the first non-Kite commit, so huge
+/// repositories never pay for a full `git log`.
+pub(crate) fn kite_save_stack() -> Result<Option<SaveStack>> {
+    let mut count = 0;
 
-    let mut save_count = 0;
-    let mut base_hash = None;
-
-    for line in log_output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let Some((hash, msg)) = line.split_once(' ') else {
-            continue;
+    for page in 0.. {
+        let skip = (page * LOG_PAGE_SIZE).to_string();
+        let max = LOG_PAGE_SIZE.to_string();
+        let output = match execute_git(&["log", "--format=%H %s", "-n", &max, "--skip", &skip]) {
+            Ok(output) => output,
+            Err(_) => return Ok(None), // no commits yet
         };
 
-        if msg.starts_with("[kite] save") {
-            save_count += 1;
-        } else {
-            base_hash = Some(hash.to_string());
-            break;
+        let mut page_lines = 0;
+        for line in output.lines().filter(|line| !line.trim().is_empty()) {
+            page_lines += 1;
+            let Some((hash, subject)) = line.split_once(' ') else {
+                continue;
+            };
+
+            if subject.starts_with(SAVE_PREFIX) {
+                count += 1;
+            } else if count == 0 {
+                return Ok(None);
+            } else {
+                return Ok(Some(SaveStack {
+                    base: KiteBase::Commit(hash.to_string()),
+                    count,
+                }));
+            }
+        }
+
+        if page_lines < LOG_PAGE_SIZE {
+            break; // reached the root commit
         }
     }
 
-    if save_count > 0 {
-        Ok(Some(match base_hash {
-            Some(hash) => KiteBase::Commit(hash),
-            None => KiteBase::Root,
+    if count > 0 {
+        Ok(Some(SaveStack {
+            base: KiteBase::Root,
+            count,
         }))
     } else {
         Ok(None)
@@ -423,6 +434,37 @@ mod tests {
         assert!(!has_staged_changes(" M src/main.rs\n"));
         assert!(!has_staged_changes("?? scratch.txt\n"));
         assert!(!has_staged_changes(" M src/main.rs\n?? scratch.txt\n"));
+    }
+
+    #[test]
+    fn kite_save_stack_counts_contiguous_saves_above_base() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let base_sha = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        write_file(&repo.path, "tracked.txt", "first\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        write_file(&repo.path, "tracked.txt", "second\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:01"]);
+
+        let stack = with_repo_cwd(&repo.path, kite_save_stack)
+            .expect("stack should resolve")
+            .expect("saves should be found");
+
+        assert_eq!(stack.count, 2);
+        assert_eq!(stack.base, KiteBase::Commit(base_sha.trim().to_string()));
+    }
+
+    #[test]
+    fn kite_save_stack_is_none_without_saves_on_top() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        let stack = with_repo_cwd(&repo.path, kite_save_stack).expect("stack should resolve");
+        assert!(stack.is_none());
     }
 
     #[test]
