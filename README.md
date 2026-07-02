@@ -191,9 +191,9 @@ Opens a GitHub pull request for the current branch using the [GitHub CLI](https:
 - Requires `gh` to be installed and authenticated, and a remote to exist.
 - Refuses to run with unlanded saves so the pull request always shows polished commits — run `kt land` first.
 - Publishes the branch automatically when the remote is missing it or behind it.
-- If a pull request is already open for the branch, prints its URL and stops.
-- Finds the repository's pull request template in the places GitHub looks (`.github/`, the repo root, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`) and fills it in.
-- Discovers PR-related agent skills installed on the machine (`.claude/skills`, `.agents/skills`, and `skills` in the repo; `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills` per user) and feeds their guidance to the AI.
+- If a pull request is already open for the branch, Kite pushes any new commits, checks whether the body still reflects the branch, and offers a refreshed body when it doesn't — preserving the existing structure and any human-written notes. Without AI, the existing body is never touched.
+- Finds the repository's pull request template in the places GitHub looks (`.github/`, the repo root, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`), fills it in, and drops sections that don't apply — no empty headings, no `N/A`, no leftover boilerplate.
+- Discovers PR-related agent skills installed on the machine (`.claude/skills`, `.agents/skills`, and `skills` in the repo; `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills` per user) and treats them as your own instructions for how the pull request must be written — they take precedence over the default rules.
 - Uses recent merged pull request titles from the repository as style examples for the new title.
 - Drafts the title and body with the same Ollama → OpenAI cascade as `kt land`. Without AI, it falls back to a deterministic draft built from the template and the branch's commits.
 - Always previews the pull request and asks for confirmation before creating anything.

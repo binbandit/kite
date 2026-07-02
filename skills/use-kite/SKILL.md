@@ -21,7 +21,7 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 - Use `kt` to quicksave tracked and untracked changes without hooks.
 - Use `kt land` to preview and rewrite contiguous Kite saves into grouped local commits.
 - Use `kt publish` to push a landed branch after review.
-- Use `kt pr` to open a GitHub pull request for a landed branch. It requires the `gh` CLI, refuses to run with unlanded saves, and previews the AI-drafted title and body before creating anything.
+- Use `kt pr` to open a GitHub pull request for a landed branch. It requires the `gh` CLI, refuses to run with unlanded saves, and previews the AI-drafted title and body before creating anything. If the branch's pull request is already open, it pushes new commits and offers a refreshed body when the existing one has gone stale.
 - Use `kt undo` only when the user explicitly wants to reverse a previous land.
 
 3. Treat history-rewriting commands as high-impact.

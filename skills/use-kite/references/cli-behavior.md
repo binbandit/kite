@@ -52,12 +52,12 @@
 
 - Requires the GitHub CLI (`gh`) to be installed and authenticated (checked offline via `gh auth token`), and a remote to exist.
 - Refuses to run on the base branch or with unlanded `[kite] save` commits (run `kt land` first).
-- If an open pull request already exists for the branch, prints its URL and exits; merged or closed PRs do not block a new one.
+- If an open pull request already exists for the branch, pushes any new commits, asks the AI whether the body still reflects the branch, and offers a refreshed body (`gh pr edit`) after preview and confirmation; if it still fits, prints "nothing to update". Without AI the existing body is left untouched. Merged or closed PRs do not block a new one.
 - Fetches `origin/<branch>` and publishes when the remote is missing the branch or out of date.
 - Gathers context for the draft:
   - the commits and diff between the base branch and `HEAD`
-  - the repository's pull request template (checked case-insensitively in the root, `.github/`, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`)
-  - PR-related agent skills (`SKILL.md` files mentioning pull requests) from `.claude/skills`, `.agents/skills`, and `skills` in the repo, plus `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills`
+  - the repository's pull request template (checked case-insensitively in the root, `.github/`, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`); the AI fills it in and removes sections that don't apply rather than leaving them empty or writing N/A
+  - PR-related agent skills (`SKILL.md` files whose name or frontmatter mentions pull requests) from `.claude/skills`, `.agents/skills`, and `skills` in the repo, plus `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills` — treated as the user's own instructions and given precedence over the default drafting rules
   - recent merged pull request titles as style examples
 - Drafts the title and body with the same Ollama → OpenAI cascade as `kt land`; without AI it falls back to a deterministic draft from the template and commit subjects.
 - Previews the draft and asks for confirmation before running `gh pr create` (skip with `--yes`).
