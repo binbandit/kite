@@ -7,6 +7,7 @@ Kite splits version control into two phases:
 - `kt` creates instant `[kite] save` snapshots while you are coding.
 - `kt land` rewrites contiguous Kite saves into reviewable commits.
 - `kt publish` pushes the rewritten branch when you are ready.
+- `kt pr` opens a GitHub pull request for the landed branch with `gh`.
 
 `kt go` is optional. It creates and checks out a fresh branch for a new piece of work, or switches to the named branch when it already exists. If you are already on the branch you want, keep using `kt`, `kt land`, and `kt publish` there.
 
@@ -57,6 +58,16 @@ Typical landed output looks like:
 - `feat(ui): build checkout modal component`
 
 If AI is unavailable, Kite shows the provider failures and asks for one manual commit message before any history is changed.
+
+### 3. Open a Pull Request
+
+Once the branch is landed, run:
+
+```bash
+kt pr
+```
+
+Kite gathers everything a good pull request needs, drafts it with the same AI cascade, shows you the result, and only creates it after you confirm. See [`kt pr`](#kt-pr) below for details.
 
 ## Installation
 
@@ -164,12 +175,39 @@ kt land --push
 
 Publishes the current branch after you review the rewritten local history.
 
-- If a remote exists, Kite first tries `git pull --rebase origin <current-branch>`.
-- Then it pushes with `--set-upstream origin <current-branch> --force-with-lease`.
+- Pushes with `--set-upstream origin <current-branch> --force-with-lease` — and nothing else.
+- Deliberately no `git pull --rebase` first: after a land, the remote still holds the old saves, and rebasing onto them would resurrect the history you just rewrote.
+- If someone else pushed to the branch, the lease rejects the push and Kite reports it; you decide how to reconcile.
 - If no remote exists, Kite exits without error and leaves the history local.
 
 ```bash
 kt publish
+```
+
+### `kt pr`
+
+Opens a GitHub pull request for the current branch using the [GitHub CLI](https://cli.github.com) (`gh`). It is deliberately smart about the draft:
+
+- Requires `gh` to be installed and authenticated, and a remote to exist.
+- Refuses to run with unlanded saves so the pull request always shows polished commits — run `kt land` first.
+- Publishes the branch automatically when the remote is missing it or behind it.
+- If a pull request is already open for the branch, prints its URL and stops.
+- Finds the repository's pull request template in the places GitHub looks (`.github/`, the repo root, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`) and fills it in.
+- Discovers PR-related agent skills installed on the machine (`.claude/skills`, `.agents/skills`, and `skills` in the repo; `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills` per user) and feeds their guidance to the AI.
+- Uses recent merged pull request titles from the repository as style examples for the new title.
+- Drafts the title and body with the same Ollama → OpenAI cascade as `kt land`. Without AI, it falls back to a deterministic draft built from the template and the branch's commits.
+- Always previews the pull request and asks for confirmation before creating anything.
+
+```bash
+kt pr
+```
+
+Create it as a draft, target a different base branch, or skip the confirmation:
+
+```bash
+kt pr --draft
+kt pr --base release/1.2
+kt pr --yes
 ```
 
 ### `kt undo`
@@ -186,7 +224,7 @@ kt undo
 
 ## Configuration & AI Providers
 
-Kite uses a local-first cascade and falls back without blocking the landing flow.
+Kite uses a local-first cascade for both `kt land` and `kt pr`, and falls back without blocking either flow.
 
 **1. Local Ollama**
 
@@ -220,7 +258,7 @@ export KITE_OPENAI_TIMEOUT_SECS="120"
 
 **3. Manual fallback**
 
-If neither AI provider is available, Kite shows the provider failures and asks for one manual commit message. Leaving the prompt blank aborts the land without changing history.
+If neither AI provider is available, Kite shows the provider failures and keeps working: `kt land` asks for one manual commit message (leaving it blank aborts without changing history), and `kt pr` builds a deterministic draft from the template and the branch's commits.
 
 ## Why Kite Is Safe
 
@@ -232,6 +270,7 @@ Kite keeps the risky parts explicit:
 - **Rollback marker:** Every successful land records the previous `HEAD` at `refs/kite/pre_land`.
 - **No dropped files:** If the AI misses files, Kite adds a `chore: unclassified updates` commit rather than silently omitting them.
 - **Explicit publish:** Landing is local by default. Publishing remains a separate step unless you opt into `--push`.
+- **Preview before PR:** `kt pr` shows the full title and body and asks for confirmation before anything reaches GitHub.
 
 ---
 

@@ -1,6 +1,9 @@
+mod ai;
 mod git;
 mod land;
+mod pr;
 mod synth;
+mod ui;
 
 #[cfg(test)]
 mod test_support;
@@ -9,18 +12,31 @@ use anyhow::Result;
 use chrono::Local;
 use clap::{CommandFactory, Parser, Subcommand};
 use colored::*;
+use std::process::ExitCode;
 
 use crate::git::{
-    check_ref, execute_git, execute_git_quiet, get_default_branch, has_remote, has_staged_changes,
-    is_inside_git_repository,
+    SAVE_PREFIX, check_ref, execute_git, execute_git_quiet, get_default_branch, has_remote,
+    has_staged_changes, is_inside_git_repository, is_staged_status_line, kite_save_stack,
 };
 use crate::land::{land, publish_current_branch, undo};
+use crate::pr::{PrOptions, create_pull_request};
+use crate::ui::pluralize;
+
+const WORKFLOW_HELP: &str = "\
+Everyday flow:
+  kt              quicksave everything on the current branch
+  kt land         rewrite your saves into reviewable commits
+  kt publish      push the branch (force-with-lease)
+  kt pr           open a GitHub pull request with gh
+
+Run `kt <command> --help` for details.";
 
 #[derive(Parser)]
 #[command(
     name = "kt",
     about = "Fast quicksaves and inspectable AI-assisted landing",
-    version
+    version,
+    after_help = WORKFLOW_HELP
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,28 +61,58 @@ enum Commands {
     },
     /// Publish the current branch after reviewing local history
     Publish,
+    /// Open a GitHub pull request for the current branch (requires gh)
+    Pr {
+        /// Create the pull request as a draft
+        #[arg(long)]
+        draft: bool,
+        /// Target base branch (defaults to the repository's default branch)
+        #[arg(long)]
+        base: Option<String>,
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Instantly revert the last land operation
     Undo,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{} {error:#}", "✗".red());
+            ExitCode::FAILURE
+        }
+    }
+}
 
-    match &cli.command {
+fn run(cli: Cli) -> Result<()> {
+    match cli.command {
         None if !is_inside_git_repository()? => {
             print!("{}", render_help());
             Ok(())
         }
-        Some(Commands::Go { name }) => go(name),
+        None => save(),
+        Some(Commands::Go { name }) => go(&name),
         Some(Commands::Land {
             push,
             allow_dirty,
             yes,
-        }) => run_land(*push, *yes, *allow_dirty),
+        }) => block_on(land(push, yes, allow_dirty)),
         Some(Commands::Publish) => publish_current_branch(),
+        Some(Commands::Pr { draft, base, yes }) => {
+            block_on(create_pull_request(PrOptions { draft, base, yes }))
+        }
         Some(Commands::Undo) => undo(),
-        None => save(),
     }
+}
+
+fn block_on(future: impl Future<Output = Result<()>>) -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(future)
 }
 
 fn render_help() -> String {
@@ -74,27 +120,37 @@ fn render_help() -> String {
     format!("{}\n", command.render_help())
 }
 
-fn run_land(push: bool, auto_confirm: bool, allow_dirty: bool) -> Result<()> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(land(push, auto_confirm, allow_dirty))
-}
-
 fn save() -> Result<()> {
-    let status = execute_git(&["status", "--porcelain"])?;
+    // -uall lists files inside untracked directories, so the count is honest.
+    let status = execute_git(&["status", "--porcelain", "-uall"])?;
     if status.trim().is_empty() {
+        let note = match kite_save_stack()? {
+            Some(stack) => format!(
+                "nothing new — {} ready to land",
+                pluralize(stack.count, "save")
+            ),
+            None => "nothing to save".to_string(),
+        };
+        println!("{} {}", "·".dimmed(), note.dimmed());
         return Ok(());
     }
 
-    if !has_staged_changes(&status) {
+    let has_staged = has_staged_changes(&status);
+    let saved_files = if has_staged {
+        status.lines().filter(|l| is_staged_status_line(l)).count()
+    } else {
         execute_git_quiet(&["add", "-A"])?;
-    }
+        status.lines().filter(|l| !l.trim().is_empty()).count()
+    };
 
-    let msg = format!("[kite] save {}", Local::now().format("%H:%M:%S"));
+    let msg = format!("{SAVE_PREFIX} {}", Local::now().format("%H:%M:%S"));
     execute_git_quiet(&["commit", "-m", &msg, "--no-verify"])?;
 
-    println!("{} {}", "·".dimmed(), "saved".dimmed());
+    println!(
+        "{} {}",
+        "·".dimmed(),
+        format!("saved {}", pluralize(saved_files, "file")).dimmed()
+    );
     Ok(())
 }
 
@@ -102,40 +158,40 @@ fn go(name: &str) -> Result<()> {
     let local_ref = format!("refs/heads/{name}");
     if check_ref(&local_ref).is_some() {
         execute_git(&["checkout", name])?;
-        println!(
-            "{} Switched to existing flow branch: {} {}",
-            "·".cyan(),
-            name.bold(),
-            "(no new branch created)".dimmed()
-        );
+        println!("{} Switched to {}", "✓".green(), name.bold());
         return Ok(());
     }
 
     let default_branch = get_default_branch()?;
+    let remote_base = format!("origin/{default_branch}");
 
-    if has_remote() {
+    let base = if has_remote() {
         let _ = execute_git(&["fetch", "origin", &default_branch]);
-        execute_git(&[
-            "checkout",
-            "-b",
-            name,
-            &format!("origin/{}", default_branch),
-        ])
-        .or_else(|_| execute_git(&["checkout", "-b", name, &default_branch]))?;
+        match execute_git(&["checkout", "-b", name, &remote_base]) {
+            Ok(_) => remote_base,
+            Err(_) => {
+                execute_git(&["checkout", "-b", name, &default_branch])?;
+                default_branch
+            }
+        }
     } else {
         execute_git(&["checkout", "-b", name, &default_branch])?;
-    }
+        default_branch
+    };
 
-    println!("{} Switched to flow branch: {}", "·".cyan(), name.bold());
+    println!(
+        "{} Created {} {}",
+        "✓".green(),
+        name.bold(),
+        format!("from {base}").dimmed()
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{acquire_cwd_lock, git, init_repo, write_file};
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::test_support::{TempDir, acquire_cwd_lock, git, init_repo, write_file};
 
     fn run_save_in_repo(repo: &std::path::Path) -> Result<()> {
         crate::test_support::with_repo_cwd(repo, save)
@@ -154,20 +210,6 @@ mod tests {
             save()?;
             Ok(None)
         })
-    }
-
-    fn temp_dir() -> std::path::PathBuf {
-        let unique = format!(
-            "kite-test-non-repo-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time should be after unix epoch")
-                .as_nanos()
-        );
-        let path = std::env::temp_dir().join(unique);
-        fs::create_dir_all(&path).expect("temp dir should be created");
-        path
     }
 
     #[test]
@@ -216,6 +258,18 @@ mod tests {
     }
 
     #[test]
+    fn save_on_clean_tree_is_a_safe_no_op() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let head_before = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        run_save_in_repo(&repo.path).expect("clean-tree save should succeed");
+
+        let head_after = git(&repo.path, &["rev-parse", "HEAD"]);
+        assert_eq!(head_before, head_after);
+    }
+
+    #[test]
     fn go_switches_to_existing_branch_without_recreating_it() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
@@ -241,15 +295,14 @@ mod tests {
     #[test]
     fn default_command_shows_help_outside_git_repo() {
         let _lock = acquire_cwd_lock();
-        let dir = temp_dir();
+        let dir = TempDir::new("kite-test-non-repo");
 
-        let help = run_default_in_cwd(&dir)
+        let help = run_default_in_cwd(&dir.path)
             .expect("default command should succeed outside a git repo")
             .expect("non-git repo should render help");
 
         assert!(help.contains("Fast quicksaves and inspectable AI-assisted landing"));
         assert!(help.contains("Usage: kt [COMMAND]"));
-
-        fs::remove_dir_all(dir).expect("temp dir should be removed");
+        assert!(help.contains("Everyday flow:"));
     }
 }

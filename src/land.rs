@@ -1,21 +1,19 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use colored::*;
 use std::collections::HashSet;
-use std::io::{self, Write};
-use std::process::{Command, Stdio};
 
 use crate::git::{
     KiteBase, changed_files_for_base, check_ref, commit_git, diff_for_base, execute_git,
-    get_current_branch, get_kite_base, has_head_commit, has_remote, sorted_files,
+    get_current_branch, has_head_commit, has_remote, kite_save_stack, sorted_files,
 };
-use crate::synth::{
-    CommitGroup, ProviderFailure, flatten_error, normalize_groups, synthesize_groups,
-};
+use crate::synth::{CommitGroup, normalize_groups, synthesize_groups};
+use crate::ui::{Spinner, confirm, pluralize, print_provider_failures, prompt_line};
 
 #[derive(Clone, Debug)]
 struct LandScope {
     base: KiteBase,
+    save_count: usize,
     diff: String,
     actual_files: HashSet<String>,
 }
@@ -32,68 +30,74 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
             return Ok(());
         };
 
-        print!("{} Synthesizing... ", "·".cyan());
-        io::stdout().flush()?;
+        let spinner = Spinner::start("Synthesizing");
+        let synthesized = synthesize_groups(&scope.diff, &scope.actual_files).await;
+        spinner.stop();
 
-        let (raw_groups, provider_label) =
-            match synthesize_groups(&scope.diff, &scope.actual_files).await {
-                Ok((groups, provider_label)) => {
-                    println!("({provider_label})");
-                    (groups, provider_label)
+        let (raw_groups, provider_label) = match synthesized {
+            Ok(result) => result,
+            Err(failures) => {
+                print_provider_failures(&failures);
+                if auto_confirm {
+                    anyhow::bail!(
+                        "AI synthesis is unavailable. Rerun `kt land` without --yes to enter a commit message manually."
+                    );
                 }
-                Err(failures) => {
-                    println!("{}", "unavailable".dimmed());
-                    let Some(message) = prompt_manual_commit_message(&failures)? else {
-                        println!("{} Aborted. No history changed.", "·".red());
-                        return Ok(());
-                    };
-                    (
-                        vec![CommitGroup {
-                            message,
-                            files: sorted_files(&scope.actual_files),
-                        }],
-                        "manual",
-                    )
-                }
-            };
+                let Some(message) = prompt_line("One commit message (blank to abort)")? else {
+                    println!("{} Aborted — no history changed", "·".red());
+                    return Ok(());
+                };
+                (
+                    vec![CommitGroup {
+                        message,
+                        files: sorted_files(&scope.actual_files),
+                    }],
+                    "manual",
+                )
+            }
+        };
 
         let groups = normalize_groups(raw_groups, &scope.actual_files);
         if groups.is_empty() {
             anyhow::bail!("No changed files were assigned to landed commit groups.");
         }
 
-        println!();
-        print_land_plan(&groups, provider_label);
+        print!(
+            "{}",
+            render_land_plan(&groups, provider_label, scope.save_count)
+        );
 
-        if !auto_confirm && !confirm_land(push)? {
-            println!("{} Aborted. No history changed.", "·".red());
+        let question = if push {
+            "Rewrite history and publish?"
+        } else {
+            "Rewrite history?"
+        };
+        if !auto_confirm && !confirm(question)? {
+            println!("{} Aborted — no history changed", "·".red());
             return Ok(());
         }
 
         execute_land(&scope.base, &groups)?;
 
         if push {
-            publish_current_branch()?;
-            println!("{}\n", tree_tail("Landed and published").green());
+            println!("{} Landed", "✓".green());
+            publish_current_branch().context("Landed locally, but publishing failed")?;
+        } else if has_remote() {
+            println!(
+                "{} Landed — review, then {} or {}",
+                "✓".green(),
+                "kt publish".bold(),
+                "kt pr".bold()
+            );
         } else {
-            if has_remote() {
-                let current_branch = get_current_branch()?;
-                println!(
-                    "{} Review the rewritten history, then run `kt publish` or `git push --force-with-lease origin {}`.",
-                    "·".dimmed(),
-                    current_branch
-                );
-            }
-            println!("{}\n", tree_tail("Landed locally").green());
+            println!("{} Landed", "✓".green());
         }
 
         Ok(())
     })
     .await;
 
-    if stashed
-        && let Err(restore_error) = restore_dirty_worktree_for_land()
-    {
+    if stashed && let Err(restore_error) = restore_dirty_worktree_for_land() {
         return match land_result {
             Ok(_) => Err(restore_error),
             Err(land_error) => Err(anyhow!(
@@ -105,90 +109,75 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
     land_result
 }
 
+/// Pushes with `--force-with-lease` and nothing else. Deliberately no
+/// `pull --rebase` first: after a land the remote holds the old saves, and
+/// rebasing onto them would resurrect the history we just rewrote. The lease
+/// protects anything pushed by someone else — the push is rejected and the
+/// user decides.
 pub(crate) fn publish_current_branch() -> Result<()> {
     if !has_remote() {
-        println!(
-            "{} No remote configured. Landed history is local only.",
-            "·".dimmed()
-        );
+        println!("{} No remote — history stays local", "·".dimmed());
         return Ok(());
     }
 
-    let current_branch = get_current_branch()?;
+    let branch = get_current_branch()?;
 
-    print!("{} ", tree_line("Pulling remote changes..."));
-    io::stdout().flush()?;
-    match execute_git(&["pull", "--rebase", "origin", &current_branch]) {
-        Ok(_) => println!("Done"),
-        Err(_) => println!("{}", "Skipped (no upstream or nothing to pull)".dimmed()),
-    }
-
-    print!("{} ", tree_line("Publishing to remote..."));
-    io::stdout().flush()?;
-
-    match execute_git(&[
+    let spinner = Spinner::start(format!("Publishing {branch}"));
+    let pushed = execute_git(&[
         "push",
         "--set-upstream",
         "origin",
-        &current_branch,
+        &branch,
         "--force-with-lease",
-    ]) {
-        Ok(_) => println!("Done"),
-        Err(_) => println!("{}", "Failed (You may need to push manually)".yellow()),
-    }
+    ]);
+    spinner.stop();
 
+    pushed.with_context(|| {
+        format!(
+            "Push rejected. If `origin/{branch}` has commits you don't have, fetch and reconcile them first."
+        )
+    })?;
+    println!("{} Published {}", "✓".green(), branch.bold());
     Ok(())
 }
 
 pub(crate) fn undo() -> Result<()> {
-    let pre_land_sha = match check_ref("refs/kite/pre_land") {
-        Some(sha) => sha,
-        None => {
-            println!(
-                "{} Nothing to undo. No previous land operation found.",
-                "·".yellow()
-            );
-            return Ok(());
-        }
+    let Some(pre_land_sha) = check_ref("refs/kite/pre_land") else {
+        println!("{} Nothing to undo — no land recorded", "·".yellow());
+        return Ok(());
     };
 
     let status = execute_git(&["status", "--porcelain"])?;
     if !status.trim().is_empty() {
         anyhow::bail!(
-            "Working directory is not clean. Please `kt save` or stash your changes before undoing."
+            "Working directory is not clean. Please `kt` your changes or stash them before undoing."
         );
     }
 
-    print!("{} Rewinding timeline... ", "·".cyan());
-    io::stdout().flush()?;
     execute_git(&["reset", "--hard", &pre_land_sha])?;
     execute_git(&["update-ref", "-d", "refs/kite/pre_land"])?;
-    println!("Done");
 
     if has_remote() {
-        let current_branch = get_current_branch()?;
-        print!("{} Reverting remote... ", "·".cyan());
-        io::stdout().flush()?;
-
-        match Command::new("git")
-            .args(["push", "--force-with-lease", "origin", &current_branch])
-            .stderr(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
-        {
-            Ok(status) if status.success() => println!("Done"),
-            _ => println!("{}", "Failed (Remote may have diverged)".yellow()),
+        let branch = get_current_branch()?;
+        let spinner = Spinner::start("Reverting remote");
+        let reverted = execute_git(&["push", "--force-with-lease", "origin", &branch]);
+        spinner.stop();
+        if reverted.is_err() {
+            println!(
+                "{} Remote not reverted — it may have diverged",
+                "·".yellow()
+            );
         }
     }
 
-    println!("  {}\n", "└─ Restored previous saves".green());
+    println!("{} Restored pre-land saves", "✓".green());
     Ok(())
 }
 
 fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
     if !has_head_commit() {
         println!(
-            "{} Repository has no commits yet. Create an initial commit before running `kt land`.",
+            "{} No commits yet — make an initial commit before landing",
             "·".yellow()
         );
         return Ok(None);
@@ -198,32 +187,35 @@ fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
         let status = execute_git(&["status", "--porcelain"])?;
         if !status.trim().is_empty() {
             anyhow::bail!(
-                "Working directory must be clean before `kt land`. Run `kt` to snapshot current work or stash unrelated changes first."
+                "Working directory must be clean before `kt land`. Run `kt` to snapshot current work, or use `kt land --allow-dirty` to stash it temporarily."
             );
         }
     }
 
-    let Some(base) = get_kite_base()? else {
+    let Some(stack) = kite_save_stack()? else {
         println!(
-            "{} Nothing to land. Create one or more contiguous `[kite] save` commits first.",
-            "·".dimmed()
+            "{} {}",
+            "·".dimmed(),
+            "nothing to land — create saves with `kt` first".dimmed()
         );
         return Ok(None);
     };
 
-    let diff = diff_for_base(&base)?;
-    let actual_files = changed_files_for_base(&base)?;
+    let diff = diff_for_base(&stack.base)?;
+    let actual_files = changed_files_for_base(&stack.base)?;
 
     if actual_files.is_empty() {
         println!(
-            "{} Nothing to land. No file changes were found.",
-            "·".dimmed()
+            "{} {}",
+            "·".dimmed(),
+            "nothing to land — the saves contain no changes".dimmed()
         );
         return Ok(None);
     }
 
     Ok(Some(LandScope {
-        base,
+        base: stack.base,
+        save_count: stack.count,
         diff,
         actual_files,
     }))
@@ -250,74 +242,31 @@ fn restore_dirty_worktree_for_land() -> Result<()> {
     Ok(())
 }
 
-fn print_land_plan(groups: &[CommitGroup], provider_label: &str) {
-    println!(
-        "{} Proposed history using {} synthesis:",
+/// Renders the proposed history as a numbered list of commits, each with a
+/// small file tree underneath.
+fn render_land_plan(groups: &[CommitGroup], provider_label: &str, save_count: usize) -> String {
+    let mut plan = format!(
+        "{} Plan ({provider_label}): {} {} {}\n\n",
         "·".cyan(),
-        provider_label
+        pluralize(save_count, "save"),
+        "→".dimmed(),
+        pluralize(groups.len(), "commit"),
     );
 
-    for group in groups {
-        println!(
-            "{}",
-            tree_line(&format!(
-                "{} ({})",
-                group.message,
-                pluralize(group.files.len(), "file")
-            ))
-        );
-        for file in &group.files {
-            println!("{}", tree_branch(file));
+    for (index, group) in groups.iter().enumerate() {
+        plan.push_str(&format!("  {}. {}\n", index + 1, group.message.bold()));
+        for (position, file) in group.files.iter().enumerate() {
+            let glyph = if position + 1 == group.files.len() {
+                "└─"
+            } else {
+                "├─"
+            };
+            plan.push_str(&format!("     {} {}\n", glyph.dimmed(), file));
         }
     }
-}
 
-fn confirm_land(push: bool) -> Result<bool> {
-    let action = if push {
-        "rewrite local history and publish it"
-    } else {
-        "rewrite local history"
-    };
-
-    print!("{} Proceed and {}? [y/N]: ", "·".cyan(), action);
-    io::stdout().flush()?;
-
-    let mut response = String::new();
-    io::stdin().read_line(&mut response)?;
-
-    Ok(matches!(response.trim(), "y" | "Y" | "yes" | "YES"))
-}
-
-fn prompt_manual_commit_message(failures: &[ProviderFailure]) -> Result<Option<String>> {
-    println!();
-    println!("{} Automatic synthesis was unavailable:", "·".yellow());
-
-    for failure in failures {
-        println!(
-            "{}",
-            tree_line(&format!(
-                "{}: {}",
-                failure.provider,
-                flatten_error(&failure.error)
-            ))
-        );
-    }
-
-    print!(
-        "{} Single commit message (leave blank to abort): ",
-        "·".cyan()
-    );
-    io::stdout().flush()?;
-
-    let mut msg = String::new();
-    io::stdin().read_line(&mut msg)?;
-
-    let msg = msg.trim();
-    if msg.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(msg.to_string()))
+    plan.push('\n');
+    plan
 }
 
 fn execute_land(base: &KiteBase, groups: &[CommitGroup]) -> Result<()> {
@@ -385,7 +334,6 @@ fn commit_groups(groups: &[CommitGroup]) -> Result<()> {
             execute_git(&["add", "--", file])?;
         }
         commit_git(&group.message)?;
-        println!("{}", tree_line(&group.message));
     }
 
     Ok(())
@@ -397,30 +345,6 @@ fn finalize_landed_branch(original_branch: &str, temp_branch: &str) -> Result<()
     execute_git(&["checkout", original_branch])?;
     execute_git(&["branch", "-D", temp_branch])?;
     Ok(())
-}
-
-// The land summary is drawn as a small tree: each step hangs off a dimmed
-// vertical trunk, file entries branch from it, and the summary closes on a tail.
-// Defining the glyphs here keeps the shape in one place so every call site reads
-// as intent rather than ASCII art.
-fn tree_line(message: &str) -> String {
-    format!("  {} {}", "│".dimmed(), message)
-}
-
-fn tree_branch(file: &str) -> String {
-    format!("  {} {} {}", "│".dimmed(), "├─".dimmed(), file)
-}
-
-fn tree_tail(message: &str) -> String {
-    format!("  └─ {}", message)
-}
-
-fn pluralize(count: usize, singular: &str) -> String {
-    if count == 1 {
-        format!("1 {singular}")
-    } else {
-        format!("{count} {singular}s")
-    }
 }
 
 #[cfg(test)]
@@ -450,16 +374,31 @@ mod tests {
     }
 
     #[test]
-    fn tree_lines_match_land_summary_layout() {
+    fn render_land_plan_numbers_commits_and_closes_file_trees() {
         // Pin colors off so we assert the structural layout, not ANSI codes.
         colored::control::set_override(false);
 
-        assert_eq!(
-            tree_line("Publishing to remote... Done"),
-            "  │ Publishing to remote... Done"
+        let plan = render_land_plan(
+            &[
+                CommitGroup {
+                    message: "feat(api): add webhooks".to_string(),
+                    files: vec!["src/api.rs".to_string(), "src/hooks.rs".to_string()],
+                },
+                CommitGroup {
+                    message: "docs: refresh readme".to_string(),
+                    files: vec!["README.md".to_string()],
+                },
+            ],
+            "local",
+            3,
         );
-        assert_eq!(tree_branch("src/main.rs"), "  │ ├─ src/main.rs");
-        assert_eq!(tree_tail("Landed"), "  └─ Landed");
+
+        assert!(plan.contains("Plan (local): 3 saves → 2 commits"));
+        assert!(plan.contains("  1. feat(api): add webhooks\n"));
+        assert!(plan.contains("     ├─ src/api.rs\n"));
+        assert!(plan.contains("     └─ src/hooks.rs\n"));
+        assert!(plan.contains("  2. docs: refresh readme\n"));
+        assert!(plan.contains("     └─ README.md\n"));
     }
 
     #[test]
@@ -489,6 +428,7 @@ mod tests {
             .expect("land scope should collect when allow_dirty is true")
             .expect("kite saves should be landable");
         assert!(matches!(scope.base, KiteBase::Commit(_)));
+        assert_eq!(scope.save_count, 1);
         assert!(scope.actual_files.contains("tracked.txt"));
     }
 

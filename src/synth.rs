@@ -1,14 +1,14 @@
-use anyhow::{Context, Result};
+//! Turns the diff introduced by Kite saves into a validated commit plan.
+
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::env;
-use std::time::Duration;
 
+use crate::ai::{self, ProviderFailure, extract_json_block};
 use crate::git::{recent_commit_style_examples, sorted_files};
 
 const MAX_COMMIT_STYLE_EXAMPLES: usize = 6;
-const DEFAULT_LOCAL_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 120;
+pub(crate) const MAX_DIFF_BYTES: usize = 20_000;
 
 const SYSTEM_PROMPT: &str = "\
 You are an expert version control synthesis engine. Analyze the git diff.
@@ -30,8 +30,8 @@ Rules for file assignment:
 4. Do not omit files.
 5. Do not duplicate files across groups.
 
-Return ONLY a valid JSON array of objects. Absolutely no markdown or conversational text.
-Schema: [ { \"message\": \"feat(auth): implement JWT validation\", \"files\": [\"src/auth.rs\"] } ]";
+Return ONLY valid JSON. Absolutely no markdown or conversational text.
+Schema: { \"groups\": [ { \"message\": \"feat(auth): implement JWT validation\", \"files\": [\"src/auth.rs\"] } ] }";
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGroup {
@@ -44,36 +44,23 @@ struct CommitGroupsEnvelope {
     groups: Vec<CommitGroup>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ProviderFailure {
-    pub(crate) provider: &'static str,
-    pub(crate) error: String,
-}
-
 pub(crate) async fn synthesize_groups(
     diff: &str,
     actual_files: &HashSet<String>,
 ) -> std::result::Result<(Vec<CommitGroup>, &'static str), Vec<ProviderFailure>> {
-    let mut failures = Vec::new();
+    let user = build_synthesis_input(diff, actual_files);
 
-    match try_local_ollama(diff, actual_files).await {
-        Ok(groups) => return Ok((groups, "local")),
-        Err(local_error) => failures.push(ProviderFailure {
-            provider: "local",
-            error: format!("{local_error:#}"),
-        }),
-    }
+    let request = ai::Request {
+        system: SYSTEM_PROMPT,
+        user: &user,
+        schema_name: "commit_groups",
+        schema: groups_schema(),
+    };
 
-    match try_openai(diff, actual_files).await {
-        Ok(groups) => Ok((groups, "cloud")),
-        Err(openai_error) => {
-            failures.push(ProviderFailure {
-                provider: "cloud",
-                error: format!("{openai_error:#}"),
-            });
-            Err(failures)
-        }
-    }
+    ai::complete(&request, |raw| {
+        parse_groups(raw).and_then(|groups| validate_group_coverage(groups, actual_files))
+    })
+    .await
 }
 
 pub(crate) fn normalize_groups(
@@ -109,122 +96,36 @@ pub(crate) fn normalize_groups(
     normalized
 }
 
-pub(crate) fn flatten_error(error: &str) -> String {
-    error
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" | ")
-}
-
-async fn try_local_ollama(diff: &str, actual_files: &HashSet<String>) -> Result<Vec<CommitGroup>> {
-    let prompt = build_synthesis_input(diff, actual_files, 15_000)?;
-    let timeout = env_duration_secs(&["KITE_LOCAL_TIMEOUT_SECS"], DEFAULT_LOCAL_TIMEOUT_SECS)?;
-    let client = reqwest::Client::builder().timeout(timeout).build()?;
-
-    let body = serde_json::json!({
-        "model": env::var("KITE_LOCAL_MODEL").unwrap_or_else(|_| "llama3".to_string()),
-        "messages": [
-            { "role": "system", "content": SYSTEM_PROMPT },
-            { "role": "user", "content": prompt }
-        ],
-        "stream": false,
-        "format": "json"
-    });
-
-    let res = client
-        .post("http://localhost:11434/api/chat")
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?;
-    let json: serde_json::Value = res.json().await?;
-    let content = json["message"]["content"].as_str().unwrap_or("[]");
-
-    parse_json(content).and_then(|groups| validate_group_coverage(groups, actual_files))
-}
-
-async fn try_openai(diff: &str, actual_files: &HashSet<String>) -> Result<Vec<CommitGroup>> {
-    let (base_url, model, api_key) = get_openai_env_config()?;
-    let timeout = env_duration_secs(&["KITE_OPENAI_TIMEOUT_SECS"], DEFAULT_OPENAI_TIMEOUT_SECS)?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(timeout)
-        .build()?;
-
-    let prompt = format!(
-        "{}\nFor this provider, return an object exactly like: {{ \"groups\": [{{\"message\":\"...\",\"files\":[\"...\"]}}] }}\n\n{}",
-        SYSTEM_PROMPT,
-        build_synthesis_input(diff, actual_files, 20_000)?
-    );
-
-    let body = serde_json::json!({
-        "model": model,
-        "input": prompt,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "commit_groups",
-                "strict": true,
-                "schema": {
+fn groups_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["groups"],
+        "properties": {
+            "groups": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["groups"],
+                    "required": ["message", "files"],
                     "properties": {
-                        "groups": {
+                        "message": { "type": "string", "minLength": 1 },
+                        "files": {
                             "type": "array",
                             "minItems": 1,
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": ["message", "files"],
-                                "properties": {
-                                    "message": { "type": "string", "minLength": 1 },
-                                    "files": {
-                                        "type": "array",
-                                        "minItems": 1,
-                                        "items": { "type": "string", "minLength": 1 }
-                                    }
-                                }
-                            }
+                            "items": { "type": "string", "minLength": 1 }
                         }
                     }
                 }
             }
         }
-    });
-
-    let responses_url = format!("{}/responses", base_url.trim_end_matches('/'));
-    let mut request = client.post(&responses_url).bearer_auth(api_key).json(&body);
-    if url_uses_portkey(&responses_url) {
-        let portkey_api_key = first_non_empty_env(&["PORTKEY_API_KEY"])
-            .context("PORTKEY_API_KEY is required when the OpenAI URL routes through portkey")?;
-        request = request.header("x-portkey-api-key", portkey_api_key);
-    }
-
-    let res = request
-        .send()
-        .await
-        .with_context(|| "Failed to send request to OpenAI Responses API")?
-        .error_for_status()
-        .with_context(|| "OpenAI Responses API returned non-success status")?;
-
-    let json: serde_json::Value = res.json().await?;
-    parse_openai_groups(&json).and_then(|groups| validate_group_coverage(groups, actual_files))
+    })
 }
 
-fn url_uses_portkey(url: &str) -> bool {
-    url.to_ascii_lowercase().contains("portkey")
-}
-
-fn build_synthesis_input(
-    diff: &str,
-    actual_files: &HashSet<String>,
-    max_diff_bytes: usize,
-) -> Result<String> {
+fn build_synthesis_input(diff: &str, actual_files: &HashSet<String>) -> String {
     let mut prompt = String::new();
-    let examples = recent_commit_style_examples(MAX_COMMIT_STYLE_EXAMPLES)?;
+    let examples = recent_commit_style_examples(MAX_COMMIT_STYLE_EXAMPLES);
 
     if !examples.is_empty() {
         prompt.push_str("Recent non-Kite commit message examples from this repository:\n");
@@ -245,8 +146,8 @@ fn build_synthesis_input(
     prompt.push('\n');
 
     prompt.push_str("Diff (may be truncated; rely on the changed-file list for full coverage):\n");
-    prompt.push_str(truncate_for_prompt(diff, max_diff_bytes));
-    Ok(prompt)
+    prompt.push_str(truncate_for_prompt(diff, MAX_DIFF_BYTES));
+    prompt
 }
 
 fn validate_group_coverage(
@@ -305,195 +206,32 @@ fn validate_group_coverage(
     );
 }
 
-fn get_openai_env_config() -> Result<(String, String, String)> {
-    let base_url = first_non_empty_env(&[
-        "KITE_OPENAI_URL",
-        "KITE_OPENAI_BASE_URL",
-        "OPENAI_URL",
-        "OPENAI_BASE_URL",
-    ])
-    .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+/// Accepts the three shapes models actually produce: a bare array, a
+/// `{ "groups": [...] }` envelope, or either of those buried in prose/fences.
+fn parse_groups(raw: &str) -> Result<Vec<CommitGroup>> {
+    let raw = raw.trim();
 
-    let model = first_non_empty_env(&["KITE_OPENAI_MODEL", "OPENAI_MODEL"])
-        .unwrap_or_else(|| "gpt-5.4-mini".to_string());
-
-    let api_key = first_non_empty_env(&[
-        "KITE_OPENAI_API_KEY",
-        "OPENAI_API_KEY",
-        "KITE_API_KEY",
-        "OPENAI_KEY",
-    ])
-    .context(
-        "No OpenAI API key found in KITE_OPENAI_API_KEY, OPENAI_API_KEY, KITE_API_KEY, or OPENAI_KEY",
-    )?;
-
-    let completions_base = base_url.trim_end_matches('/');
-    let normalized_base = if completions_base.ends_with("/responses") {
-        completions_base.trim_end_matches("/responses").to_string()
-    } else if completions_base.ends_with("/chat/completions") {
-        completions_base
-            .trim_end_matches("/chat/completions")
-            .to_string()
-    } else if completions_base.ends_with("/v1") {
-        completions_base.to_string()
-    } else {
-        format!("{}/v1", completions_base)
-    };
-
-    Ok((normalized_base, model, api_key))
-}
-
-fn extract_openai_output_text(json: &serde_json::Value) -> String {
-    if let Some(s) = json.get("output_text").and_then(|v| v.as_str()) {
-        return s.to_string();
-    }
-
-    if let Some(output) = json.get("output").and_then(|v| v.as_array()) {
-        for item in output {
-            if let Some(content_items) = item.get("content").and_then(|v| v.as_array()) {
-                for content_item in content_items {
-                    if let Some(text) = content_item.get("text").and_then(|v| v.as_str()) {
-                        return text.to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    json.pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn parse_openai_groups(json: &serde_json::Value) -> Result<Vec<CommitGroup>> {
-    if let Some(output) = json.get("output").and_then(|v| v.as_array()) {
-        for item in output {
-            if let Some(content_items) = item.get("content").and_then(|v| v.as_array()) {
-                for content_item in content_items {
-                    if let Some(structured) = content_item.get("json") {
-                        let parsed: CommitGroupsEnvelope =
-                            serde_json::from_value(structured.clone())?;
-                        if !parsed.groups.is_empty() {
-                            return Ok(parsed.groups);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let content = extract_openai_output_text(json);
-    if let Ok(parsed) = serde_json::from_str::<CommitGroupsEnvelope>(content.trim())
-        && !parsed.groups.is_empty()
-    {
-        return Ok(parsed.groups);
-    }
-
-    parse_json(&content)
-}
-
-fn first_non_empty_env(keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        env::var(key)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    })
-}
-
-fn env_duration_secs(keys: &[&str], default_secs: u64) -> Result<Duration> {
-    let Some(raw) = first_non_empty_env(keys) else {
-        return Ok(Duration::from_secs(default_secs));
-    };
-
-    parse_timeout_secs(&raw)
-        .map(Duration::from_secs)
-        .with_context(|| format!("Invalid timeout in {}", keys.join(", ")))
-}
-
-fn parse_timeout_secs(raw: &str) -> Result<u64> {
-    let seconds: u64 = raw.trim().parse()?;
-    if seconds == 0 {
-        anyhow::bail!("timeout must be greater than zero seconds");
-    }
-    Ok(seconds)
-}
-
-fn parse_json(raw: &str) -> Result<Vec<CommitGroup>> {
-    if let Ok(groups) = serde_json::from_str::<Vec<CommitGroup>>(raw.trim())
+    if let Ok(groups) = serde_json::from_str::<Vec<CommitGroup>>(raw)
         && !groups.is_empty()
     {
         return Ok(groups);
     }
 
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim())
-        && let Some(groups_value) = value.get("groups")
+    if let Ok(envelope) = serde_json::from_str::<CommitGroupsEnvelope>(raw)
+        && !envelope.groups.is_empty()
     {
-        let groups: Vec<CommitGroup> = serde_json::from_value(groups_value.clone())?;
-        if !groups.is_empty() {
-            return Ok(groups);
-        }
+        return Ok(envelope.groups);
     }
 
-    let json_str = extract_first_json_array(raw).unwrap_or_else(|| "[]".to_string());
-    let groups: Vec<CommitGroup> = serde_json::from_str(&json_str)?;
-
+    let embedded_array = extract_json_block(raw, '[', ']').unwrap_or("[]");
+    let groups: Vec<CommitGroup> = serde_json::from_str(embedded_array)?;
     if groups.is_empty() {
-        anyhow::bail!("Empty JSON array parsed");
+        anyhow::bail!("Model reply contained no commit groups");
     }
     Ok(groups)
 }
 
-fn extract_first_json_array(raw: &str) -> Option<String> {
-    let mut start_idx: Option<usize> = None;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (idx, ch) in raw.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => in_string = true,
-            '[' => {
-                if start_idx.is_none() {
-                    start_idx = Some(idx);
-                }
-                depth += 1;
-            }
-            ']' => {
-                if depth == 0 {
-                    continue;
-                }
-                depth -= 1;
-                if depth == 0
-                    && let Some(start) = start_idx
-                {
-                    return Some(raw[start..=idx].to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn truncate_for_prompt(text: &str, max_bytes: usize) -> &str {
+pub(crate) fn truncate_for_prompt(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
     }
@@ -510,7 +248,6 @@ fn truncate_for_prompt(text: &str, max_bytes: usize) -> &str {
 mod tests {
     use super::*;
     use crate::test_support::{acquire_cwd_lock, git, init_repo, with_repo_cwd, write_file};
-    use serde_json::json;
 
     fn assert_single_group(groups: Vec<CommitGroup>, message: &str, file: &str) {
         assert_eq!(groups.len(), 1);
@@ -519,94 +256,27 @@ mod tests {
     }
 
     #[test]
-    fn extract_first_json_array_ignores_brackets_inside_strings() {
-        let raw = r#"noise "[ignore]" before [{"message":"feat: add parser","files":["src/main.rs"]}] after"#;
-        let extracted = extract_first_json_array(raw).expect("array should be extracted");
+    fn parse_groups_accepts_bare_arrays() {
+        let raw = r#"[{"message":"feat: add parser","files":["src/main.rs"]}]"#;
+        let parsed = parse_groups(raw).expect("bare array should parse");
 
-        assert_eq!(
-            extracted,
-            r#"[{"message":"feat: add parser","files":["src/main.rs"]}]"#
-        );
+        assert_single_group(parsed, "feat: add parser", "src/main.rs");
     }
 
     #[test]
-    fn parse_json_accepts_groups_envelope_shape() {
+    fn parse_groups_accepts_groups_envelope_shape() {
         let raw = r#"{"groups":[{"message":"fix: tighten parsing","files":["src/main.rs"]}]}"#;
-        let parsed = parse_json(raw).expect("groups envelope should parse");
+        let parsed = parse_groups(raw).expect("groups envelope should parse");
 
         assert_single_group(parsed, "fix: tighten parsing", "src/main.rs");
     }
 
     #[test]
-    fn parse_json_extracts_array_from_mixed_text() {
+    fn parse_groups_extracts_array_from_mixed_text() {
         let raw = "Result:\n```json\n[{\"message\":\"chore: update deps\",\"files\":[\"Cargo.toml\"]}]\n```";
-        let parsed = parse_json(raw).expect("embedded json array should parse");
+        let parsed = parse_groups(raw).expect("embedded json array should parse");
 
         assert_single_group(parsed, "chore: update deps", "Cargo.toml");
-    }
-
-    #[test]
-    fn parse_openai_groups_uses_structured_json_when_present() {
-        let payload = json!({
-            "output": [
-                {
-                    "content": [
-                        {
-                            "json": {
-                                "groups": [
-                                    {
-                                        "message": "feat(cli): add flow command",
-                                        "files": ["src/main.rs"]
-                                    }
-                                ]
-                            }
-                        }
-                    ]
-                }
-            ]
-        });
-
-        let parsed = parse_openai_groups(&payload).expect("structured output should parse");
-
-        assert_single_group(parsed, "feat(cli): add flow command", "src/main.rs");
-    }
-
-    #[test]
-    fn parse_openai_groups_falls_back_to_output_text() {
-        let payload = json!({
-            "output_text": "[{\"message\":\"docs: clarify readme\",\"files\":[\"README.md\"]}]"
-        });
-
-        let parsed = parse_openai_groups(&payload).expect("output_text should parse");
-
-        assert_single_group(parsed, "docs: clarify readme", "README.md");
-    }
-
-    #[test]
-    fn parse_timeout_secs_accepts_positive_integer_seconds() {
-        assert_eq!(
-            parse_timeout_secs("120").expect("timeout should parse"),
-            120
-        );
-        assert_eq!(
-            parse_timeout_secs(" 45 ").expect("trimmed timeout should parse"),
-            45
-        );
-    }
-
-    #[test]
-    fn parse_timeout_secs_rejects_zero_and_invalid_values() {
-        let zero = parse_timeout_secs("0").expect_err("zero should fail");
-        assert!(format!("{zero:#}").contains("greater than zero"));
-
-        let invalid = parse_timeout_secs("slow").expect_err("non-number should fail");
-        assert!(format!("{invalid:#}").contains("invalid digit"));
-    }
-
-    #[test]
-    fn url_uses_portkey_detects_portkey_hosts_case_insensitively() {
-        assert!(url_uses_portkey("https://example.PortKey.ai/v1/responses"));
-        assert!(!url_uses_portkey("https://api.openai.com/v1/responses"));
     }
 
     #[test]
@@ -681,9 +351,8 @@ mod tests {
             .collect();
 
         let prompt = with_repo_cwd(&repo.path, || {
-            build_synthesis_input("diff --git a/src/main.rs b/src/main.rs", &actual_files, 500)
-        })
-        .expect("prompt should build");
+            build_synthesis_input("diff --git a/src/main.rs b/src/main.rs", &actual_files)
+        });
 
         assert!(
             prompt
@@ -707,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn build_synthesis_input_includes_examples_and_truncates_diff() {
+    fn build_synthesis_input_includes_commit_style_examples() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
         let actual_files: HashSet<String> =
@@ -722,17 +391,19 @@ mod tests {
         git(&repo.path, &["commit", "-m", "docs: refresh usage"]);
 
         let prompt = with_repo_cwd(&repo.path, || {
-            build_synthesis_input("abcdefghijklmnopqrstuvwxyz", &actual_files, 8)
-        })
-        .expect("prompt should build");
+            build_synthesis_input("abcdefghijklmnopqrstuvwxyz", &actual_files)
+        });
 
         assert!(prompt.contains("Recent non-Kite commit message examples from this repository:"));
         assert!(prompt.contains("- docs: refresh usage"));
         assert!(prompt.contains("- fix(cli): tighten landing"));
-        assert!(prompt.contains(
-            "Diff (may be truncated; rely on the changed-file list for full coverage):\nabcdefgh"
-        ));
-        assert!(!prompt.contains("abcdefghi"));
+    }
+
+    #[test]
+    fn truncate_for_prompt_respects_char_boundaries() {
+        assert_eq!(truncate_for_prompt("abcdefgh", 8), "abcdefgh");
+        assert_eq!(truncate_for_prompt("abcdefghij", 8), "abcdefgh");
+        assert_eq!(truncate_for_prompt("héllo", 2), "h"); // no mid-codepoint cuts
     }
 
     #[test]

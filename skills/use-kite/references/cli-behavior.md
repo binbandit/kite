@@ -5,7 +5,7 @@
 ### `kt go <name>`
 
 - This command is optional. It creates and checks out a new branch for a fresh flow, or switches to the named local branch when it already exists.
-- When switching to an existing branch, print a note that no new branch was created.
+- Prints `Switched to <name>` for an existing branch and `Created <name> from <base>` for a new one, so the verb tells you which happened.
 - `kt`, `kt land`, and `kt publish` all operate on the current branch whether or not `kt go` was used.
 - Prefer `origin/HEAD` when it exists.
 - Otherwise fall back to `main`, `master`, or the current branch.
@@ -15,9 +15,10 @@
 ### `kt`
 
 - Run `git status --porcelain`.
-- If the worktree is clean, exit without creating a commit.
+- If the worktree is clean, print how many saves are ready to land (or "nothing to save") and exit without creating a commit.
 - If the index already contains staged changes, create a quicksave from only that staged selection.
 - Otherwise run `git add -A` and create a quicksave commit with message `[kite] save HH:MM:SS`.
+- Print how many files were saved.
 - The normal recommended workflow is still to let Kite quicksave everything; staged-only quicksaves are an explicit override.
 - Pass `--no-verify`, so Git hooks do not run for quicksaves.
 
@@ -34,7 +35,7 @@
   1. Local Ollama at `http://localhost:11434/api/chat` with `KITE_LOCAL_MODEL` or default `llama3`, and `KITE_LOCAL_TIMEOUT_SECS` or default 30 seconds
   2. OpenAI Responses API using the configured base URL, model, API key, and `KITE_OPENAI_TIMEOUT_SECS` or default 120 seconds
   3. Manual fallback that asks for one commit message before rewriting history
-- Show the proposed grouped commit plan before rewriting anything, unless `--yes` is passed.
+- Show the proposed grouped commit plan before rewriting anything; `--yes` skips only the confirmation prompt.
 - Record the pre-land `HEAD` at `refs/kite/pre_land`.
 - If rewriting fails mid-land, keep the in-progress state on a `kite-recovery-*` branch so partial commits or staged changes are preserved.
 - Rewrite history locally by default.
@@ -44,8 +45,23 @@
 ### `kt publish`
 
 - If no remote exists, print a note and exit successfully.
-- Otherwise try `git pull --rebase origin <branch>`.
-- Then push the current branch with `--set-upstream origin <branch> --force-with-lease`.
+- Push the current branch with `--set-upstream origin <branch> --force-with-lease` — no `pull --rebase` first, so a land never gets rebased onto the remote's stale saves.
+- A rejected lease (someone else pushed) is reported as an error for the user to reconcile manually.
+
+### `kt pr [--draft] [--base <branch>] [--yes]`
+
+- Requires the GitHub CLI (`gh`) to be installed and authenticated (checked offline via `gh auth token`), and a remote to exist.
+- Refuses to run on the base branch or with unlanded `[kite] save` commits (run `kt land` first).
+- If an open pull request already exists for the branch, prints its URL and exits; merged or closed PRs do not block a new one.
+- Fetches `origin/<branch>` and publishes when the remote is missing the branch or out of date.
+- Gathers context for the draft:
+  - the commits and diff between the base branch and `HEAD`
+  - the repository's pull request template (checked case-insensitively in the root, `.github/`, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`)
+  - PR-related agent skills (`SKILL.md` files mentioning pull requests) from `.claude/skills`, `.agents/skills`, and `skills` in the repo, plus `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills`
+  - recent merged pull request titles as style examples
+- Drafts the title and body with the same Ollama → OpenAI cascade as `kt land`; without AI it falls back to a deterministic draft from the template and commit subjects.
+- Previews the draft and asks for confirmation before running `gh pr create` (skip with `--yes`).
+- `--draft` creates a draft pull request; `--base` overrides the detected default branch.
 
 ### `kt undo`
 
@@ -73,3 +89,4 @@
 - `git log --oneline -n 12`
 - `command -v kt`
 - `git remote -v`
+- `command -v gh` (before `kt pr`)

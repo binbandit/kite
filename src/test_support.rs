@@ -15,14 +15,14 @@ pub(crate) fn acquire_cwd_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-pub(crate) struct TempRepo {
+pub(crate) struct TempDir {
     pub(crate) path: PathBuf,
 }
 
-impl TempRepo {
-    fn new() -> Self {
+impl TempDir {
+    pub(crate) fn new(prefix: &str) -> Self {
         let unique = format!(
-            "kite-test-{}-{}",
+            "{prefix}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -30,12 +30,12 @@ impl TempRepo {
                 .as_nanos()
         );
         let path = std::env::temp_dir().join(unique);
-        fs::create_dir_all(&path).expect("temp repo directory should be created");
+        fs::create_dir_all(&path).expect("temp directory should be created");
         Self { path }
     }
 }
 
-impl Drop for TempRepo {
+impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
@@ -58,8 +58,12 @@ pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-pub(crate) fn write_file(repo: &Path, path: &str, contents: &str) {
-    fs::write(repo.join(path), contents).expect("test file should be written");
+pub(crate) fn write_file(root: &Path, path: &str, contents: &str) {
+    let path = root.join(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("parent directories should be created");
+    }
+    fs::write(path, contents).expect("test file should be written");
 }
 
 pub(crate) fn with_repo_cwd<T>(repo: &Path, f: impl FnOnce() -> T) -> T {
@@ -70,8 +74,8 @@ pub(crate) fn with_repo_cwd<T>(repo: &Path, f: impl FnOnce() -> T) -> T {
     result
 }
 
-pub(crate) fn init_repo() -> TempRepo {
-    let repo = TempRepo::new();
+pub(crate) fn init_repo() -> TempDir {
+    let repo = TempDir::new("kite-test");
     git(&repo.path, &["init"]);
     git(&repo.path, &["config", "user.name", "Kite Test"]);
     git(&repo.path, &["config", "user.email", "kite@example.com"]);
@@ -84,8 +88,8 @@ pub(crate) fn init_repo() -> TempRepo {
     repo
 }
 
-pub(crate) fn init_root_kite_repo() -> TempRepo {
-    let repo = TempRepo::new();
+pub(crate) fn init_root_kite_repo() -> TempDir {
+    let repo = TempDir::new("kite-test");
     git(&repo.path, &["init"]);
     git(&repo.path, &["config", "user.name", "Kite Test"]);
     git(&repo.path, &["config", "user.email", "kite@example.com"]);
