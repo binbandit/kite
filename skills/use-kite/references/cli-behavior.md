@@ -52,7 +52,7 @@
 
 - Requires the GitHub CLI (`gh`) to be installed and authenticated (checked offline via `gh auth token`), and a remote to exist.
 - Refuses to run on the base branch or with unlanded `[kite] save` commits (run `kt land` first).
-- If an open pull request already exists for the branch, prints its URL and exits; merged or closed PRs do not block a new one.
+- If an open pull request already exists for the branch, pushes any new commits, asks the AI whether the body still reflects the branch, and offers a refreshed body (`gh pr edit`) after preview and confirmation; if it still fits, prints "nothing to update". Without AI the existing body is left untouched. Merged or closed PRs do not block a new one.
 - Fetches `origin/<branch>` and publishes when the remote is missing the branch or out of date.
 - Gathers context for the draft:
   - the commits and diff between the base branch and `HEAD`

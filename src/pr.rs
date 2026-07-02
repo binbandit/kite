@@ -44,6 +44,8 @@ Body rules:
 
 Skill guidance, when provided, is the user's own instructions for how their pull requests must be written. Follow it — it takes precedence over the rules above wherever they disagree.
 
+Update rule: when the current pull request is provided, you are refreshing it. Keep its structure and any human-written notes, and revise only what the commits and diff have made stale or incomplete. If nothing needs to change, return the current title and body verbatim.
+
 Return ONLY valid JSON: { \"title\": \"...\", \"body\": \"...\" }";
 
 pub(crate) struct PrOptions {
@@ -62,6 +64,14 @@ struct PrDraft {
 struct Guidance {
     label: String,
     content: String,
+}
+
+/// The branch's already-open pull request, as reported by `gh pr view`.
+struct ExistingPr {
+    url: String,
+    title: String,
+    body: String,
+    base: String,
 }
 
 struct PrContext {
@@ -99,23 +109,11 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
         );
     }
 
-    println!(
-        "{} {} {} {}",
-        "·".cyan(),
-        branch.bold(),
-        "→".dimmed(),
-        base.bold()
-    );
-
-    if let Some(url) = open_pr_url() {
-        println!(
-            "{} Already open: {url} {}",
-            "·".cyan(),
-            "(kt publish updates it)".dimmed()
-        );
-        return Ok(());
+    if let Some(existing) = open_pr() {
+        return refresh_pull_request(existing, branch, options.yes).await;
     }
 
+    print_flow_header(&branch, &base);
     sync_branch_to_remote(&branch)?;
 
     let context = collect_pr_context(branch, base)?;
@@ -124,7 +122,7 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
     // The style-example lookup hits the network, so it shares the spinner.
     let spinner = Spinner::start("Drafting");
     let title_examples = merged_pr_titles();
-    let drafted = draft_with_ai(&context, &title_examples).await;
+    let drafted = draft_with_ai(&context, &title_examples, None).await;
     spinner.stop();
 
     let (draft, provider_label) = match drafted {
@@ -146,6 +144,75 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
     let url = gh_pr_create(&draft, &context.base, options.draft)?;
     println!("{} {}", "✓".green(), url.trim());
     Ok(())
+}
+
+/// The branch already has an open pull request: push any new commits, then
+/// check whether the body still describes the branch and offer a refreshed
+/// one when it doesn't. Without AI the existing body is never touched.
+async fn refresh_pull_request(
+    existing: ExistingPr,
+    branch: String,
+    auto_confirm: bool,
+) -> Result<()> {
+    print_flow_header(&branch, &existing.base);
+    println!("{} Already open: {}", "·".cyan(), existing.url);
+
+    sync_branch_to_remote(&branch)?;
+
+    let context = collect_pr_context(branch, existing.base.clone())?;
+    announce_guidance(&context);
+
+    let spinner = Spinner::start("Checking the body against the branch");
+    let title_examples = merged_pr_titles();
+    let drafted = draft_with_ai(&context, &title_examples, Some(&existing)).await;
+    spinner.stop();
+
+    let (draft, provider_label) = match drafted {
+        Ok(result) => result,
+        Err(failures) => {
+            print_provider_failures(&failures);
+            println!("{} Leaving the pull request as is", "·".yellow());
+            return Ok(());
+        }
+    };
+
+    if drafts_match(&draft, &existing) {
+        println!(
+            "{} Body already reflects the branch — nothing to update",
+            "✓".green()
+        );
+        return Ok(());
+    }
+
+    println!("{} Updated draft ({provider_label}):", "·".cyan());
+    print!("{}", render_preview(&draft));
+
+    if !auto_confirm && !confirm("Update the pull request?")? {
+        println!("{} Aborted — pull request left unchanged", "·".red());
+        return Ok(());
+    }
+
+    gh(&["pr", "edit", "--title", &draft.title, "--body", &draft.body])?;
+    println!("{} Updated {}", "✓".green(), existing.url);
+    Ok(())
+}
+
+fn print_flow_header(branch: &str, base: &str) {
+    println!(
+        "{} {} {} {}",
+        "·".cyan(),
+        branch.bold(),
+        "→".dimmed(),
+        base.bold()
+    );
+}
+
+/// Whitespace-insensitive comparison, so a model that only reflows the text
+/// it was told to return verbatim doesn't trigger a pointless update.
+fn drafts_match(draft: &PrDraft, existing: &ExistingPr) -> bool {
+    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalize(&draft.title) == normalize(&existing.title)
+        && normalize(&draft.body) == normalize(&existing.body)
 }
 
 /// Checks for a working, authenticated `gh` up front — one offline spawn
@@ -199,21 +266,23 @@ fn sync_branch_to_remote(branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// The URL of the branch's open pull request, if any. `gh pr view` also
-/// resolves merged and closed PRs, so filter to open ones — a reused branch
-/// must still be able to get a fresh pull request.
-fn open_pr_url() -> Option<String> {
-    let url = gh(&[
-        "pr",
-        "view",
-        "--json",
-        "url,state",
-        "--jq",
-        r#"select(.state == "OPEN") | .url"#,
-    ])
-    .ok()?;
-    let url = url.trim();
-    (!url.is_empty()).then(|| url.to_string())
+/// The branch's open pull request, if any. `gh pr view` also resolves merged
+/// and closed PRs, so filter to open ones — a reused branch must still be
+/// able to get a fresh pull request.
+fn open_pr() -> Option<ExistingPr> {
+    let raw = gh(&["pr", "view", "--json", "url,title,body,state,baseRefName"]).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+
+    if json["state"].as_str() != Some("OPEN") {
+        return None;
+    }
+
+    Some(ExistingPr {
+        url: json["url"].as_str()?.to_string(),
+        title: json["title"].as_str()?.to_string(),
+        body: json["body"].as_str().unwrap_or("").to_string(),
+        base: json["baseRefName"].as_str()?.to_string(),
+    })
 }
 
 fn collect_pr_context(branch: String, base: String) -> Result<PrContext> {
@@ -424,8 +493,9 @@ fn merged_pr_titles() -> Vec<String> {
 async fn draft_with_ai(
     context: &PrContext,
     title_examples: &[String],
+    existing: Option<&ExistingPr>,
 ) -> std::result::Result<(PrDraft, &'static str), Vec<ai::ProviderFailure>> {
-    let user = build_pr_input(context, title_examples);
+    let user = build_pr_input(context, title_examples, existing);
     let request = ai::Request {
         system: SYSTEM_PROMPT,
         user: &user,
@@ -448,11 +518,23 @@ fn draft_schema() -> serde_json::Value {
     })
 }
 
-fn build_pr_input(context: &PrContext, title_examples: &[String]) -> String {
+fn build_pr_input(
+    context: &PrContext,
+    title_examples: &[String],
+    existing: Option<&ExistingPr>,
+) -> String {
     let mut input = format!(
         "Branch: {}\nBase branch: {}\n\n",
         context.branch, context.base
     );
+
+    if let Some(pr) = existing {
+        input.push_str(&format!(
+            "Current pull request (already open — refresh it per the update rule):\nTitle: {}\nBody:\n{}\n\n",
+            pr.title,
+            truncate_for_prompt(&pr.body, MAX_TEMPLATE_BYTES)
+        ));
+    }
 
     if !title_examples.is_empty() {
         input.push_str("Recent pull request titles from this repository:\n");
@@ -684,6 +766,47 @@ mod tests {
     }
 
     #[test]
+    fn drafts_match_ignores_whitespace_reflow_only() {
+        let existing = ExistingPr {
+            url: "https://example.com/pull/1".to_string(),
+            title: "feat: add gadgets".to_string(),
+            body: "## Summary\n\nAdds gadgets.".to_string(),
+            base: "main".to_string(),
+        };
+
+        let reflowed = PrDraft {
+            title: "feat:  add gadgets".to_string(),
+            body: "## Summary\nAdds gadgets.".to_string(),
+        };
+        assert!(drafts_match(&reflowed, &existing));
+
+        let revised = PrDraft {
+            title: "feat: add gadgets".to_string(),
+            body: "## Summary\n\nAdds gadgets and widgets.".to_string(),
+        };
+        assert!(!drafts_match(&revised, &existing));
+    }
+
+    #[test]
+    fn build_pr_input_leads_with_the_existing_pull_request_when_refreshing() {
+        let ctx = context(None, vec!["feat: add webhooks"]);
+        let existing = ExistingPr {
+            url: "https://example.com/pull/1".to_string(),
+            title: "feat: old title".to_string(),
+            body: "Old body.".to_string(),
+            base: "main".to_string(),
+        };
+
+        let input = build_pr_input(&ctx, &[], Some(&existing));
+
+        assert!(
+            input.contains("Current pull request (already open — refresh it per the update rule):")
+        );
+        assert!(input.contains("Title: feat: old title"));
+        assert!(input.contains("Old body."));
+    }
+
+    #[test]
     fn parse_draft_accepts_plain_and_fenced_json() {
         let plain = parse_draft(r#"{"title":"feat: add pr","body":"Adds `kt pr`."}"#)
             .expect("plain JSON should parse");
@@ -748,7 +871,7 @@ mod tests {
             content: "Always link issues.".to_string(),
         });
 
-        let input = build_pr_input(&ctx, &["feat: previous change".to_string()]);
+        let input = build_pr_input(&ctx, &["feat: previous change".to_string()], None);
 
         assert!(input.contains("Branch: feat/add-webhooks"));
         assert!(input.contains("Recent pull request titles"));
