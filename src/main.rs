@@ -78,10 +78,18 @@ enum Commands {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    match run(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{} {error:#}", "✗".red());
+            ExitCode::FAILURE
+        }
+    }
+}
 
-    let result = match cli.command {
-        None if !is_inside_git_repository() => {
+fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        None if !is_inside_git_repository()? => {
             print!("{}", render_help());
             Ok(())
         }
@@ -97,14 +105,6 @@ fn main() -> ExitCode {
             block_on(create_pull_request(PrOptions { draft, base, yes }))
         }
         Some(Commands::Undo) => undo(),
-    };
-
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{} {error:#}", "✗".red());
-            ExitCode::FAILURE
-        }
     }
 }
 
@@ -121,7 +121,8 @@ fn render_help() -> String {
 }
 
 fn save() -> Result<()> {
-    let status = execute_git(&["status", "--porcelain"])?;
+    // -uall lists files inside untracked directories, so the count is honest.
+    let status = execute_git(&["status", "--porcelain", "-uall"])?;
     if status.trim().is_empty() {
         let note = match kite_save_stack()? {
             Some(stack) => format!(
@@ -134,15 +135,13 @@ fn save() -> Result<()> {
         return Ok(());
     }
 
-    let staged_only = has_staged_changes(&status);
-    if !staged_only {
+    let has_staged = has_staged_changes(&status);
+    let saved_files = if has_staged {
+        status.lines().filter(|l| is_staged_status_line(l)).count()
+    } else {
         execute_git_quiet(&["add", "-A"])?;
-    }
-
-    let saved_files = status
-        .lines()
-        .filter(|line| !staged_only || is_staged_status_line(line))
-        .count();
+        status.lines().filter(|l| !l.trim().is_empty()).count()
+    };
 
     let msg = format!("{SAVE_PREFIX} {}", Local::now().format("%H:%M:%S"));
     execute_git_quiet(&["commit", "-m", &msg, "--no-verify"])?;
@@ -192,9 +191,7 @@ fn go(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{acquire_cwd_lock, git, init_repo, write_file};
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::test_support::{TempDir, acquire_cwd_lock, git, init_repo, write_file};
 
     fn run_save_in_repo(repo: &std::path::Path) -> Result<()> {
         crate::test_support::with_repo_cwd(repo, save)
@@ -206,27 +203,13 @@ mod tests {
 
     fn run_default_in_cwd(path: &std::path::Path) -> Result<Option<String>> {
         crate::test_support::with_repo_cwd(path, || {
-            if !is_inside_git_repository() {
+            if !is_inside_git_repository()? {
                 return Ok(Some(render_help()));
             }
 
             save()?;
             Ok(None)
         })
-    }
-
-    fn temp_dir() -> std::path::PathBuf {
-        let unique = format!(
-            "kite-test-non-repo-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time should be after unix epoch")
-                .as_nanos()
-        );
-        let path = std::env::temp_dir().join(unique);
-        fs::create_dir_all(&path).expect("temp dir should be created");
-        path
     }
 
     #[test]
@@ -312,16 +295,14 @@ mod tests {
     #[test]
     fn default_command_shows_help_outside_git_repo() {
         let _lock = acquire_cwd_lock();
-        let dir = temp_dir();
+        let dir = TempDir::new("kite-test-non-repo");
 
-        let help = run_default_in_cwd(&dir)
+        let help = run_default_in_cwd(&dir.path)
             .expect("default command should succeed outside a git repo")
             .expect("non-git repo should render help");
 
         assert!(help.contains("Fast quicksaves and inspectable AI-assisted landing"));
         assert!(help.contains("Usage: kt [COMMAND]"));
         assert!(help.contains("Everyday flow:"));
-
-        fs::remove_dir_all(dir).expect("temp dir should be removed");
     }
 }

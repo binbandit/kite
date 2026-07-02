@@ -41,26 +41,6 @@ impl Drop for TempDir {
     }
 }
 
-pub(crate) struct TempRepo {
-    dir: TempDir,
-}
-
-impl TempRepo {
-    fn new() -> Self {
-        Self {
-            dir: TempDir::new("kite-test"),
-        }
-    }
-}
-
-impl std::ops::Deref for TempRepo {
-    type Target = TempDir;
-
-    fn deref(&self) -> &TempDir {
-        &self.dir
-    }
-}
-
 pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -78,8 +58,12 @@ pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-pub(crate) fn write_file(repo: &Path, path: &str, contents: &str) {
-    fs::write(repo.join(path), contents).expect("test file should be written");
+pub(crate) fn write_file(root: &Path, path: &str, contents: &str) {
+    let path = root.join(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("parent directories should be created");
+    }
+    fs::write(path, contents).expect("test file should be written");
 }
 
 pub(crate) fn with_repo_cwd<T>(repo: &Path, f: impl FnOnce() -> T) -> T {
@@ -90,8 +74,8 @@ pub(crate) fn with_repo_cwd<T>(repo: &Path, f: impl FnOnce() -> T) -> T {
     result
 }
 
-pub(crate) fn init_repo() -> TempRepo {
-    let repo = TempRepo::new();
+pub(crate) fn init_repo() -> TempDir {
+    let repo = TempDir::new("kite-test");
     git(&repo.path, &["init"]);
     git(&repo.path, &["config", "user.name", "Kite Test"]);
     git(&repo.path, &["config", "user.email", "kite@example.com"]);
@@ -104,8 +88,8 @@ pub(crate) fn init_repo() -> TempRepo {
     repo
 }
 
-pub(crate) fn init_root_kite_repo() -> TempRepo {
-    let repo = TempRepo::new();
+pub(crate) fn init_root_kite_repo() -> TempDir {
+    let repo = TempDir::new("kite-test");
     git(&repo.path, &["init"]);
     git(&repo.path, &["config", "user.name", "Kite Test"]);
     git(&repo.path, &["config", "user.email", "kite@example.com"]);

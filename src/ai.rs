@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use std::env;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const OLLAMA_URL: &str = "http://localhost:11434/api/chat";
@@ -66,9 +67,19 @@ pub(crate) fn flatten_error(error: &str) -> String {
         .join(" | ")
 }
 
+/// One client for the process; timeouts vary per request, connections pool.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("HTTP client should initialize")
+    })
+}
+
 async fn ask_ollama(request: &Request<'_>) -> Result<String> {
     let timeout = env_duration_secs("KITE_LOCAL_TIMEOUT_SECS", DEFAULT_LOCAL_TIMEOUT_SECS)?;
-    let client = reqwest::Client::builder().timeout(timeout).build()?;
 
     let body = serde_json::json!({
         "model": first_non_empty_env(&["KITE_LOCAL_MODEL"])
@@ -81,11 +92,19 @@ async fn ask_ollama(request: &Request<'_>) -> Result<String> {
         "format": "json"
     });
 
-    let response = client
+    let response = http_client()
         .post(OLLAMA_URL)
+        .timeout(timeout)
         .json(&body)
         .send()
-        .await?
+        .await
+        .map_err(|error| {
+            if error.is_connect() {
+                anyhow::anyhow!("Ollama is not running at {OLLAMA_URL}")
+            } else {
+                error.into()
+            }
+        })?
         .error_for_status()?;
 
     let json: serde_json::Value = response.json().await?;
@@ -98,10 +117,6 @@ async fn ask_ollama(request: &Request<'_>) -> Result<String> {
 async fn ask_openai(request: &Request<'_>) -> Result<String> {
     let (base_url, model, api_key) = openai_env_config()?;
     let timeout = env_duration_secs("KITE_OPENAI_TIMEOUT_SECS", DEFAULT_OPENAI_TIMEOUT_SECS)?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(timeout)
-        .build()?;
 
     let body = serde_json::json!({
         "model": model,
@@ -118,10 +133,14 @@ async fn ask_openai(request: &Request<'_>) -> Result<String> {
     });
 
     let responses_url = format!("{}/responses", base_url.trim_end_matches('/'));
-    let mut http_request = client.post(&responses_url).bearer_auth(api_key).json(&body);
-    if url_uses_portkey(&responses_url) {
-        let portkey_api_key = first_non_empty_env(&["PORTKEY_API_KEY"])
-            .context("PORTKEY_API_KEY is required when the OpenAI URL routes through portkey")?;
+    let mut http_request = http_client()
+        .post(&responses_url)
+        .timeout(timeout)
+        .bearer_auth(api_key)
+        .json(&body);
+    if url_uses_portkey(&responses_url)
+        && let Some(portkey_api_key) = first_non_empty_env(&["PORTKEY_API_KEY"])
+    {
         http_request = http_request.header("x-portkey-api-key", portkey_api_key);
     }
 

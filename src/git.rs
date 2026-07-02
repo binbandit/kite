@@ -26,8 +26,9 @@ pub(crate) struct SaveStack {
 /// Memoizes the repo root for the current working directory so we don't spawn an
 /// extra `git rev-parse --show-toplevel` before every git invocation. The cache is
 /// keyed on the cwd, so it stays correct if the process changes directories (e.g.
-/// across test repositories).
-pub(crate) fn repo_root() -> Result<PathBuf> {
+/// across test repositories). Returns `Ok(None)` outside a repository and `Err`
+/// only when git itself could not be run.
+fn find_repo_root() -> Result<Option<PathBuf>> {
     static CACHE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
 
@@ -40,20 +41,17 @@ pub(crate) fn repo_root() -> Result<PathBuf> {
         if let Some((cached_cwd, cached_root)) = guard.as_ref()
             && *cached_cwd == cwd
         {
-            return Ok(cached_root.clone());
+            return Ok(Some(cached_root.clone()));
         }
     }
 
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
-        .context("Failed to resolve Git repository root")?;
+        .context("Failed to run git. Is it installed and on your PATH?")?;
 
     if !output.status.success() {
-        anyhow::bail!(
-            "Kite must be run inside a Git repository: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        return Ok(None);
     }
 
     let root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
@@ -63,11 +61,15 @@ pub(crate) fn repo_root() -> Result<PathBuf> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = Some((cwd, root.clone()));
 
-    Ok(root)
+    Ok(Some(root))
 }
 
-pub(crate) fn is_inside_git_repository() -> bool {
-    repo_root().is_ok()
+pub(crate) fn repo_root() -> Result<PathBuf> {
+    find_repo_root()?.context("Kite must be run inside a Git repository")
+}
+
+pub(crate) fn is_inside_git_repository() -> Result<bool> {
+    Ok(find_repo_root()?.is_some())
 }
 
 fn git_command() -> Result<Command> {
@@ -310,10 +312,10 @@ pub(crate) fn changed_files_for_base(base: &KiteBase) -> Result<HashSet<String>>
         .collect())
 }
 
-pub(crate) fn recent_commit_style_examples(limit: usize) -> Result<Vec<String>> {
-    let output = match execute_git(&["log", "--format=%s", "-n", "30"]) {
-        Ok(output) => output,
-        Err(_) => return Ok(Vec::new()),
+/// Best-effort style examples; an unreadable log just means no examples.
+pub(crate) fn recent_commit_style_examples(limit: usize) -> Vec<String> {
+    let Ok(output) = execute_git(&["log", "--format=%s", "-n", "30"]) else {
+        return Vec::new();
     };
 
     let mut seen = HashSet::new();
@@ -335,7 +337,7 @@ pub(crate) fn recent_commit_style_examples(limit: usize) -> Result<Vec<String>> 
         }
     }
 
-    Ok(examples)
+    examples
 }
 
 pub(crate) fn sorted_files(files: &HashSet<String>) -> Vec<String> {
@@ -354,7 +356,8 @@ pub(crate) fn kite_save_stack() -> Result<Option<SaveStack>> {
         let max = LOG_PAGE_SIZE.to_string();
         let output = match execute_git(&["log", "--format=%H %s", "-n", &max, "--skip", &skip]) {
             Ok(output) => output,
-            Err(_) => return Ok(None), // no commits yet
+            Err(_) if page == 0 => return Ok(None), // no commits yet
+            Err(error) => return Err(error),
         };
 
         let mut page_lines = 0;
@@ -488,8 +491,7 @@ mod tests {
         git(&repo.path, &["add", "tracked.txt"]);
         git(&repo.path, &["commit", "-m", "docs: refresh usage"]);
 
-        let examples = with_repo_cwd(&repo.path, || recent_commit_style_examples(6))
-            .expect("examples should load");
+        let examples = with_repo_cwd(&repo.path, || recent_commit_style_examples(6));
 
         assert_eq!(
             examples,

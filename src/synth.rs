@@ -8,7 +8,7 @@ use crate::ai::{self, ProviderFailure, extract_json_block};
 use crate::git::{recent_commit_style_examples, sorted_files};
 
 const MAX_COMMIT_STYLE_EXAMPLES: usize = 6;
-const MAX_DIFF_BYTES: usize = 15_000;
+pub(crate) const MAX_DIFF_BYTES: usize = 20_000;
 
 const SYSTEM_PROMPT: &str = "\
 You are an expert version control synthesis engine. Analyze the git diff.
@@ -48,12 +48,7 @@ pub(crate) async fn synthesize_groups(
     diff: &str,
     actual_files: &HashSet<String>,
 ) -> std::result::Result<(Vec<CommitGroup>, &'static str), Vec<ProviderFailure>> {
-    let user = build_synthesis_input(diff, actual_files).map_err(|error| {
-        vec![ProviderFailure {
-            provider: "local",
-            error: format!("{error:#}"),
-        }]
-    })?;
+    let user = build_synthesis_input(diff, actual_files);
 
     let request = ai::Request {
         system: SYSTEM_PROMPT,
@@ -128,9 +123,9 @@ fn groups_schema() -> serde_json::Value {
     })
 }
 
-fn build_synthesis_input(diff: &str, actual_files: &HashSet<String>) -> Result<String> {
+fn build_synthesis_input(diff: &str, actual_files: &HashSet<String>) -> String {
     let mut prompt = String::new();
-    let examples = recent_commit_style_examples(MAX_COMMIT_STYLE_EXAMPLES)?;
+    let examples = recent_commit_style_examples(MAX_COMMIT_STYLE_EXAMPLES);
 
     if !examples.is_empty() {
         prompt.push_str("Recent non-Kite commit message examples from this repository:\n");
@@ -152,7 +147,7 @@ fn build_synthesis_input(diff: &str, actual_files: &HashSet<String>) -> Result<S
 
     prompt.push_str("Diff (may be truncated; rely on the changed-file list for full coverage):\n");
     prompt.push_str(truncate_for_prompt(diff, MAX_DIFF_BYTES));
-    Ok(prompt)
+    prompt
 }
 
 fn validate_group_coverage(
@@ -357,8 +352,7 @@ mod tests {
 
         let prompt = with_repo_cwd(&repo.path, || {
             build_synthesis_input("diff --git a/src/main.rs b/src/main.rs", &actual_files)
-        })
-        .expect("prompt should build");
+        });
 
         assert!(
             prompt
@@ -398,8 +392,7 @@ mod tests {
 
         let prompt = with_repo_cwd(&repo.path, || {
             build_synthesis_input("abcdefghijklmnopqrstuvwxyz", &actual_files)
-        })
-        .expect("prompt should build");
+        });
 
         assert!(prompt.contains("Recent non-Kite commit message examples from this repository:"));
         assert!(prompt.contains("- docs: refresh usage"));

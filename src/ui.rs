@@ -90,19 +90,9 @@ pub(crate) fn print_provider_failures(failures: &[ProviderFailure]) {
             "  {} {}: {}",
             "-".dimmed(),
             failure.provider,
-            summarize_provider_error(&failure.error).dimmed()
+            flatten_error(&failure.error).dimmed()
         );
     }
-}
-
-/// Collapses well-known failure shapes into one human sentence; anything
-/// unrecognized is flattened but kept intact for debugging.
-fn summarize_provider_error(error: &str) -> String {
-    let flat = flatten_error(error);
-    if flat.contains("Connection refused") && flat.contains("11434") {
-        return "Ollama is not running at localhost:11434".to_string();
-    }
-    flat
 }
 
 pub(crate) fn pluralize(count: usize, singular: &str) -> String {
