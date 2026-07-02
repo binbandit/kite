@@ -35,7 +35,7 @@
   1. Local Ollama at `http://localhost:11434/api/chat` with `KITE_LOCAL_MODEL` or default `llama3`, and `KITE_LOCAL_TIMEOUT_SECS` or default 30 seconds
   2. OpenAI Responses API using the configured base URL, model, API key, and `KITE_OPENAI_TIMEOUT_SECS` or default 120 seconds
   3. Manual fallback that asks for one commit message before rewriting history
-- Show the proposed grouped commit plan before rewriting anything, unless `--yes` is passed.
+- Show the proposed grouped commit plan before rewriting anything; `--yes` skips only the confirmation prompt.
 - Record the pre-land `HEAD` at `refs/kite/pre_land`.
 - If rewriting fails mid-land, keep the in-progress state on a `kite-recovery-*` branch so partial commits or staged changes are preserved.
 - Rewrite history locally by default.

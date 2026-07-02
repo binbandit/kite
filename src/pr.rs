@@ -74,7 +74,7 @@ struct PrContext {
 }
 
 pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
-    ensure_gh_available()?;
+    ensure_gh_ready()?;
     if !has_remote() {
         anyhow::bail!(
             "A remote is required to open a pull request. Add one with `git remote add origin <url>`."
@@ -114,10 +114,12 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
         return Ok(());
     }
 
-    let context = collect_pr_context(branch, base)?;
+    let mut context = collect_pr_context(branch, base)?;
     announce_guidance(&context);
 
+    // The style-example lookup hits the network, so it shares the spinner.
     let spinner = Spinner::start("Drafting");
+    context.title_examples = merged_pr_titles();
     let drafted = draft_with_ai(&context).await;
     spinner.stop();
 
@@ -142,19 +144,26 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
     Ok(())
 }
 
-fn ensure_gh_available() -> Result<()> {
-    let available = Command::new("gh")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+/// Checks for a working, authenticated `gh` up front, so a missing login
+/// fails in milliseconds instead of after the whole draft has been built.
+fn ensure_gh_ready() -> Result<()> {
+    let run = |args: &[&str]| {
+        Command::new("gh")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    };
 
-    if !available {
+    if !run(&["--version"]) {
         anyhow::bail!(
             "`kt pr` needs the GitHub CLI. Install it from https://cli.github.com, then run `gh auth login`."
         );
+    }
+    if !run(&["auth", "status"]) {
+        anyhow::bail!("GitHub CLI is not authenticated. Run `gh auth login` first.");
     }
     Ok(())
 }
@@ -226,7 +235,7 @@ fn collect_pr_context(branch: String, base: String) -> Result<PrContext> {
         diff,
         template: find_pr_template(&root),
         skills: find_pr_skills(&root),
-        title_examples: merged_pr_titles(),
+        title_examples: Vec::new(),
     })
 }
 
