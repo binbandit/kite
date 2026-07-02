@@ -36,11 +36,13 @@ Title rules:
 2. Use the imperative, present tense. Keep it concise and specific. No trailing period.
 
 Body rules:
-1. If a template is provided, follow its structure exactly: keep its headings and checklists, fill each section with real content, and drop instructional HTML comments.
-2. Without a template, write a short summary paragraph followed by a bulleted list of notable changes.
-3. Describe only changes that appear in the commits or diff. Never invent content or leave placeholders.
-4. Use GitHub-flavored markdown.
-5. If skill guidance is provided, follow it wherever it does not conflict with the template.
+1. If a template is provided, use it as the skeleton: fill each section with real content from the commits and diff, and drop instructional HTML comments.
+2. Remove template sections that do not apply to this change or that you cannot fill with real content — no empty sections, no 'N/A', no untouched boilerplate. The final body contains only sections that say something.
+3. Without a template, write a short summary paragraph followed by a bulleted list of notable changes.
+4. Describe only changes that appear in the commits or diff. Never invent content or leave placeholders.
+5. Use GitHub-flavored markdown.
+
+Skill guidance, when provided, is the user's own instructions for how their pull requests must be written. Follow it — it takes precedence over the rules above wherever they disagree.
 
 Return ONLY valid JSON: { \"title\": \"...\", \"body\": \"...\" }";
 
@@ -348,9 +350,13 @@ fn find_pr_skills_in(skill_dirs: &[PathBuf]) -> Vec<Guidance> {
 /// back to the opening lines) mentions pull requests. Matching the whole body
 /// would drag in every skill that merely references a PR somewhere.
 fn mentions_pull_requests(name: &str, content: &str) -> bool {
-    let name_says_pr = name
+    let name_words: Vec<String> = name
         .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|token| token.eq_ignore_ascii_case("pr") || token.eq_ignore_ascii_case("prs"));
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let name_says_pr = name_words.iter().any(|word| word == "pr" || word == "prs")
+        || name_words.join(" ").contains("pull request");
 
     let head = skill_frontmatter(content)
         .unwrap_or_else(|| content.lines().take(10).collect::<Vec<_>>().join("\n"))
@@ -456,17 +462,17 @@ fn build_pr_input(context: &PrContext, title_examples: &[String]) -> String {
         input.push('\n');
     }
 
-    if let Some(template) = &context.template {
+    for skill in &context.skills {
         input.push_str(&format!(
-            "Pull request template ({}) — follow its structure exactly:\n{}\n\n",
-            template.label, template.content
+            "Skill guidance from `{}` — the user's instructions for writing this pull request:\n{}\n\n",
+            skill.label, skill.content
         ));
     }
 
-    for skill in &context.skills {
+    if let Some(template) = &context.template {
         input.push_str(&format!(
-            "Guidance from skill {}:\n{}\n\n",
-            skill.label, skill.content
+            "Pull request template ({}) — fill it in, dropping sections that don't apply:\n{}\n\n",
+            template.label, template.content
         ));
     }
 
@@ -660,12 +666,21 @@ mod tests {
     fn mentions_pull_requests_checks_name_tokens_and_content() {
         assert!(mentions_pull_requests("write-prs", ""));
         assert!(mentions_pull_requests("pr-helper", ""));
+        assert!(mentions_pull_requests("create-pull-request", ""));
+        assert!(mentions_pull_requests("Pull_Requests", ""));
         assert!(mentions_pull_requests(
             "shipit",
             "Use this when opening a Pull Request."
         ));
         assert!(mentions_pull_requests("shipit", "pull-request etiquette"));
         assert!(!mentions_pull_requests("sprint-notes", "Formats SQL."));
+        assert!(!mentions_pull_requests("prettier-config", ""));
+    }
+
+    #[test]
+    fn mentions_pull_requests_ignores_body_only_mentions() {
+        let body_only = "---\nname: shipit\ndescription: Release automation.\n---\nStep 9: also open a pull request.";
+        assert!(!mentions_pull_requests("shipit", body_only));
     }
 
     #[test]
@@ -737,8 +752,19 @@ mod tests {
 
         assert!(input.contains("Branch: feat/add-webhooks"));
         assert!(input.contains("Recent pull request titles"));
-        assert!(input.contains("follow its structure exactly:\n## Summary"));
-        assert!(input.contains("Guidance from skill write-prs"));
+        assert!(input.contains("dropping sections that don't apply:\n## Summary"));
+        assert!(input.contains("Skill guidance from `write-prs`"));
+
+        let skill_index = input
+            .find("Skill guidance from")
+            .expect("skill section should exist");
+        let template_index = input
+            .find("Pull request template")
+            .expect("template section should exist");
+        assert!(
+            skill_index < template_index,
+            "the user's skill guidance should lead the prompt"
+        );
         assert!(input.contains("- feat: add webhooks"));
         assert!(input.contains("Diff (may be truncated):"));
     }

@@ -56,8 +56,8 @@
 - Fetches `origin/<branch>` and publishes when the remote is missing the branch or out of date.
 - Gathers context for the draft:
   - the commits and diff between the base branch and `HEAD`
-  - the repository's pull request template (checked case-insensitively in the root, `.github/`, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`)
-  - PR-related agent skills (`SKILL.md` files mentioning pull requests) from `.claude/skills`, `.agents/skills`, and `skills` in the repo, plus `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills`
+  - the repository's pull request template (checked case-insensitively in the root, `.github/`, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`); the AI fills it in and removes sections that don't apply rather than leaving them empty or writing N/A
+  - PR-related agent skills (`SKILL.md` files whose name or frontmatter mentions pull requests) from `.claude/skills`, `.agents/skills`, and `skills` in the repo, plus `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills` — treated as the user's own instructions and given precedence over the default drafting rules
   - recent merged pull request titles as style examples
 - Drafts the title and body with the same Ollama → OpenAI cascade as `kt land`; without AI it falls back to a deterministic draft from the template and commit subjects.
 - Previews the draft and asks for confirmation before running `gh pr create` (skip with `--yes`).
