@@ -175,8 +175,9 @@ kt land --push
 
 Publishes the current branch after you review the rewritten local history.
 
-- If a remote exists, Kite first tries `git pull --rebase origin <current-branch>`.
-- Then it pushes with `--set-upstream origin <current-branch> --force-with-lease`.
+- Pushes with `--set-upstream origin <current-branch> --force-with-lease` — and nothing else.
+- Deliberately no `git pull --rebase` first: after a land, the remote still holds the old saves, and rebasing onto them would resurrect the history you just rewrote.
+- If someone else pushed to the branch, the lease rejects the push and Kite reports it; you decide how to reconcile.
 - If no remote exists, Kite exits without error and leaves the history local.
 
 ```bash

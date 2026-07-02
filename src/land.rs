@@ -38,6 +38,11 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
             Ok(result) => result,
             Err(failures) => {
                 print_provider_failures(&failures);
+                if auto_confirm {
+                    anyhow::bail!(
+                        "AI synthesis is unavailable. Rerun `kt land` without --yes to enter a commit message manually."
+                    );
+                }
                 let Some(message) = prompt_line("One commit message (blank to abort)")? else {
                     println!("{} Aborted — no history changed", "·".red());
                     return Ok(());
@@ -62,14 +67,20 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
             render_land_plan(&groups, provider_label, scope.save_count)
         );
 
-        if !auto_confirm && !confirm("Rewrite history?")? {
+        let question = if push {
+            "Rewrite history and publish?"
+        } else {
+            "Rewrite history?"
+        };
+        if !auto_confirm && !confirm(question)? {
             println!("{} Aborted — no history changed", "·".red());
             return Ok(());
         }
 
         execute_land(&scope.base, &groups)?;
 
-        if push && has_remote() {
+        if push {
+            println!("{} Landed", "✓".green());
             publish_current_branch().context("Landed locally, but publishing failed")?;
         } else if has_remote() {
             println!(
@@ -98,6 +109,11 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
     land_result
 }
 
+/// Pushes with `--force-with-lease` and nothing else. Deliberately no
+/// `pull --rebase` first: after a land the remote holds the old saves, and
+/// rebasing onto them would resurrect the history we just rewrote. The lease
+/// protects anything pushed by someone else — the push is rejected and the
+/// user decides.
 pub(crate) fn publish_current_branch() -> Result<()> {
     if !has_remote() {
         println!("{} No remote — history stays local", "·".dimmed());
@@ -107,7 +123,6 @@ pub(crate) fn publish_current_branch() -> Result<()> {
     let branch = get_current_branch()?;
 
     let spinner = Spinner::start(format!("Publishing {branch}"));
-    let _ = execute_git(&["pull", "--rebase", "origin", &branch]);
     let pushed = execute_git(&[
         "push",
         "--set-upstream",
@@ -117,7 +132,11 @@ pub(crate) fn publish_current_branch() -> Result<()> {
     ]);
     spinner.stop();
 
-    pushed?;
+    pushed.with_context(|| {
+        format!(
+            "Push rejected. If `origin/{branch}` has commits you don't have, fetch and reconcile them first."
+        )
+    })?;
     println!("{} Published {}", "✓".green(), branch.bold());
     Ok(())
 }
