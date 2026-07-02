@@ -19,7 +19,7 @@ use crate::git::{
     kite_save_stack, repo_root,
 };
 use crate::land::publish_current_branch;
-use crate::synth::truncate_for_prompt;
+use crate::synth::{MAX_DIFF_BYTES, truncate_for_prompt};
 use crate::ui::{Spinner, confirm, pluralize, print_provider_failures};
 
 const MAX_COMMIT_SUBJECTS: usize = 50;
@@ -27,7 +27,6 @@ const MAX_PR_TITLE_EXAMPLES: usize = 8;
 const MAX_SKILLS: usize = 3;
 const MAX_SKILL_BYTES: usize = 4_000;
 const MAX_TEMPLATE_BYTES: usize = 6_000;
-const MAX_DIFF_BYTES: usize = 15_000;
 
 const SYSTEM_PROMPT: &str = "\
 You write pull requests for software teams. Using the branch's commits and diff, produce a pull request title and body.
@@ -70,7 +69,6 @@ struct PrContext {
     diff: String,
     template: Option<Guidance>,
     skills: Vec<Guidance>,
-    title_examples: Vec<String>,
 }
 
 pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
@@ -107,20 +105,24 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
         base.bold()
     );
 
-    sync_branch_to_remote(&branch)?;
-
-    if let Some(url) = existing_pr_url() {
-        println!("{} Already open: {url}", "·".cyan());
+    if let Some(url) = open_pr_url() {
+        println!(
+            "{} Already open: {url} {}",
+            "·".cyan(),
+            "(kt publish updates it)".dimmed()
+        );
         return Ok(());
     }
 
-    let mut context = collect_pr_context(branch, base)?;
+    sync_branch_to_remote(&branch)?;
+
+    let context = collect_pr_context(branch, base)?;
     announce_guidance(&context);
 
     // The style-example lookup hits the network, so it shares the spinner.
     let spinner = Spinner::start("Drafting");
-    context.title_examples = merged_pr_titles();
-    let drafted = draft_with_ai(&context).await;
+    let title_examples = merged_pr_titles();
+    let drafted = draft_with_ai(&context, &title_examples).await;
     spinner.stop();
 
     let (draft, provider_label) = match drafted {
@@ -144,28 +146,25 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
     Ok(())
 }
 
-/// Checks for a working, authenticated `gh` up front, so a missing login
-/// fails in milliseconds instead of after the whole draft has been built.
+/// Checks for a working, authenticated `gh` up front — one offline spawn
+/// (`gh auth token`), so a missing install or login fails in milliseconds
+/// instead of after the whole draft has been built.
 fn ensure_gh_ready() -> Result<()> {
-    let run = |args: &[&str]| {
-        Command::new("gh")
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    };
+    let status = Command::new("gh")
+        .args(["auth", "token"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 
-    if !run(&["--version"]) {
-        anyhow::bail!(
+    match status {
+        Err(_) => anyhow::bail!(
             "`kt pr` needs the GitHub CLI. Install it from https://cli.github.com, then run `gh auth login`."
-        );
+        ),
+        Ok(status) if !status.success() => {
+            anyhow::bail!("GitHub CLI is not authenticated. Run `gh auth login` first.")
+        }
+        Ok(_) => Ok(()),
     }
-    if !run(&["auth", "status"]) {
-        anyhow::bail!("GitHub CLI is not authenticated. Run `gh auth login` first.");
-    }
-    Ok(())
 }
 
 fn gh(args: &[&str]) -> Result<String> {
@@ -185,20 +184,32 @@ fn gh(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Pushes the branch when the remote is missing it or behind it, so `gh pr
-/// create` always sees the commits we are describing.
+/// Pushes the branch when the remote is missing it or out of date, so `gh pr
+/// create` always sees the commits we are describing. Fetches first so the
+/// comparison reflects the actual remote, not a stale tracking ref.
 fn sync_branch_to_remote(branch: &str) -> Result<()> {
-    let head = execute_git(&["rev-parse", "HEAD"])?;
+    let _ = execute_git(&["fetch", "origin", branch]); // branch may not exist remotely yet
     let remote_ref = format!("refs/remotes/origin/{branch}");
 
-    if check_ref(&remote_ref).as_deref() != Some(head.trim()) {
+    if check_ref("HEAD") != check_ref(&remote_ref) {
         publish_current_branch()?;
     }
     Ok(())
 }
 
-fn existing_pr_url() -> Option<String> {
-    let url = gh(&["pr", "view", "--json", "url", "--jq", ".url"]).ok()?;
+/// The URL of the branch's open pull request, if any. `gh pr view` also
+/// resolves merged and closed PRs, so filter to open ones — a reused branch
+/// must still be able to get a fresh pull request.
+fn open_pr_url() -> Option<String> {
+    let url = gh(&[
+        "pr",
+        "view",
+        "--json",
+        "url,state",
+        "--jq",
+        r#"select(.state == "OPEN") | .url"#,
+    ])
+    .ok()?;
     let url = url.trim();
     (!url.is_empty()).then(|| url.to_string())
 }
@@ -235,7 +246,6 @@ fn collect_pr_context(branch: String, base: String) -> Result<PrContext> {
         diff,
         template: find_pr_template(&root),
         skills: find_pr_skills(&root),
-        title_examples: Vec::new(),
     })
 }
 
@@ -285,7 +295,7 @@ fn find_pr_skills(root: &Path) -> Vec<Guidance> {
         root.join(".agents/skills"),
         root.join("skills"),
     ];
-    if let Some(home) = home_dir() {
+    if let Some(home) = std::env::home_dir() {
         skill_dirs.extend([
             home.join(".claude/skills"),
             home.join(".codex/skills"),
@@ -334,13 +344,24 @@ fn find_pr_skills_in(skill_dirs: &[PathBuf]) -> Vec<Guidance> {
     skills
 }
 
+/// A skill is PR-related when its name says so, or its frontmatter (falling
+/// back to the opening lines) mentions pull requests. Matching the whole body
+/// would drag in every skill that merely references a PR somewhere.
 fn mentions_pull_requests(name: &str, content: &str) -> bool {
     let name_says_pr = name
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|token| token.eq_ignore_ascii_case("pr") || token.eq_ignore_ascii_case("prs"));
 
-    let content = content.to_ascii_lowercase();
-    name_says_pr || content.contains("pull request") || content.contains("pull-request")
+    let head = skill_frontmatter(content)
+        .unwrap_or_else(|| content.lines().take(10).collect::<Vec<_>>().join("\n"))
+        .to_ascii_lowercase();
+    name_says_pr || head.contains("pull request") || head.contains("pull-request")
+}
+
+fn skill_frontmatter(content: &str) -> Option<String> {
+    let rest = content.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    Some(rest[..end].to_string())
 }
 
 fn find_entry_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {
@@ -367,12 +388,6 @@ fn read_guidance(root: &Path, path: &Path, max_bytes: usize) -> Option<Guidance>
         label,
         content: truncate_for_prompt(&content, max_bytes).to_string(),
     })
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
 }
 
 fn merged_pr_titles() -> Vec<String> {
@@ -402,8 +417,9 @@ fn merged_pr_titles() -> Vec<String> {
 
 async fn draft_with_ai(
     context: &PrContext,
+    title_examples: &[String],
 ) -> std::result::Result<(PrDraft, &'static str), Vec<ai::ProviderFailure>> {
-    let user = build_pr_input(context);
+    let user = build_pr_input(context, title_examples);
     let request = ai::Request {
         system: SYSTEM_PROMPT,
         user: &user,
@@ -426,15 +442,15 @@ fn draft_schema() -> serde_json::Value {
     })
 }
 
-fn build_pr_input(context: &PrContext) -> String {
+fn build_pr_input(context: &PrContext, title_examples: &[String]) -> String {
     let mut input = format!(
         "Branch: {}\nBase branch: {}\n\n",
         context.branch, context.base
     );
 
-    if !context.title_examples.is_empty() {
+    if !title_examples.is_empty() {
         input.push_str("Recent pull request titles from this repository:\n");
-        for title in &context.title_examples {
+        for title in title_examples {
             input.push_str(&format!("- {title}\n"));
         }
         input.push('\n');
@@ -559,14 +575,7 @@ fn gh_pr_create(draft: &PrDraft, base: &str, as_draft: bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
-    use std::fs;
-
-    fn write(path: &Path, contents: &str) {
-        fs::create_dir_all(path.parent().expect("parent should exist"))
-            .expect("directories should be created");
-        fs::write(path, contents).expect("file should be written");
-    }
+    use crate::test_support::{TempDir, write_file};
 
     fn context(template: Option<Guidance>, commits: Vec<&str>) -> PrContext {
         PrContext {
@@ -576,15 +585,15 @@ mod tests {
             diff: "diff --git a/src/api.rs b/src/api.rs".to_string(),
             template,
             skills: Vec::new(),
-            title_examples: vec!["feat: previous change".to_string()],
         }
     }
 
     #[test]
     fn find_pr_template_matches_github_locations_case_insensitively() {
         let dir = TempDir::new("kite-pr-template");
-        write(
-            &dir.path.join(".github/PULL_REQUEST_TEMPLATE.md"),
+        write_file(
+            &dir.path,
+            ".github/PULL_REQUEST_TEMPLATE.md",
             "## Summary\n",
         );
 
@@ -596,12 +605,14 @@ mod tests {
     #[test]
     fn find_pr_template_falls_back_to_multi_template_directory() {
         let dir = TempDir::new("kite-pr-template-dir");
-        write(
-            &dir.path.join(".github/PULL_REQUEST_TEMPLATE/bugfix.md"),
+        write_file(
+            &dir.path,
+            ".github/PULL_REQUEST_TEMPLATE/bugfix.md",
             "## Bugfix\n",
         );
-        write(
-            &dir.path.join(".github/PULL_REQUEST_TEMPLATE/feature.md"),
+        write_file(
+            &dir.path,
+            ".github/PULL_REQUEST_TEMPLATE/feature.md",
             "## Feature\n",
         );
 
@@ -622,16 +633,19 @@ mod tests {
         let project = dir.path.join(".claude/skills");
         let user = dir.path.join("home/.claude/skills");
 
-        write(
-            &project.join("write-prs/SKILL.md"),
+        write_file(
+            &dir.path,
+            ".claude/skills/write-prs/SKILL.md",
             "---\nname: write-prs\ndescription: Guidance for pull requests.\n---\nAlways link issues.",
         );
-        write(
-            &user.join("write-prs/SKILL.md"),
+        write_file(
+            &dir.path,
+            "home/.claude/skills/write-prs/SKILL.md",
             "Stale duplicate that must lose to the project copy.",
         );
-        write(
-            &user.join("unrelated/SKILL.md"),
+        write_file(
+            &dir.path,
+            "home/.claude/skills/unrelated/SKILL.md",
             "---\nname: unrelated\ndescription: Formats SQL.\n---",
         );
 
@@ -719,7 +733,7 @@ mod tests {
             content: "Always link issues.".to_string(),
         });
 
-        let input = build_pr_input(&ctx);
+        let input = build_pr_input(&ctx, &["feat: previous change".to_string()]);
 
         assert!(input.contains("Branch: feat/add-webhooks"));
         assert!(input.contains("Recent pull request titles"));

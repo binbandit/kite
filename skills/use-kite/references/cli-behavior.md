@@ -45,15 +45,15 @@
 ### `kt publish`
 
 - If no remote exists, print a note and exit successfully.
-- Otherwise try `git pull --rebase origin <branch>`.
-- Then push the current branch with `--set-upstream origin <branch> --force-with-lease`.
+- Push the current branch with `--set-upstream origin <branch> --force-with-lease` — no `pull --rebase` first, so a land never gets rebased onto the remote's stale saves.
+- A rejected lease (someone else pushed) is reported as an error for the user to reconcile manually.
 
 ### `kt pr [--draft] [--base <branch>] [--yes]`
 
-- Requires the GitHub CLI (`gh`) to be installed and authenticated, and a remote to exist.
+- Requires the GitHub CLI (`gh`) to be installed and authenticated (checked offline via `gh auth token`), and a remote to exist.
 - Refuses to run on the base branch or with unlanded `[kite] save` commits (run `kt land` first).
-- Publishes the branch when `origin/<branch>` is missing or does not match `HEAD`.
-- If a pull request already exists for the branch, prints its URL and exits.
+- If an open pull request already exists for the branch, prints its URL and exits; merged or closed PRs do not block a new one.
+- Fetches `origin/<branch>` and publishes when the remote is missing the branch or out of date.
 - Gathers context for the draft:
   - the commits and diff between the base branch and `HEAD`
   - the repository's pull request template (checked case-insensitively in the root, `.github/`, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`)
