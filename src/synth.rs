@@ -36,6 +36,7 @@ Rules for hunk assignment:
 4. Do not omit hunk ids.
 5. Do not duplicate hunk ids across groups.
 6. Keep interdependent changes (a definition and its call sites) in the same commit so every commit is coherent on its own.
+7. Order the groups so foundational changes come before the changes that depend on them.
 
 Return ONLY valid JSON. Absolutely no markdown or conversational text.
 Schema: { \"groups\": [ { \"message\": \"feat(auth): implement JWT validation\", \"hunks\": [\"h1\", \"h4\"] } ] }";
@@ -216,12 +217,14 @@ fn validate_group_coverage(groups: &[CommitGroup], unit_ids: &[String]) -> Resul
     }
 
     if !duplicates.is_empty() {
-        sort_ids(&mut duplicates);
+        duplicates.sort();
+        duplicates.dedup();
         problems.push(format!("duplicate hunks: {}", duplicates.join(", ")));
     }
 
     if !unknown.is_empty() {
-        sort_ids(&mut unknown);
+        unknown.sort();
+        unknown.dedup();
         problems.push(format!("unknown hunks: {}", unknown.join(", ")));
     }
 
@@ -229,20 +232,6 @@ fn validate_group_coverage(groups: &[CommitGroup], unit_ids: &[String]) -> Resul
         "Synthesis output did not cover the diff hunks correctly ({})",
         problems.join("; ")
     );
-}
-
-/// Orders ids numerically (`h2` before `h10`) with a lexical fallback for
-/// ids that don't match the `h<n>` shape, and drops repeats.
-fn sort_ids(ids: &mut Vec<String>) {
-    ids.sort_by_key(|id| {
-        (
-            id.strip_prefix('h')
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(usize::MAX),
-            id.clone(),
-        )
-    });
-    ids.dedup();
 }
 
 /// Accepts the three shapes models actually produce: a bare array, a
