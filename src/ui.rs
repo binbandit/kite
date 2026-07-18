@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::ai::{ProviderFailure, flatten_error};
+use crate::ai::flatten_error;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_TICK: Duration = Duration::from_millis(80);
@@ -83,16 +83,9 @@ pub(crate) fn prompt_line(question: &str) -> Result<Option<String>> {
     Ok((!answer.is_empty()).then(|| answer.to_string()))
 }
 
-pub(crate) fn print_provider_failures(failures: &[ProviderFailure]) {
+pub(crate) fn print_ai_unavailable(error: &anyhow::Error) {
     println!("{} AI unavailable", "·".yellow());
-    for failure in failures {
-        println!(
-            "  {} {}: {}",
-            "-".dimmed(),
-            failure.provider,
-            flatten_error(&failure.error).dimmed()
-        );
-    }
+    println!("  {}", flatten_error(&format!("{error:#}")).dimmed());
 }
 
 pub(crate) fn pluralize(count: usize, singular: &str) -> String {

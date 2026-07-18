@@ -1,30 +1,20 @@
-//! Provider cascade shared by every AI-assisted command.
+//! AI layer shared by every AI-assisted command.
 //!
-//! `complete` tries local Ollama first, then the OpenAI Responses API, and
-//! hands each raw reply to the caller's `parse` closure. A reply that fails to
-//! parse counts as a provider failure, so a rambling local model falls through
-//! to the cloud instead of aborting the command.
+//! `complete` sends the request to the model and hands the raw reply to the
+//! caller's `parse` closure. A reply that fails to parse counts as a failure,
+//! so callers fall back to their manual flow instead of aborting.
 
 use anyhow::{Context, Result};
 use std::env;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-const OLLAMA_URL: &str = "http://localhost:11434/api/chat";
-const DEFAULT_LOCAL_MODEL: &str = "llama3";
-const DEFAULT_LOCAL_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 120;
 
-#[derive(Clone, Debug)]
-pub(crate) struct ProviderFailure {
-    pub(crate) provider: &'static str,
-    pub(crate) error: String,
-}
-
 /// One structured request: a system prompt, a user prompt, and the JSON schema
-/// the reply must satisfy (enforced natively where the provider supports it).
+/// the reply must satisfy (enforced natively by the Responses API).
 pub(crate) struct Request<'a> {
     pub(crate) system: &'a str,
     pub(crate) user: &'a str,
@@ -35,27 +25,8 @@ pub(crate) struct Request<'a> {
 pub(crate) async fn complete<T>(
     request: &Request<'_>,
     parse: impl Fn(&str) -> Result<T>,
-) -> std::result::Result<(T, &'static str), Vec<ProviderFailure>> {
-    let mut failures = Vec::new();
-
-    match ask_ollama(request).await.and_then(|raw| parse(&raw)) {
-        Ok(value) => return Ok((value, "local")),
-        Err(error) => failures.push(ProviderFailure {
-            provider: "local",
-            error: format!("{error:#}"),
-        }),
-    }
-
-    match ask_openai(request).await.and_then(|raw| parse(&raw)) {
-        Ok(value) => Ok((value, "cloud")),
-        Err(error) => {
-            failures.push(ProviderFailure {
-                provider: "cloud",
-                error: format!("{error:#}"),
-            });
-            Err(failures)
-        }
-    }
+) -> Result<T> {
+    ask_openai(request).await.and_then(|raw| parse(&raw))
 }
 
 pub(crate) fn flatten_error(error: &str) -> String {
@@ -76,42 +47,6 @@ fn http_client() -> &'static reqwest::Client {
             .build()
             .expect("HTTP client should initialize")
     })
-}
-
-async fn ask_ollama(request: &Request<'_>) -> Result<String> {
-    let timeout = env_duration_secs("KITE_LOCAL_TIMEOUT_SECS", DEFAULT_LOCAL_TIMEOUT_SECS)?;
-
-    let body = serde_json::json!({
-        "model": first_non_empty_env(&["KITE_LOCAL_MODEL"])
-            .unwrap_or_else(|| DEFAULT_LOCAL_MODEL.to_string()),
-        "messages": [
-            { "role": "system", "content": request.system },
-            { "role": "user", "content": request.user }
-        ],
-        "stream": false,
-        "format": "json"
-    });
-
-    let response = http_client()
-        .post(OLLAMA_URL)
-        .timeout(timeout)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| {
-            if error.is_connect() {
-                anyhow::anyhow!("Ollama is not running at {OLLAMA_URL}")
-            } else {
-                error.into()
-            }
-        })?
-        .error_for_status()?;
-
-    let json: serde_json::Value = response.json().await?;
-    Ok(json["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string())
 }
 
 async fn ask_openai(request: &Request<'_>) -> Result<String> {

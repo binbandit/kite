@@ -1,5 +1,6 @@
 mod ai;
 mod git;
+mod hunks;
 mod land;
 mod pr;
 mod synth;

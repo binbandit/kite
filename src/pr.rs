@@ -3,7 +3,7 @@
 //! The command gathers everything a good pull request needs — the branch's
 //! commits and diff, the repository's PR template, recent PR titles for style,
 //! and any PR-related agent skills installed on the machine — then asks the AI
-//! provider cascade for a title and body. Without AI it falls back to a
+//! for a title and body. Without AI it falls back to a
 //! deterministic draft. Nothing is created until the user approves the preview.
 
 use anyhow::{Context, Result};
@@ -20,7 +20,7 @@ use crate::git::{
 };
 use crate::land::publish_current_branch;
 use crate::synth::{MAX_DIFF_BYTES, truncate_for_prompt};
-use crate::ui::{Spinner, confirm, pluralize, print_provider_failures};
+use crate::ui::{Spinner, confirm, pluralize, print_ai_unavailable};
 
 const MAX_COMMIT_SUBJECTS: usize = 50;
 const MAX_PR_TITLE_EXAMPLES: usize = 8;
@@ -125,15 +125,15 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
     let drafted = draft_with_ai(&context, &title_examples, None).await;
     spinner.stop();
 
-    let (draft, provider_label) = match drafted {
-        Ok(result) => result,
-        Err(failures) => {
-            print_provider_failures(&failures);
-            (fallback_draft(&context), "manual")
+    let draft = match drafted {
+        Ok(draft) => draft,
+        Err(error) => {
+            print_ai_unavailable(&error);
+            fallback_draft(&context)
         }
     };
 
-    println!("{} Draft ({provider_label}):", "·".cyan());
+    println!("{} Draft:", "·".cyan());
     print!("{}", render_preview(&draft));
 
     if !options.yes && !confirm("Create pull request?")? {
@@ -167,10 +167,10 @@ async fn refresh_pull_request(
     let drafted = draft_with_ai(&context, &title_examples, Some(&existing)).await;
     spinner.stop();
 
-    let (draft, provider_label) = match drafted {
-        Ok(result) => result,
-        Err(failures) => {
-            print_provider_failures(&failures);
+    let draft = match drafted {
+        Ok(draft) => draft,
+        Err(error) => {
+            print_ai_unavailable(&error);
             println!("{} Leaving the pull request as is", "·".yellow());
             return Ok(());
         }
@@ -184,7 +184,7 @@ async fn refresh_pull_request(
         return Ok(());
     }
 
-    println!("{} Updated draft ({provider_label}):", "·".cyan());
+    println!("{} Updated draft:", "·".cyan());
     print!("{}", render_preview(&draft));
 
     if !auto_confirm && !confirm("Update the pull request?")? {
@@ -494,7 +494,7 @@ async fn draft_with_ai(
     context: &PrContext,
     title_examples: &[String],
     existing: Option<&ExistingPr>,
-) -> std::result::Result<(PrDraft, &'static str), Vec<ai::ProviderFailure>> {
+) -> Result<PrDraft> {
     let user = build_pr_input(context, title_examples, existing);
     let request = ai::Request {
         system: SYSTEM_PROMPT,
