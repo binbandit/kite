@@ -29,18 +29,16 @@
 - `--allow-dirty` temporarily stashes local changes before landing and restores them afterward so only contiguous `[kite] save` commits are rewritten.
 - Operate only on contiguous `[kite] save` commits at the top of history.
 - Build the synthesis prompt from:
-  - the diff introduced by those saves
+  - the diff introduced by those saves, split into labeled hunks the AI assigns to commits (so one file's changes can land as several commits)
   - recent non-Kite commit messages from the current repo as style examples
-- Try providers in this order:
-  1. Local Ollama at `http://localhost:11434/api/chat` with `KITE_LOCAL_MODEL` or default `llama3`, and `KITE_LOCAL_TIMEOUT_SECS` or default 30 seconds
-  2. OpenAI Responses API using the configured base URL, model, API key, and `KITE_OPENAI_TIMEOUT_SECS` or default 120 seconds
-  3. Manual fallback that asks for one commit message before rewriting history
-- Show the proposed grouped commit plan before rewriting anything; `--yes` skips only the confirmation prompt.
+- Synthesize with the OpenAI Responses API using the configured base URL, model, API key, and `KITE_OPENAI_TIMEOUT_SECS` or default 120 seconds; if it is unavailable, a manual fallback asks for one commit message before rewriting history.
+- Verify a hunk-level plan against a temporary index before rewriting; if the replayed commits would not reproduce the saved tree exactly, land whole files instead.
+- Show the proposed grouped commit plan before rewriting anything (split files are annotated like `(1/2 hunks)`); `--yes` skips only the confirmation prompt.
 - Record the pre-land `HEAD` at `refs/kite/pre_land`.
 - If rewriting fails mid-land, keep the in-progress state on a `kite-recovery-*` branch so partial commits or staged changes are preserved.
 - Rewrite history locally by default.
 - If `--push` is passed, publish immediately after a successful local land.
-- If AI misses files, add a final `chore: unclassified updates` commit for the leftovers.
+- If AI misses hunks, add a final `chore: unclassified updates` commit for the leftovers.
 
 ### `kt publish`
 
@@ -59,7 +57,7 @@
   - the repository's pull request template (checked case-insensitively in the root, `.github/`, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`); the AI fills it in and removes sections that don't apply rather than leaving them empty or writing N/A
   - PR-related agent skills (`SKILL.md` files whose name or frontmatter mentions pull requests) from `.claude/skills`, `.agents/skills`, and `skills` in the repo, plus `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills` — treated as the user's own instructions and given precedence over the default drafting rules
   - recent merged pull request titles as style examples
-- Drafts the title and body with the same Ollama → OpenAI cascade as `kt land`; without AI it falls back to a deterministic draft from the template and commit subjects.
+- Drafts the title and body with the same OpenAI Responses API as `kt land`; without AI it falls back to a deterministic draft from the template and commit subjects.
 - Previews the draft and asks for confirmation before running `gh pr create` (skip with `--yes`).
 - `--draft` creates a draft pull request; `--base` overrides the detected default branch.
 

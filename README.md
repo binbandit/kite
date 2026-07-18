@@ -44,11 +44,7 @@ kt land
 
 Kite analyzes the diff introduced by those saves, proposes logical commit groups, and only rewrites history after you confirm the plan.
 
-When AI is available, Kite tries providers in this order:
-
-1. Local Ollama
-2. OpenAI Responses API
-3. Manual fallback prompt
+Grouping is hunk-level: when one file contains changes for different purposes, its hunks can land in different commits. The plan marks split files with `(1/2 hunks)`-style annotations. Before rewriting anything, Kite replays the hunk-level plan against a temporary index and requires the result to reproduce your saved state exactly; if it cannot, it lands whole files instead.
 
 Kite also feeds recent non-Kite commit messages from the current repository into the prompt so landed messages follow the repo's existing style when possible. If the repo does not show a clear pattern, Kite falls back to Conventional Commit style.
 
@@ -57,7 +53,7 @@ Typical landed output looks like:
 - `feat(api): add stripe webhook endpoints`
 - `feat(ui): build checkout modal component`
 
-If AI is unavailable, Kite shows the provider failures and asks for one manual commit message before any history is changed.
+If the AI is unavailable, Kite shows the failure and asks for one manual commit message before any history is changed.
 
 ### 3. Open a Pull Request
 
@@ -67,7 +63,7 @@ Once the branch is landed, run:
 kt pr
 ```
 
-Kite gathers everything a good pull request needs, drafts it with the same AI cascade, shows you the result, and only creates it after you confirm. See [`kt pr`](#kt-pr) below for details.
+Kite gathers everything a good pull request needs, drafts it with the same AI as `kt land`, shows you the result, and only creates it after you confirm. See [`kt pr`](#kt-pr) below for details.
 
 ## Installation
 
@@ -142,6 +138,8 @@ Synthesizes contiguous Kite quicksaves into a polished local history.
 - By default, requires a clean working tree. If you still have WIP changes, run `kt` first or stash them.
 - Use `--allow-dirty` to land while your worktree is dirty; `kt` temporarily stashes and restores those changes.
 - Only rewrites contiguous `[kite] save` commits at the top of history.
+- Splits changes by hunk, so one file can contribute to multiple commits. Binary files, mode changes, and renames stay whole.
+- Verifies the hunk-level plan against a temporary index first; if the replayed commits would not reproduce your saved state bit-for-bit, Kite falls back to whole-file grouping.
 - Shows the proposed commit plan before rewriting anything.
 - Stores the pre-land `HEAD` in `refs/kite/pre_land` so `kt undo` can restore it later.
 - Creates normal `git commit`s, so hooks do run during landing.
@@ -195,7 +193,7 @@ Opens a GitHub pull request for the current branch using the [GitHub CLI](https:
 - Finds the repository's pull request template in the places GitHub looks (`.github/`, the repo root, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`), fills it in, and drops sections that don't apply — no empty headings, no `N/A`, no leftover boilerplate.
 - Discovers PR-related agent skills installed on the machine (`.claude/skills`, `.agents/skills`, and `skills` in the repo; `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills` per user) and treats them as your own instructions for how the pull request must be written — they take precedence over the default rules.
 - Uses recent merged pull request titles from the repository as style examples for the new title.
-- Drafts the title and body with the same Ollama → OpenAI cascade as `kt land`. Without AI, it falls back to a deterministic draft built from the template and the branch's commits.
+- Drafts the title and body with the same AI as `kt land`. Without AI, it falls back to a deterministic draft built from the template and the branch's commits.
 - Always previews the pull request and asks for confirmation before creating anything.
 
 ```bash
@@ -222,24 +220,9 @@ Attempts to restore the pre-land state.
 kt undo
 ```
 
-## Configuration & AI Providers
+## Configuration & AI
 
-Kite uses a local-first cascade for both `kt land` and `kt pr`, and falls back without blocking either flow.
-
-**1. Local Ollama**
-
-- Endpoint: `http://localhost:11434/api/chat`
-- Model env: `KITE_LOCAL_MODEL`
-- Timeout env: `KITE_LOCAL_TIMEOUT_SECS`
-- Default model: `llama3`
-- Default timeout: 30 seconds
-
-```bash
-export KITE_LOCAL_MODEL="llama3"
-export KITE_LOCAL_TIMEOUT_SECS="30"
-```
-
-**2. OpenAI Responses API**
+Both `kt land` and `kt pr` use one AI, reached through the OpenAI Responses API, and fall back without blocking either flow.
 
 - Base URL env precedence: `KITE_OPENAI_URL`, `KITE_OPENAI_BASE_URL`, `OPENAI_URL`, `OPENAI_BASE_URL`
 - Model env precedence: `KITE_OPENAI_MODEL`, `OPENAI_MODEL`
@@ -256,9 +239,9 @@ export KITE_OPENAI_MODEL="gpt-5.4-mini"
 export KITE_OPENAI_TIMEOUT_SECS="120"
 ```
 
-**3. Manual fallback**
+**Manual fallback**
 
-If neither AI provider is available, Kite shows the provider failures and keeps working: `kt land` asks for one manual commit message (leaving it blank aborts without changing history), and `kt pr` builds a deterministic draft from the template and the branch's commits.
+If the AI is unavailable, Kite shows the failure and keeps working: `kt land` asks for one manual commit message (leaving it blank aborts without changing history), and `kt pr` builds a deterministic draft from the template and the branch's commits.
 
 ## Why Kite Is Safe
 
@@ -268,7 +251,8 @@ Kite keeps the risky parts explicit:
 - **Dirty worktree override:** `kt land --allow-dirty` temporarily stashes uncommitted changes, lands saved commits, then restores those changes.
 - **Preview before rewrite:** Kite shows the proposed commit plan before it rewrites history.
 - **Rollback marker:** Every successful land records the previous `HEAD` at `refs/kite/pre_land`.
-- **No dropped files:** If the AI misses files, Kite adds a `chore: unclassified updates` commit rather than silently omitting them.
+- **No dropped changes:** If the AI misses hunks, Kite adds a `chore: unclassified updates` commit rather than silently omitting them.
+- **Exact-tree verification:** A hunk-level plan is replayed in a temporary index before any rewrite and must reproduce the pre-land tree exactly, otherwise Kite lands whole files instead.
 - **Explicit publish:** Landing is local by default. Publishing remains a separate step unless you opt into `--push`.
 - **Preview before PR:** `kt pr` shows the full title and body and asks for confirmation before anything reaches GitHub.
 

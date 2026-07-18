@@ -94,6 +94,63 @@ pub(crate) fn execute_git(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Like `execute_git`, but with extra environment variables and optional
+/// stdin — used for `git apply --cached` and temporary-index dry runs.
+pub(crate) fn execute_git_with(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin_data: Option<&str>,
+) -> Result<String> {
+    let mut command = git_command()?;
+    command
+        .args(args)
+        .envs(envs.iter().copied())
+        .stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("Failed 'git {}'", args.join(" ")))?;
+
+    if let Some(data) = stdin_data {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .expect("stdin should be piped")
+            .write_all(data.as_bytes())
+            .with_context(|| format!("Failed writing stdin to 'git {}'", args.join(" ")))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("Failed 'git {}'", args.join(" ")))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Git error: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Stages a patch into the index without touching the worktree.
+pub(crate) fn apply_cached_patch(patch: &str) -> Result<()> {
+    execute_git_with(
+        &["apply", "--cached", "--whitespace=nowarn"],
+        &[],
+        Some(patch),
+    )
+    .map(|_| ())
+}
+
 pub(crate) fn execute_git_quiet(args: &[&str]) -> Result<()> {
     let output = git_command()?
         .args(args)
@@ -277,39 +334,43 @@ pub(crate) fn check_ref(ref_name: &str) -> Option<String> {
     }
 }
 
+/// Explicit prefixes, context width, and binary payloads keep the diff
+/// parseable into hunks and replayable with `git apply` regardless of the
+/// user's diff configuration.
 pub(crate) fn diff_for_base(base: &KiteBase) -> Result<String> {
     match base {
         KiteBase::Commit(hash) => {
             let range = format!("{hash}..HEAD");
-            execute_git(&["diff", &range])
-        }
-        KiteBase::Root => {
-            execute_git(&["diff-tree", "--root", "--no-commit-id", "-r", "-p", "HEAD"])
-        }
-    }
-}
-
-pub(crate) fn changed_files_for_base(base: &KiteBase) -> Result<HashSet<String>> {
-    let output = match base {
-        KiteBase::Commit(hash) => {
-            let range = format!("{hash}..HEAD");
-            execute_git(&["diff", "--name-only", &range])?
+            execute_git(&[
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-renames",
+                "--binary",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "-U3",
+                &range,
+            ])
         }
         KiteBase::Root => execute_git(&[
+            "-c",
+            "core.quotepath=false",
             "diff-tree",
             "--root",
             "--no-commit-id",
             "-r",
-            "--name-only",
+            "-p",
+            "--no-renames",
+            "--binary",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "-U3",
             "HEAD",
-        ])?,
-    };
-
-    Ok(output
-        .lines()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-        .collect())
+        ]),
+    }
 }
 
 /// Best-effort style examples; an unreadable log just means no examples.
@@ -338,12 +399,6 @@ pub(crate) fn recent_commit_style_examples(limit: usize) -> Vec<String> {
     }
 
     examples
-}
-
-pub(crate) fn sorted_files(files: &HashSet<String>) -> Vec<String> {
-    let mut files: Vec<String> = files.iter().cloned().collect();
-    files.sort();
-    files
 }
 
 /// Walks history from `HEAD` in pages until the first non-Kite commit, so huge

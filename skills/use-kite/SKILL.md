@@ -1,6 +1,6 @@
 ---
 name: use-kite
-description: Operate the Kite CLI (`kt`) for repositories that use Kite's quicksave-and-land workflow. Use when Codex needs to inspect Kite state, start a flow with `kt go`, create quicksaves with `kt`, land contiguous `[kite] save` commits into polished history with `kt land`, publish with `kt publish`, open a pull request with `kt pr`, explain or troubleshoot Kite behavior, or configure Kite's Ollama/OpenAI fallback settings.
+description: Operate the Kite CLI (`kt`) for repositories that use Kite's quicksave-and-land workflow. Use when Codex needs to inspect Kite state, start a flow with `kt go`, create quicksaves with `kt`, land contiguous `[kite] save` commits into polished history with `kt land`, publish with `kt publish`, open a pull request with `kt pr`, explain or troubleshoot Kite behavior, or configure Kite's OpenAI settings.
 ---
 
 # Use Kite
