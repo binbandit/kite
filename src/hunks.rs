@@ -9,6 +9,9 @@
 
 use std::collections::HashSet;
 
+/// Floor for each unit's share of the prompt body budget.
+const MIN_UNIT_BODY_BYTES: usize = 400;
+
 /// How much of a file a commit takes, for plan rendering.
 #[derive(Clone, Debug)]
 pub(crate) struct FileStat {
@@ -73,6 +76,24 @@ pub(crate) struct DiffUnits {
 
 fn unit_id(index: usize) -> String {
     format!("h{}", index + 1)
+}
+
+/// Appends `body`, cut at a line boundary once it exceeds `cap` bytes.
+fn push_capped(out: &mut String, body: &str, cap: usize) {
+    if body.len() <= cap {
+        out.push_str(body);
+        return;
+    }
+    let mut used = 0;
+    for line in body.lines() {
+        if used + line.len() + 1 > cap {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+        used += line.len() + 1;
+    }
+    out.push_str("(trimmed)\n");
 }
 
 pub(crate) fn parse_diff(diff: &str) -> DiffUnits {
@@ -203,9 +224,20 @@ impl DiffUnits {
         index
     }
 
-    /// Full hunk bodies for the prompt, binary payloads elided. The caller
-    /// truncates this to its byte budget.
-    pub(crate) fn render_unit_bodies(&self) -> String {
+    /// Hunk bodies for the prompt, binary payloads elided. When the full
+    /// render exceeds `budget`, every unit gets a fair share of it instead of
+    /// the tail units losing their bodies entirely — a hunk the model never
+    /// saw is a hunk it forgets to assign.
+    pub(crate) fn render_unit_bodies(&self, budget: usize) -> String {
+        let full = self.render_bodies_capped(usize::MAX);
+        if full.len() <= budget {
+            return full;
+        }
+        let per_unit = (budget / self.unit_ids().len().max(1)).max(MIN_UNIT_BODY_BYTES);
+        self.render_bodies_capped(per_unit)
+    }
+
+    fn render_bodies_capped(&self, cap: usize) -> String {
         let mut bodies = String::new();
         for file in &self.files {
             if file.atomic {
@@ -216,9 +248,7 @@ impl DiffUnits {
                     file.label()
                 ));
                 if !file.is_binary() {
-                    for hunk in &file.hunks {
-                        bodies.push_str(hunk);
-                    }
+                    push_capped(&mut bodies, &file.hunks.concat(), cap);
                 }
             } else {
                 for (offset, hunk) in file.hunks.iter().enumerate() {
@@ -227,7 +257,7 @@ impl DiffUnits {
                         unit_id(file.first_unit + offset),
                         file.path
                     ));
-                    bodies.push_str(hunk);
+                    push_capped(&mut bodies, hunk, cap);
                 }
             }
             bodies.push('\n');
@@ -386,7 +416,7 @@ Hc$@<O00001
                 .render_unit_index()
                 .contains("- h1 logo.png (whole file: binary)")
         );
-        assert!(!units.render_unit_bodies().contains("literal 5"));
+        assert!(!units.render_unit_bodies(usize::MAX).contains("literal 5"));
 
         let patch = units.assemble_patch(&ids(&["h1"]));
         assert!(patch.contains("GIT binary patch"));
@@ -418,6 +448,37 @@ index 1111111..2222222
         let patch = units.assemble_patch(&ids(&["h1"]));
         assert!(patch.contains("new mode 100755"));
         assert!(patch.contains("+set -e"));
+    }
+
+    #[test]
+    fn render_unit_bodies_shares_the_budget_across_units() {
+        // One oversized hunk and one small one: with a tight budget the big
+        // body gets trimmed while every unit keeps its header and a share.
+        let long_hunk: String = (0..60)
+            .map(|line| format!("+line {line} padded to take up space\n"))
+            .collect();
+        let diff = format!(
+            "diff --git a/big.txt b/big.txt\n\
+             index 1111111..2222222 100644\n\
+             --- a/big.txt\n\
+             +++ b/big.txt\n\
+             @@ -0,0 +1,60 @@\n{long_hunk}\
+             diff --git a/small.txt b/small.txt\n\
+             index 3333333..4444444 100644\n\
+             --- a/small.txt\n\
+             +++ b/small.txt\n\
+             @@ -1,1 +1,2 @@\n one\n+two\n"
+        );
+        let units = parse_diff(&diff);
+
+        let full = units.render_unit_bodies(usize::MAX);
+        assert!(!full.contains("(trimmed)"));
+
+        let trimmed = units.render_unit_bodies(1_000);
+        assert!(trimmed.contains("[h1] big.txt"));
+        assert!(trimmed.contains("(trimmed)"));
+        assert!(trimmed.contains("[h2] small.txt"));
+        assert!(trimmed.contains("+two"));
     }
 
     #[test]

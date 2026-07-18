@@ -174,8 +174,8 @@ fn build_synthesis_input(units: &DiffUnits) -> String {
     prompt.push_str(&units.render_unit_index());
     prompt.push('\n');
 
-    prompt.push_str("Hunk contents (may be truncated; rely on the hunk list for full coverage):\n");
-    let bodies = units.render_unit_bodies();
+    prompt.push_str("Hunk contents (may be trimmed; rely on the hunk list for full coverage):\n");
+    let bodies = units.render_unit_bodies(MAX_DIFF_BYTES);
     prompt.push_str(truncate_for_prompt(&bodies, MAX_DIFF_BYTES));
     prompt
 }
@@ -415,9 +415,11 @@ index 3333333..4444444 100644
         assert!(prompt.contains("- h1 src/main.rs @@ -1,3 +1,4 @@"));
         assert!(prompt.contains("- h2 src/main.rs @@ -10,3 +11,4 @@"));
         assert!(prompt.contains("- h3 README.md @@ -1,1 +1,2 @@"));
-        assert!(prompt.contains(
-            "Hunk contents (may be truncated; rely on the hunk list for full coverage):"
-        ));
+        assert!(
+            prompt.contains(
+                "Hunk contents (may be trimmed; rely on the hunk list for full coverage):"
+            )
+        );
         assert!(prompt.contains("[h1] src/main.rs"));
         assert!(prompt.contains("+    init();"));
     }
