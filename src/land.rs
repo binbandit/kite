@@ -657,6 +657,53 @@ mod tests {
     }
 
     #[test]
+    fn land_splits_edits_only_a_few_lines_apart() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(
+            &repo.path,
+            "code.txt",
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+        );
+        git(&repo.path, &["add", "code.txt"]);
+        git(&repo.path, &["commit", "-m", "chore: add code"]);
+
+        // Lines 2 and 6 — close enough to merge into one hunk at the default
+        // context width, but separate hunks with -U1.
+        write_file(
+            &repo.path,
+            "code.txt",
+            "one\nTWO\nthree\nfour\nfive\nSIX\nseven\neight\nnine\nten\n",
+        );
+        git(&repo.path, &["add", "code.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let pre_land_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        assert_eq!(scope.units.unit_ids(), vec!["h1", "h2"]);
+
+        let groups = [
+            group("feat: upcase two", &["h1"]),
+            group("feat: upcase six", &["h2"]),
+        ];
+        let commits = with_repo_cwd(&repo.path, || {
+            plan_commits(&scope.base, &scope.units, &groups)
+        });
+        assert!(matches!(commits[0].stage, StageOp::Patch(_)));
+
+        execute_land_in_repo(&repo.path, &scope.base, &commits).expect("land should succeed");
+
+        let intermediate = git(&repo.path, &["show", "HEAD^:code.txt"]);
+        assert!(intermediate.contains("TWO") && intermediate.contains("six\n"));
+
+        let landed_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
+        assert_eq!(landed_tree, pre_land_tree);
+    }
+
+    #[test]
     fn plan_commits_falls_back_to_whole_files_when_hunks_are_missing() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();

@@ -336,7 +336,10 @@ pub(crate) fn check_ref(ref_name: &str) -> Option<String> {
 
 /// Explicit prefixes, context width, and binary payloads keep the diff
 /// parseable into hunks and replayable with `git apply` regardless of the
-/// user's diff configuration.
+/// user's diff configuration. One line of context (`-U1`) keeps nearby edits
+/// in separate hunks so they can land in different commits; `git apply`
+/// still anchors reliably because it matches the removed lines as well, and
+/// the pre-land tree verification catches any misapplication.
 pub(crate) fn diff_for_base(base: &KiteBase) -> Result<String> {
     match base {
         KiteBase::Commit(hash) => {
@@ -351,7 +354,7 @@ pub(crate) fn diff_for_base(base: &KiteBase) -> Result<String> {
                 "--binary",
                 "--src-prefix=a/",
                 "--dst-prefix=b/",
-                "-U3",
+                "-U1",
                 &range,
             ])
         }
@@ -367,7 +370,7 @@ pub(crate) fn diff_for_base(base: &KiteBase) -> Result<String> {
             "--binary",
             "--src-prefix=a/",
             "--dst-prefix=b/",
-            "-U3",
+            "-U1",
             "HEAD",
         ]),
     }
