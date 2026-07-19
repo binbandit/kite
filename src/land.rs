@@ -52,7 +52,7 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
 
         let commits = match synthesized {
             Ok(raw_groups) => {
-                let groups = normalize_groups(raw_groups, &scope.units.unit_ids());
+                let groups = normalize_groups(raw_groups, &scope.units);
                 if groups.is_empty() {
                     anyhow::bail!("No changes were assigned to landed commit groups.");
                 }
@@ -69,7 +69,7 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
                     println!("{} Aborted — no history changed", "·".red());
                     return Ok(());
                 };
-                vec![whole_tree_commit(&scope.units, message)]
+                vec![whole_files_commit(message, scope.units.all_files())]
             }
         };
 
@@ -346,19 +346,15 @@ fn collapse_to_whole_files(units: &DiffUnits, groups: &[CommitGroup]) -> Vec<Lan
             continue;
         }
 
-        commits.push(LandCommit {
-            message: group.message.clone(),
-            files: files.iter().cloned().map(FileStat::whole).collect(),
-            stage: StageOp::WholeFiles(files),
-        });
+        commits.push(whole_files_commit(group.message.clone(), files));
     }
 
     commits
 }
 
-/// Manual fallback: every changed file in one commit.
-fn whole_tree_commit(units: &DiffUnits, message: String) -> LandCommit {
-    let files = units.all_files();
+/// One commit staged as whole files; used by the verification fallback and
+/// the manual path.
+fn whole_files_commit(message: String, files: Vec<String>) -> LandCommit {
     LandCommit {
         message,
         files: files.iter().cloned().map(FileStat::whole).collect(),
@@ -368,7 +364,7 @@ fn whole_tree_commit(units: &DiffUnits, message: String) -> LandCommit {
 
 /// Renders the proposed history as a numbered list of commits, each with a
 /// small file tree underneath. Files split across commits show how many of
-/// their hunks each commit takes.
+/// their hunks each commit takes and which parts they are.
 fn render_land_plan(commits: &[LandCommit], save_count: usize) -> String {
     let mut plan = format!(
         "{} Plan: {} {} {}\n\n",
@@ -381,16 +377,23 @@ fn render_land_plan(commits: &[LandCommit], save_count: usize) -> String {
     for (index, commit) in commits.iter().enumerate() {
         plan.push_str(&format!("  {}. {}\n", index + 1, commit.message.bold()));
         for (position, file) in commit.files.iter().enumerate() {
-            let glyph = if position + 1 == commit.files.len() {
-                "└─"
-            } else {
-                "├─"
-            };
+            let last = position + 1 == commit.files.len();
+            let glyph = if last { "└─" } else { "├─" };
             let mut line = file.path.clone();
             if file.selected < file.total {
                 line.push_str(&format!(" ({}/{} hunks)", file.selected, file.total));
             }
             plan.push_str(&format!("     {} {}\n", glyph.dimmed(), line));
+
+            let continuation = if last { " " } else { "│" };
+            for heading in &file.headings {
+                let clipped: String = heading.chars().take(72).collect();
+                plan.push_str(&format!(
+                    "     {}    {}\n",
+                    continuation.dimmed(),
+                    format!("· {clipped}").dimmed()
+                ));
+            }
         }
     }
 
@@ -507,15 +510,11 @@ mod tests {
         with_repo_cwd(repo, undo)
     }
 
-    fn whole_files_commit(message: &str, files: &[&str]) -> LandCommit {
-        LandCommit {
-            message: message.to_string(),
-            files: files
-                .iter()
-                .map(|file| FileStat::whole(file.to_string()))
-                .collect(),
-            stage: StageOp::WholeFiles(files.iter().map(|file| file.to_string()).collect()),
-        }
+    fn files_commit(message: &str, files: &[&str]) -> LandCommit {
+        whole_files_commit(
+            message.to_string(),
+            files.iter().map(|file| file.to_string()).collect(),
+        )
     }
 
     fn group(message: &str, hunks: &[&str]) -> CommitGroup {
@@ -558,6 +557,7 @@ mod tests {
                             path: "src/api.rs".to_string(),
                             selected: 1,
                             total: 2,
+                            headings: vec!["fn register_webhook()".to_string()],
                         },
                         FileStat::whole("src/hooks.rs".to_string()),
                     ],
@@ -575,6 +575,7 @@ mod tests {
         assert!(plan.contains("Plan: 3 saves → 2 commits"));
         assert!(plan.contains("  1. feat(api): add webhooks\n"));
         assert!(plan.contains("     ├─ src/api.rs (1/2 hunks)\n"));
+        assert!(plan.contains("     │    · fn register_webhook()\n"));
         assert!(plan.contains("     └─ src/hooks.rs\n"));
         assert!(plan.contains("  2. docs: refresh readme\n"));
         assert!(plan.contains("     └─ README.md\n"));
@@ -752,10 +753,7 @@ mod tests {
         execute_land_in_repo(
             &repo.path,
             &scope.base,
-            &[whole_files_commit(
-                "feat: land tracked change",
-                &["tracked.txt"],
-            )],
+            &[files_commit("feat: land tracked change", &["tracked.txt"])],
         )
         .expect("land should succeed");
 
@@ -791,10 +789,7 @@ mod tests {
         execute_land_in_repo(
             &repo.path,
             &scope.base,
-            &[whole_files_commit(
-                "feat: land tracked change",
-                &["tracked.txt"],
-            )],
+            &[files_commit("feat: land tracked change", &["tracked.txt"])],
         )
         .expect("land should succeed");
 
@@ -858,7 +853,7 @@ mod tests {
         with_repo_cwd(&nested, || {
             execute_land(
                 &scope.base,
-                &[whole_files_commit(
+                &[files_commit(
                     "feat: land nested change",
                     &["nested/feature.txt"],
                 )],
@@ -888,10 +883,7 @@ mod tests {
         let err = execute_land_in_repo(
             &repo.path,
             &scope.base,
-            &[whole_files_commit(
-                "feat: land tracked change",
-                &["missing.txt"],
-            )],
+            &[files_commit("feat: land tracked change", &["missing.txt"])],
         )
         .expect_err("land should fail when a grouped file cannot be staged");
 
