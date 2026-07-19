@@ -18,6 +18,9 @@ pub(crate) struct FileStat {
     pub(crate) path: String,
     pub(crate) selected: usize,
     pub(crate) total: usize,
+    /// Headings of the selected hunks, filled only when the file is split
+    /// across commits, so the plan shows which parts land where.
+    pub(crate) headings: Vec<String>,
 }
 
 impl FileStat {
@@ -26,6 +29,7 @@ impl FileStat {
             path,
             selected: 1,
             total: 1,
+            headings: Vec::new(),
         }
     }
 }
@@ -301,16 +305,26 @@ impl DiffUnits {
         let mut stats = Vec::new();
         for file in &self.files {
             let total = file.unit_count();
-            let selected = (0..total)
+            let selected: Vec<usize> = (0..total)
                 .filter(|offset| ids.contains(&unit_id(file.first_unit + offset)))
-                .count();
-            if selected > 0 {
-                stats.push(FileStat {
-                    path: file.path.clone(),
-                    selected,
-                    total,
-                });
+                .collect();
+            if selected.is_empty() {
+                continue;
             }
+            let headings = if selected.len() < total {
+                selected
+                    .iter()
+                    .map(|&offset| hunk_heading(&file.hunks[offset]))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            stats.push(FileStat {
+                path: file.path.clone(),
+                selected: selected.len(),
+                total,
+                headings,
+            });
         }
         stats
     }
@@ -320,6 +334,29 @@ impl DiffUnits {
             .into_iter()
             .map(|stat| stat.path)
             .collect()
+    }
+
+    /// File a unit id belongs to; `None` for ids that don't match `h<n>`.
+    pub(crate) fn path_for(&self, id: &str) -> Option<&str> {
+        let index = id
+            .strip_prefix('h')?
+            .parse::<usize>()
+            .ok()?
+            .checked_sub(1)?;
+        self.files
+            .iter()
+            .find(|file| index >= file.first_unit && index < file.first_unit + file.unit_count())
+            .map(|file| file.path.as_str())
+    }
+}
+
+/// The function context git puts after the `@@` markers, or the raw `@@`
+/// line when there is none.
+fn hunk_heading(hunk: &str) -> String {
+    let header = hunk.lines().next().unwrap_or("");
+    match header.rsplit_once("@@") {
+        Some((_, context)) if !context.trim().is_empty() => context.trim().to_string(),
+        _ => header.trim().to_string(),
     }
 }
 

@@ -96,17 +96,17 @@ pub(crate) async fn synthesize_groups(units: &DiffUnits) -> Result<Vec<CommitGro
     last_parsed.map(Ok).unwrap_or(Err(last_error))
 }
 
-pub(crate) fn normalize_groups(groups: Vec<CommitGroup>, unit_ids: &[String]) -> Vec<CommitGroup> {
+pub(crate) fn normalize_groups(groups: Vec<CommitGroup>, units: &DiffUnits) -> Vec<CommitGroup> {
+    let unit_ids = units.unit_ids();
     let mut remaining: HashSet<String> = unit_ids.iter().cloned().collect();
     let mut normalized = Vec::new();
 
     for group in groups {
-        let mut hunks = Vec::new();
-        for id in group.hunks {
-            if remaining.remove(&id) {
-                hunks.push(id);
-            }
-        }
+        let hunks: Vec<String> = group
+            .hunks
+            .into_iter()
+            .filter(|id| remaining.remove(id))
+            .collect();
 
         if !hunks.is_empty() {
             normalized.push(CommitGroup {
@@ -116,14 +116,31 @@ pub(crate) fn normalize_groups(groups: Vec<CommitGroup>, unit_ids: &[String]) ->
         }
     }
 
-    if !remaining.is_empty() {
+    // A leftover hunk joins the only group already touching its file — the
+    // same commit file-level grouping would have chosen. Anything ambiguous
+    // lands in a visible catch-all commit instead of being dropped.
+    let mut unclassified = Vec::new();
+    for id in unit_ids.iter().filter(|id| remaining.contains(*id)) {
+        let path = units.path_for(id);
+        let owners: Vec<usize> = normalized
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| {
+                path.is_some() && group.hunks.iter().any(|hunk| units.path_for(hunk) == path)
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        match owners[..] {
+            [owner] => normalized[owner].hunks.push(id.clone()),
+            _ => unclassified.push(id.clone()),
+        }
+    }
+
+    if !unclassified.is_empty() {
         normalized.push(CommitGroup {
             message: "chore: unclassified updates".to_string(),
-            hunks: unit_ids
-                .iter()
-                .filter(|id| remaining.contains(*id))
-                .cloned()
-                .collect(),
+            hunks: unclassified,
         });
     }
 
@@ -442,23 +459,25 @@ index 3333333..4444444 100644
     }
 
     #[test]
-    fn normalize_groups_deduplicates_hunks_and_catches_leftovers() {
-        let ids = unit_ids(&["h1", "h2", "h3"]);
+    fn normalize_groups_joins_leftovers_to_their_files_group_or_a_chore_commit() {
+        // SAMPLE_DIFF: h1 and h2 in src/main.rs, h3 in README.md.
+        let units = parse_diff(SAMPLE_DIFF);
 
         let normalized = normalize_groups(
             vec![CommitGroup {
                 message: "feat(cli): tighten landing".to_string(),
                 hunks: vec!["h2".to_string(), "h2".to_string(), "h99".to_string()],
             }],
-            &ids,
+            &units,
         );
 
+        // h1 joins the group that already owns src/main.rs; h3 has no owner.
         assert_eq!(normalized.len(), 2);
-        assert_eq!(normalized[0].hunks, vec!["h2".to_string()]);
-        assert_eq!(normalized[1].message, "chore: unclassified updates");
         assert_eq!(
-            normalized[1].hunks,
-            vec!["h1".to_string(), "h3".to_string()]
+            normalized[0].hunks,
+            vec!["h2".to_string(), "h1".to_string()]
         );
+        assert_eq!(normalized[1].message, "chore: unclassified updates");
+        assert_eq!(normalized[1].hunks, vec!["h3".to_string()]);
     }
 }
