@@ -38,7 +38,7 @@
 - If rewriting fails mid-land, keep the in-progress state on a `kite-recovery-*` branch so partial commits or staged changes are preserved.
 - Rewrite history locally by default.
 - If `--push` is passed, publish immediately after a successful local land.
-- If AI misses hunks, add a final `chore: unclassified updates` commit for the leftovers.
+- If AI misses hunks, each joins the commit already touching its file when that is unambiguous; the rest land in a final `chore: unclassified updates` commit.
 
 ### `kt publish`
 

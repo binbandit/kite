@@ -251,7 +251,7 @@ Kite keeps the risky parts explicit:
 - **Dirty worktree override:** `kt land --allow-dirty` temporarily stashes uncommitted changes, lands saved commits, then restores those changes.
 - **Preview before rewrite:** Kite shows the proposed commit plan before it rewrites history.
 - **Rollback marker:** Every successful land records the previous `HEAD` at `refs/kite/pre_land`.
-- **No dropped changes:** If the AI misses hunks, Kite adds a `chore: unclassified updates` commit rather than silently omitting them.
+- **No dropped changes:** If the AI misses hunks, each one joins the commit already touching its file, or lands in a `chore: unclassified updates` commit — never silently omitted.
 - **Exact-tree verification:** A hunk-level plan is replayed in a temporary index before any rewrite and must reproduce the pre-land tree exactly, otherwise Kite lands whole files instead.
 - **Explicit publish:** Landing is local by default. Publishing remains a separate step unless you opt into `--push`.
 - **Preview before PR:** `kt pr` shows the full title and body and asks for confirmation before anything reaches GitHub.
