@@ -325,14 +325,14 @@ pub(crate) fn has_head_commit() -> bool {
     check_ref("HEAD").is_some()
 }
 
-pub(crate) fn get_current_branch() -> Result<String> {
-    let output = execute_git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
-    Ok(output.trim().to_string())
-}
-
-/// The checked-out branch, or an error when HEAD is detached. Every command
-/// that rewrites or publishes history needs a branch to update, and finding
-/// out after the rewrite has started leaves the user stranded.
+/// The checked-out branch, or an error when HEAD is detached.
+///
+/// Deliberately the only way to ask. `rev-parse --abbrev-ref HEAD` answers
+/// "HEAD" when detached, and every caller then treated that as a branch name:
+/// `kt land` rewrote history and only failed at `git branch -f HEAD`, and
+/// `kt publish` would have pushed a remote branch literally called HEAD.
+/// Every command that rewrites or publishes history needs a real branch, and
+/// finding out afterwards leaves the user stranded.
 pub(crate) fn current_branch_name() -> Result<String> {
     let branch = execute_git(&["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map(|output| output.trim().to_string())
