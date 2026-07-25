@@ -88,6 +88,39 @@ pub(crate) fn init_repo() -> TempDir {
     repo
 }
 
+/// A repo wired to a bare `origin`, plus a branch that exists only on that
+/// remote — the shape that used to make `kt go` fork a divergent branch.
+pub(crate) fn init_repo_with_remote_branch(remote_branch: &str) -> (TempDir, TempDir) {
+    let remote = TempDir::new("kite-test-remote");
+    git(&remote.path, &["init", "--bare", "-q"]);
+
+    let repo = init_repo();
+    let remote_url = remote.path.display().to_string();
+    git(&repo.path, &["remote", "add", "origin", &remote_url]);
+    git(&repo.path, &["push", "-q", "origin", "HEAD"]);
+
+    git(&repo.path, &["checkout", "-q", "-b", remote_branch]);
+    write_file(&repo.path, "teammate.txt", "their work\n");
+    git(&repo.path, &["add", "teammate.txt"]);
+    git(&repo.path, &["commit", "-m", "feat: teammate work"]);
+    git(&repo.path, &["push", "-q", "origin", remote_branch]);
+
+    // Leave the branch on the remote only, as it would be for a colleague.
+    let default_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "@{-1}"]);
+    git(&repo.path, &["checkout", "-q", default_branch.trim()]);
+    git(&repo.path, &["branch", "-q", "-D", remote_branch]);
+    git(
+        &repo.path,
+        &[
+            "update-ref",
+            "-d",
+            &format!("refs/remotes/origin/{remote_branch}"),
+        ],
+    );
+
+    (repo, remote)
+}
+
 pub(crate) fn init_root_kite_repo() -> TempDir {
     let repo = TempDir::new("kite-test");
     git(&repo.path, &["init"]);

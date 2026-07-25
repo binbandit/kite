@@ -17,7 +17,8 @@ use std::process::ExitCode;
 
 use crate::git::{
     SAVE_PREFIX, check_ref, execute_git, execute_git_quiet, get_default_branch, has_remote,
-    has_staged_changes, is_inside_git_repository, is_staged_status_line, kite_save_stack,
+    has_staged_changes, has_unmerged_paths, is_inside_git_repository, is_staged_status_line,
+    kite_save_stack,
 };
 use crate::land::{land, publish_current_branch, undo};
 use crate::pr::{PrOptions, create_pull_request};
@@ -124,6 +125,15 @@ fn render_help() -> String {
 fn save() -> Result<()> {
     // -uall lists files inside untracked directories, so the count is honest.
     let status = execute_git(&["status", "--porcelain", "-uall"])?;
+
+    // Committing here would either fail with a wall of git hints or record the
+    // conflict markers as if they were real content.
+    if has_unmerged_paths(&status) {
+        anyhow::bail!(
+            "This repository has unresolved merge conflicts. Fix the conflicted files, `git add` them, and finish the merge before saving."
+        );
+    }
+
     if status.trim().is_empty() {
         let note = match kite_save_stack()? {
             Some(stack) => format!(
@@ -161,6 +171,25 @@ fn go(name: &str) -> Result<()> {
         execute_git(&["checkout", name])?;
         println!("{} Switched to {}", "✓".green(), name.bold());
         return Ok(());
+    }
+
+    // A branch that exists only on the remote is someone's work in progress —
+    // possibly your own from another machine. Branching off the default branch
+    // instead would silently create a divergent branch with the same name, and
+    // the next `kt publish` would overwrite theirs.
+    if has_remote() {
+        let remote_ref = format!("refs/remotes/origin/{name}");
+        let _ = execute_git(&["fetch", "origin", name]);
+        if check_ref(&remote_ref).is_some() {
+            execute_git(&["checkout", "--track", &format!("origin/{name}")])?;
+            println!(
+                "{} Switched to {} {}",
+                "✓".green(),
+                name.bold(),
+                "tracking origin".dimmed()
+            );
+            return Ok(());
+        }
     }
 
     let default_branch = get_default_branch()?;
@@ -291,6 +320,53 @@ mod tests {
         let current_head = git(&repo.path, &["rev-parse", "HEAD"]);
         assert_eq!(current_branch.trim(), "existing-flow");
         assert_eq!(current_head, existing_head);
+    }
+
+    #[test]
+    fn go_checks_out_a_remote_only_branch_instead_of_forking_over_it() {
+        let _lock = acquire_cwd_lock();
+        let (repo, _remote) = crate::test_support::init_repo_with_remote_branch("teammate-work");
+
+        run_go_in_repo(&repo.path, "teammate-work").expect("go should adopt the remote branch");
+
+        let current_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(current_branch.trim(), "teammate-work");
+
+        // The colleague's commit must be on the branch, not orphaned on the
+        // remote waiting to be force-pushed away by the next `kt publish`.
+        let subjects = git(&repo.path, &["log", "--format=%s"]);
+        assert!(
+            subjects.lines().any(|line| line == "feat: teammate work"),
+            "expected the remote branch's history, got: {subjects}"
+        );
+
+        let upstream = git(
+            &repo.path,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        );
+        assert_eq!(upstream.trim(), "origin/teammate-work");
+    }
+
+    #[test]
+    fn save_refuses_to_snapshot_an_unresolved_merge() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        git(&repo.path, &["checkout", "-q", "-b", "side"]);
+        write_file(&repo.path, "tracked.txt", "side change\n");
+        git(&repo.path, &["commit", "-qam", "feat: side"]);
+        git(&repo.path, &["checkout", "-q", "-"]);
+        write_file(&repo.path, "tracked.txt", "main change\n");
+        git(&repo.path, &["commit", "-qam", "feat: main"]);
+
+        // Conflicting merge, left unresolved.
+        let _ = std::process::Command::new("git")
+            .args(["merge", "side"])
+            .current_dir(&repo.path)
+            .output();
+
+        let err = run_save_in_repo(&repo.path).expect_err("save should refuse a conflicted tree");
+        assert!(format!("{err:#}").contains("unresolved merge conflicts"));
     }
 
     #[test]

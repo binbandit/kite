@@ -78,6 +78,14 @@ fn git_command() -> Result<Command> {
     Ok(command)
 }
 
+/// Takes ownership of command output without a second full copy. `git diff`
+/// output can be tens of megabytes, and `from_utf8_lossy(..).to_string()`
+/// would allocate all of it a second time even when it is valid UTF-8.
+fn into_string(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+}
+
 pub(crate) fn execute_git(args: &[&str]) -> Result<String> {
     let output = git_command()?
         .args(args)
@@ -91,7 +99,7 @@ pub(crate) fn execute_git(args: &[&str]) -> Result<String> {
         );
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(into_string(output.stdout))
 }
 
 /// Like `execute_git`, but with extra environment variables and optional
@@ -117,19 +125,34 @@ pub(crate) fn execute_git_with(
         .spawn()
         .with_context(|| format!("Failed 'git {}'", args.join(" ")))?;
 
-    if let Some(data) = stdin_data {
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .expect("stdin should be piped")
-            .write_all(data.as_bytes())
-            .with_context(|| format!("Failed writing stdin to 'git {}'", args.join(" ")))?;
-    }
+    // Feed stdin from a scoped thread. Writing a multi-megabyte patch inline
+    // and only then waiting would deadlock against any command that fills its
+    // stdout or stderr pipe while we are still writing. Scoped so the patch is
+    // borrowed rather than copied.
+    let output = std::thread::scope(|scope| -> Result<std::process::Output> {
+        let writer = stdin_data.map(|data| {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().expect("stdin should be piped");
+            scope.spawn(move || stdin.write_all(data.as_bytes()))
+        });
 
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("Failed 'git {}'", args.join(" ")))?;
+        let output = child
+            .wait_with_output()
+            .with_context(|| format!("Failed 'git {}'", args.join(" ")))?;
+
+        // A failed write almost always means git exited early; its stderr says
+        // why, and that beats reporting a broken pipe. Only surface the write
+        // error when git itself claims success.
+        if let Some(writer) = writer
+            && output.status.success()
+            && let Ok(Err(error)) = writer.join()
+        {
+            return Err(error)
+                .with_context(|| format!("Failed writing stdin to 'git {}'", args.join(" ")));
+        }
+
+        Ok(output)
+    })?;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -138,7 +161,7 @@ pub(crate) fn execute_git_with(
         );
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(into_string(output.stdout))
 }
 
 /// Stages a patch into the index without touching the worktree.
@@ -307,6 +330,100 @@ pub(crate) fn get_current_branch() -> Result<String> {
     Ok(output.trim().to_string())
 }
 
+/// The checked-out branch, or an error when HEAD is detached. Every command
+/// that rewrites or publishes history needs a branch to update, and finding
+/// out after the rewrite has started leaves the user stranded.
+pub(crate) fn current_branch_name() -> Result<String> {
+    let branch = execute_git(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .map(|output| output.trim().to_string())
+        .unwrap_or_default();
+
+    if branch.is_empty() {
+        anyhow::bail!(
+            "HEAD is detached, so there is no branch to update. Switch to a branch first with `git switch <branch>`."
+        );
+    }
+
+    Ok(branch)
+}
+
+/// True when the repository is mid-merge, mid-rebase, or otherwise holding
+/// unmerged index entries. Git's own message for this is a wall of hints.
+pub(crate) fn has_unmerged_paths(status: &str) -> bool {
+    status.lines().any(|line| {
+        let mut codes = line.chars();
+        let (Some(index), Some(worktree)) = (codes.next(), codes.next()) else {
+            return false;
+        };
+        index == 'U'
+            || worktree == 'U'
+            || (index == 'A' && worktree == 'A')
+            || (index == 'D' && worktree == 'D')
+    })
+}
+
+pub(crate) fn is_save_subject(subject: &str) -> bool {
+    subject.trim_start().starts_with(SAVE_PREFIX)
+}
+
+/// Local repository config, used to remember which branch a land belongs to.
+/// Config handles every branch name; a `refs/kite/pre_land/<branch>` ref
+/// would hit directory/file conflicts for names like `feat` and `feat/x`.
+pub(crate) fn config_get(key: &str) -> Option<String> {
+    let output = git_command()
+        .ok()?
+        .args(["config", "--local", "--get", key])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+pub(crate) fn config_set(key: &str, value: &str) -> Result<()> {
+    execute_git_quiet(&["config", "--local", key, value])
+}
+
+pub(crate) fn config_unset(key: &str) {
+    let _ = execute_git_quiet(&["config", "--local", "--unset", key]);
+}
+
+/// True when `ancestor` is reachable from `descendant`, i.e. pushing
+/// `descendant` would fast-forward past `ancestor` rather than discard it.
+pub(crate) fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
+    git_command()
+        .and_then(|mut command| {
+            command
+                .args(["merge-base", "--is-ancestor", ancestor, descendant])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .context("Failed 'git merge-base'")
+        })
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Subjects of the commits `reference` has that `HEAD` does not — exactly
+/// what a force-push would drop.
+pub(crate) fn subjects_missing_from_head(reference: &str) -> Vec<String> {
+    let Ok(output) = execute_git(&["log", "--format=%s", &format!("HEAD..{reference}")]) else {
+        return Vec::new();
+    };
+
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 pub(crate) fn has_remote() -> bool {
     git_command()
         .and_then(|mut command| {
@@ -405,14 +522,25 @@ pub(crate) fn recent_commit_style_examples(limit: usize) -> Vec<String> {
 }
 
 /// Walks history from `HEAD` in pages until the first non-Kite commit, so huge
-/// repositories never pay for a full `git log`.
+/// repositories never pay for a full `git log`. `--first-parent` keeps the walk
+/// on the branch's own line of development: without it a merged-in side branch
+/// can interleave by commit date and move the base onto an unrelated commit,
+/// which would make `kt land` rewrite more history than the user's saves.
 pub(crate) fn kite_save_stack() -> Result<Option<SaveStack>> {
     let mut count = 0;
 
     for page in 0.. {
         let skip = (page * LOG_PAGE_SIZE).to_string();
         let max = LOG_PAGE_SIZE.to_string();
-        let output = match execute_git(&["log", "--format=%H %s", "-n", &max, "--skip", &skip]) {
+        let output = match execute_git(&[
+            "log",
+            "--first-parent",
+            "--format=%H %s",
+            "-n",
+            &max,
+            "--skip",
+            &skip,
+        ]) {
             Ok(output) => output,
             Err(_) if page == 0 => return Ok(None), // no commits yet
             Err(error) => return Err(error),

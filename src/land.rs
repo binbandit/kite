@@ -5,12 +5,23 @@ use std::collections::HashSet;
 
 use crate::ai::flatten_error;
 use crate::git::{
-    KiteBase, apply_cached_patch, check_ref, commit_git, diff_for_base, execute_git,
-    execute_git_with, get_current_branch, has_head_commit, has_remote, kite_save_stack,
+    KiteBase, apply_cached_patch, check_ref, commit_git, config_get, config_set, config_unset,
+    current_branch_name, diff_for_base, execute_git, execute_git_with, has_head_commit, has_remote,
+    has_unmerged_paths, is_ancestor, is_save_subject, kite_save_stack, subjects_missing_from_head,
 };
 use crate::hunks::{DiffUnits, FileStat, parse_diff};
 use crate::synth::{CommitGroup, normalize_groups, synthesize_groups};
 use crate::ui::{Spinner, confirm, pluralize, print_ai_unavailable, prompt_line};
+
+/// Where the pre-land `HEAD` is parked so `kt undo` can restore it, plus the
+/// local config keys recording which branch that land belongs to and where it
+/// left `HEAD`.
+const PRE_LAND_REF: &str = "refs/kite/pre_land";
+const PRE_LAND_BRANCH_KEY: &str = "kite.preland.branch";
+const PRE_LAND_HEAD_KEY: &str = "kite.preland.head";
+
+/// How many about-to-be-discarded remote commits to list before summarizing.
+const MAX_DROPPED_COMMITS_SHOWN: usize = 10;
 
 #[derive(Clone, Debug)]
 struct LandScope {
@@ -35,6 +46,10 @@ enum StageOp {
 }
 
 pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> Result<()> {
+    if !land_preflight()? {
+        return Ok(());
+    }
+
     let stashed = if allow_dirty {
         stash_dirty_worktree_for_land()?
     } else {
@@ -117,43 +132,102 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
     land_result
 }
 
-/// Pushes with `--force-with-lease` and nothing else. Deliberately no
-/// `pull --rebase` first: after a land the remote holds the old saves, and
-/// rebasing onto them would resurrect the history we just rewrote. The lease
-/// protects anything pushed by someone else — the push is rejected and the
-/// user decides.
+/// Publishes the branch, discarding remote commits only when they are the
+/// Kite saves this branch just rewrote. Deliberately no `pull --rebase` first:
+/// after a land the remote still holds the old saves, and rebasing onto them
+/// would resurrect the history we just rewrote.
+///
+/// A bare `--force-with-lease` is not enough. The lease compares against the
+/// local remote-tracking ref, and when that ref does not exist — the usual
+/// case for a branch someone else created — git has nothing to compare and
+/// lets the push through, silently destroying their work. So we fetch, ask
+/// what would actually be dropped, and only decide from that.
 pub(crate) fn publish_current_branch() -> Result<()> {
     if !has_remote() {
         println!("{} No remote — history stays local", "·".dimmed());
         return Ok(());
     }
 
-    let branch = get_current_branch()?;
+    let branch = current_branch_name()?;
+    let remote_ref = format!("refs/remotes/origin/{branch}");
 
     let spinner = Spinner::start(format!("Publishing {branch}"));
-    let pushed = execute_git(&[
-        "push",
-        "--set-upstream",
-        "origin",
-        &branch,
-        "--force-with-lease",
-    ]);
+    // Refresh the tracking ref so the decision reflects the real remote.
+    let _ = execute_git(&["fetch", "origin", &branch]);
+    let remote_sha = check_ref(&remote_ref);
+    spinner.stop();
+
+    let force = match &remote_sha {
+        // Nothing on the remote yet, or the remote is already an ancestor:
+        // a plain push is enough and forcing would be wrong.
+        None => None,
+        Some(sha) if is_ancestor(sha, "HEAD") => None,
+        Some(sha) => {
+            confirm_discarding_remote_commits(&branch, sha)?;
+            Some(format!("--force-with-lease={branch}:{sha}"))
+        }
+    };
+
+    let mut args = vec!["push", "--set-upstream", "origin", &branch];
+    if let Some(force) = &force {
+        args.push(force);
+    }
+
+    let spinner = Spinner::start(format!("Publishing {branch}"));
+    let pushed = execute_git(&args);
     spinner.stop();
 
     pushed.with_context(|| {
         format!(
-            "Push rejected. If `origin/{branch}` has commits you don't have, fetch and reconcile them first."
+            "Push rejected. `origin/{branch}` moved while Kite was publishing — rerun `kt publish` to see the new state."
         )
     })?;
     println!("{} Published {}", "✓".green(), branch.bold());
     Ok(())
 }
 
+/// The remote has commits this branch does not. When they are all Kite saves
+/// they are the ones we just landed, so replacing them is the whole point.
+/// Anything else is someone's work and needs an explicit yes.
+fn confirm_discarding_remote_commits(branch: &str, remote_sha: &str) -> Result<()> {
+    let dropped = subjects_missing_from_head(remote_sha);
+    if dropped.iter().all(|subject| is_save_subject(subject)) {
+        return Ok(());
+    }
+
+    println!(
+        "{} `origin/{branch}` has {} that {} does not:",
+        "!".yellow(),
+        pluralize(dropped.len(), "commit"),
+        "your branch".bold()
+    );
+    for subject in dropped.iter().take(MAX_DROPPED_COMMITS_SHOWN) {
+        println!("     {} {}", "-".dimmed(), subject);
+    }
+    if dropped.len() > MAX_DROPPED_COMMITS_SHOWN {
+        println!(
+            "     {}",
+            format!("… and {} more", dropped.len() - MAX_DROPPED_COMMITS_SHOWN).dimmed()
+        );
+    }
+
+    if confirm("Publishing will discard them from the remote. Continue?")? {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "Publish cancelled — `origin/{branch}` untouched. Run `git fetch origin {branch}` and reconcile if you want to keep those commits."
+    )
+}
+
 pub(crate) fn undo() -> Result<()> {
-    let Some(pre_land_sha) = check_ref("refs/kite/pre_land") else {
+    let Some(pre_land_sha) = check_ref(PRE_LAND_REF) else {
         println!("{} Nothing to undo — no land recorded", "·".yellow());
         return Ok(());
     };
+
+    let branch = current_branch_name()?;
+    guard_undo_target(&branch)?;
 
     let status = execute_git(&["status", "--porcelain"])?;
     if !status.trim().is_empty() {
@@ -163,12 +237,18 @@ pub(crate) fn undo() -> Result<()> {
     }
 
     execute_git(&["reset", "--hard", &pre_land_sha])?;
-    execute_git(&["update-ref", "-d", "refs/kite/pre_land"])?;
+    execute_git(&["update-ref", "-d", PRE_LAND_REF])?;
+    config_unset(PRE_LAND_BRANCH_KEY);
+    config_unset(PRE_LAND_HEAD_KEY);
 
     if has_remote() {
-        let branch = get_current_branch()?;
         let spinner = Spinner::start("Reverting remote");
-        let reverted = execute_git(&["push", "--force-with-lease", "origin", &branch]);
+        let reverted = execute_git(&[
+            "push",
+            "--force-with-lease",
+            "origin",
+            &format!("{pre_land_sha}:refs/heads/{branch}"),
+        ]);
         spinner.stop();
         if reverted.is_err() {
             println!(
@@ -182,6 +262,80 @@ pub(crate) fn undo() -> Result<()> {
     Ok(())
 }
 
+/// `refs/kite/pre_land` is a single repo-wide ref, so on its own it says
+/// nothing about which branch it belongs to. Without this guard, landing on
+/// one branch and undoing on another hard-resets — and force-pushes — the
+/// wrong branch to an unrelated commit.
+fn guard_undo_target(branch: &str) -> Result<()> {
+    let Some(landed_branch) = config_get(PRE_LAND_BRANCH_KEY) else {
+        // Recorded by a Kite that predates this guard: we cannot tell which
+        // branch it belongs to, so make the user look before it resets.
+        if confirm(&format!(
+            "The recorded land has no branch attached. Reset `{branch}` to it anyway?"
+        ))? {
+            return Ok(());
+        }
+        anyhow::bail!("Undo cancelled — nothing changed");
+    };
+
+    if landed_branch != branch {
+        anyhow::bail!(
+            "The last land was on `{landed_branch}`, but you are on `{branch}`. Run `git switch {landed_branch}` first — undoing here would reset `{branch}` to unrelated history."
+        );
+    }
+
+    // Landing recorded where it left HEAD. If HEAD moved since, undo would
+    // throw away whatever was committed on top of the landed commits.
+    let Some(landed_head) = config_get(PRE_LAND_HEAD_KEY) else {
+        return Ok(());
+    };
+    let current_head = execute_git(&["rev-parse", "HEAD"])?;
+    if current_head.trim() == landed_head {
+        return Ok(());
+    }
+
+    let added = execute_git(&["log", "--format=%s", &format!("{landed_head}..HEAD")])
+        .map(|output| {
+            output
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+
+    if confirm(&format!(
+        "`{branch}` has moved since that land. Undo will discard {} made since. Continue?",
+        pluralize(added, "commit")
+    ))? {
+        return Ok(());
+    }
+    anyhow::bail!("Undo cancelled — nothing changed")
+}
+
+/// Everything that must hold before Kite touches the worktree. Run before
+/// `--allow-dirty` stashes anything, so a repository that cannot be landed
+/// never gets its work put away first and its diagnosis second.
+fn land_preflight() -> Result<bool> {
+    if !has_head_commit() {
+        println!(
+            "{} No commits yet — make an initial commit before landing",
+            "·".yellow()
+        );
+        return Ok(false);
+    }
+
+    current_branch_name()?;
+
+    let status = execute_git(&["status", "--porcelain"])?;
+    if has_unmerged_paths(&status) {
+        anyhow::bail!(
+            "This repository has unresolved merge conflicts. Resolve them and commit the merge before landing."
+        );
+    }
+
+    Ok(true)
+}
+
 fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
     if !has_head_commit() {
         println!(
@@ -190,6 +344,10 @@ fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
         );
         return Ok(None);
     }
+
+    // A detached HEAD has no branch to move onto the landed commits. Checked
+    // here so it costs nothing and reports before any work is done.
+    current_branch_name()?;
 
     if !allow_dirty {
         let status = execute_git(&["status", "--porcelain"])?;
@@ -402,11 +560,22 @@ fn render_land_plan(commits: &[LandCommit], save_count: usize) -> String {
 }
 
 fn execute_land(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
-    let original_branch = get_current_branch()?;
+    if commits.is_empty() {
+        anyhow::bail!("Refusing to land an empty plan — that would discard the saves.");
+    }
+
+    // Resolved before anything is rewritten: on a detached HEAD there is no
+    // branch to point at the landed commits, and discovering that after the
+    // rewrite strands the user on the recovery branch.
+    let original_branch = current_branch_name()?;
     let pre_land_sha = execute_git(&["rev-parse", "HEAD"])?;
     let recovery_branch = format!("kite-recovery-{}", Local::now().format("%Y%m%d%H%M%S"));
 
-    execute_git(&["update-ref", "refs/kite/pre_land", pre_land_sha.trim()])?;
+    execute_git(&["update-ref", PRE_LAND_REF, pre_land_sha.trim()])?;
+    config_set(PRE_LAND_BRANCH_KEY, &original_branch)?;
+    // Cleared until the land succeeds, so a stale value can never make `kt
+    // undo` think HEAD is untouched.
+    config_unset(PRE_LAND_HEAD_KEY);
 
     if let Err(err) = prepare_landing_branch(base, &recovery_branch).and_then(|_| {
         create_commits(commits)?;
@@ -416,6 +585,10 @@ fn execute_land(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
             "{}",
             render_land_failure(&err, &original_branch, &recovery_branch)
         );
+    }
+
+    if let Ok(landed_head) = execute_git(&["rev-parse", "HEAD"]) {
+        let _ = config_set(PRE_LAND_HEAD_KEY, landed_head.trim());
     }
 
     Ok(())
@@ -430,7 +603,7 @@ fn render_land_failure(
         "{err}\n\nLanding stopped before updating `{original_branch}`.\nKite kept the in-progress landing state on recovery branch `{recovery_branch}` so partial commits or staged changes are not lost."
     );
 
-    if get_current_branch()
+    if current_branch_name()
         .map(|branch| branch == recovery_branch)
         .unwrap_or(false)
     {
@@ -800,6 +973,129 @@ mod tests {
 
         let status = git(&repo.path, &["status", "--porcelain"]);
         assert!(status.trim().is_empty());
+    }
+
+    #[test]
+    fn undo_refuses_when_the_land_belongs_to_another_branch() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let default_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let default_branch = default_branch.trim().to_string();
+
+        git(&repo.path, &["checkout", "-q", "-b", "feature-a"]);
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: land tracked change", &["tracked.txt"])],
+        )
+        .expect("land should succeed");
+
+        // Move to an unrelated branch and commit there.
+        git(&repo.path, &["checkout", "-q", &default_branch]);
+        write_file(&repo.path, "elsewhere.txt", "unrelated work\n");
+        git(&repo.path, &["add", "elsewhere.txt"]);
+        git(&repo.path, &["commit", "-m", "feat: unrelated work"]);
+        let protected_head = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        let err = undo_in_repo(&repo.path).expect_err("undo should refuse on another branch");
+        assert!(format!("{err:#}").contains("The last land was on `feature-a`"));
+
+        // Crucially, nothing moved.
+        let head_after = git(&repo.path, &["rev-parse", "HEAD"]);
+        assert_eq!(head_after, protected_head);
+        assert!(repo.path.join("elsewhere.txt").exists());
+        assert!(
+            check_ref_in(&repo.path, PRE_LAND_REF).is_some(),
+            "a refused undo must keep the rollback marker"
+        );
+    }
+
+    #[test]
+    fn undo_on_the_landed_branch_still_restores_the_saves() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+        let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: land tracked change", &["tracked.txt"])],
+        )
+        .expect("land should succeed");
+
+        undo_in_repo(&repo.path).expect("undo should succeed on the landed branch");
+
+        assert_eq!(
+            git(&repo.path, &["rev-parse", "HEAD"]).trim(),
+            pre_land_sha.trim()
+        );
+        assert!(
+            check_ref_in(&repo.path, PRE_LAND_REF).is_none(),
+            "a successful undo consumes the marker"
+        );
+    }
+
+    #[test]
+    fn land_refuses_on_a_detached_head_before_touching_history() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+        let head_before = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        git(&repo.path, &["checkout", "-q", "--detach"]);
+
+        let err = with_repo_cwd(&repo.path, land_preflight)
+            .expect_err("a detached HEAD should be refused up front");
+        assert!(format!("{err:#}").contains("HEAD is detached"));
+
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), head_before);
+        let recovery = git(&repo.path, &["branch", "--list", "kite-recovery-*"]);
+        assert!(
+            recovery.trim().is_empty(),
+            "nothing should have been rewritten"
+        );
+    }
+
+    #[test]
+    fn land_preflight_refuses_an_unresolved_merge() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        git(&repo.path, &["checkout", "-q", "-b", "side"]);
+        write_file(&repo.path, "tracked.txt", "side\n");
+        git(&repo.path, &["commit", "-qam", "feat: side"]);
+        git(&repo.path, &["checkout", "-q", "-"]);
+        write_file(&repo.path, "tracked.txt", "main\n");
+        git(&repo.path, &["commit", "-qam", "feat: main"]);
+        let _ = std::process::Command::new("git")
+            .args(["merge", "side"])
+            .current_dir(&repo.path)
+            .output();
+
+        let err = with_repo_cwd(&repo.path, land_preflight)
+            .expect_err("a conflicted repo should be refused");
+        assert!(format!("{err:#}").contains("unresolved merge conflicts"));
+    }
+
+    fn check_ref_in(repo: &std::path::Path, name: &str) -> Option<String> {
+        with_repo_cwd(repo, || check_ref(name))
     }
 
     #[test]
