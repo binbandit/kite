@@ -9,12 +9,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::ai::{self, extract_json_block};
-use crate::git::recent_commit_style_examples;
-use crate::hunks::DiffUnits;
+use crate::git::{is_save_subject, recent_commit_style_examples};
+use crate::hunks::{DiffUnits, MIN_UNIT_BODY_BYTES};
 
 const MAX_COMMIT_STYLE_EXAMPLES: usize = 6;
 const MAX_SYNTHESIS_ATTEMPTS: usize = 3;
 pub(crate) const MAX_DIFF_BYTES: usize = 60_000;
+
+/// Past this many units the body budget cannot give each hunk enough content
+/// for the model to tell them apart, and the prompt grows without bound. A
+/// land that big groups whole files instead — see `DiffUnits::coarsened_to_files`.
+pub(crate) const MAX_PLANNABLE_UNITS: usize = MAX_DIFF_BYTES / MIN_UNIT_BODY_BYTES;
+
+/// Used when the model returns a message Kite cannot let through.
+const FALLBACK_COMMIT_MESSAGE: &str = "chore: update";
 
 const SYSTEM_PROMPT: &str = "\
 You are an expert version control synthesis engine. Analyze the git diff, which is split into labeled hunks (h1, h2, ...). Some hunks represent a whole file that cannot be split.
@@ -110,7 +118,7 @@ pub(crate) fn normalize_groups(groups: Vec<CommitGroup>, units: &DiffUnits) -> V
 
         if !hunks.is_empty() {
             normalized.push(CommitGroup {
-                message: group.message.trim().to_string(),
+                message: sanitize_commit_message(&group.message),
                 hunks,
             });
         }
@@ -145,6 +153,22 @@ pub(crate) fn normalize_groups(groups: Vec<CommitGroup>, units: &DiffUnits) -> V
     }
 
     normalized
+}
+
+/// A landed commit whose subject looks like a Kite save is indistinguishable
+/// from an unlanded one: `kt` reports work still to land, `kt land` re-lands
+/// it forever, and `kt pr` refuses to open a pull request. The system prompt
+/// forbids it — this makes it impossible. Also collapses blank messages,
+/// which `git commit -m ""` would reject mid-rewrite.
+pub(crate) fn sanitize_commit_message(message: &str) -> String {
+    let trimmed = message.trim();
+    let subject = trimmed.lines().next().unwrap_or("").trim();
+
+    if subject.is_empty() || is_save_subject(subject) {
+        return FALLBACK_COMMIT_MESSAGE.to_string();
+    }
+
+    trimmed.to_string()
 }
 
 fn groups_schema() -> serde_json::Value {
@@ -449,6 +473,47 @@ index 3333333..4444444 100644
         assert!(prompt.contains("Recent non-Kite commit message examples from this repository:"));
         assert!(prompt.contains("- docs: refresh usage"));
         assert!(prompt.contains("- fix(cli): tighten landing"));
+    }
+
+    #[test]
+    fn sanitize_commit_message_never_lets_a_save_subject_through() {
+        // A landed commit that looks like a save makes the branch unlandable
+        // forever: kt keeps reporting saves, kt land re-lands, kt pr refuses.
+        assert_eq!(
+            sanitize_commit_message("[kite] save 09:00:00"),
+            "chore: update"
+        );
+        assert_eq!(
+            sanitize_commit_message("  [kite] save 09:00:00  "),
+            "chore: update"
+        );
+        assert_eq!(sanitize_commit_message("   "), "chore: update");
+
+        // Mentioning the prefix mid-subject is fine; only the subject counts.
+        assert_eq!(
+            sanitize_commit_message("fix: ignore [kite] save prefixes"),
+            "fix: ignore [kite] save prefixes"
+        );
+        assert_eq!(
+            sanitize_commit_message("feat: add thing\n\nWith a body."),
+            "feat: add thing\n\nWith a body."
+        );
+    }
+
+    #[test]
+    fn normalize_groups_rewrites_save_shaped_messages() {
+        let units = parse_diff(SAMPLE_DIFF);
+
+        let normalized = normalize_groups(
+            vec![CommitGroup {
+                message: "[kite] save 12:00:00".to_string(),
+                hunks: vec!["h1".to_string(), "h2".to_string(), "h3".to_string()],
+            }],
+            &units,
+        );
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].message, "chore: update");
     }
 
     #[test]

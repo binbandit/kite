@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 /// Floor for each unit's share of the prompt body budget.
-const MIN_UNIT_BODY_BYTES: usize = 400;
+pub(crate) const MIN_UNIT_BODY_BYTES: usize = 400;
 
 /// How much of a file a commit takes, for plan rendering.
 #[derive(Clone, Debug)]
@@ -82,6 +82,14 @@ fn unit_id(index: usize) -> String {
     format!("h{}", index + 1)
 }
 
+/// Length of the `[h1] path (label)\n` line `render_bodies_capped` emits, so
+/// the body size can be measured without building it.
+fn unit_header_len(index: usize, path: &str, label: Option<&str>) -> usize {
+    let bracketed = unit_id(index).len() + 2; // "[h1]"
+    let label_len = label.map_or(0, |label| label.len() + 1); // " (whole file)"
+    bracketed + 1 + path.len() + label_len + 1 // + space + newline
+}
+
 /// Appends `body`, cut at a line boundary once it exceeds `cap` bytes.
 fn push_capped(out: &mut String, body: &str, cap: usize) {
     if body.len() <= cap {
@@ -89,13 +97,12 @@ fn push_capped(out: &mut String, body: &str, cap: usize) {
         return;
     }
     let mut used = 0;
-    for line in body.lines() {
-        if used + line.len() + 1 > cap {
+    for line in body.split_inclusive('\n') {
+        if used + line.len() > cap {
             break;
         }
         out.push_str(line);
-        out.push('\n');
-        used += line.len() + 1;
+        used += line.len();
     }
     out.push_str("(trimmed)\n");
 }
@@ -103,9 +110,14 @@ fn push_capped(out: &mut String, body: &str, cap: usize) {
 pub(crate) fn parse_diff(diff: &str) -> DiffUnits {
     let mut raw_files: Vec<(String, Vec<String>)> = Vec::new();
 
-    for line in diff.lines() {
+    // `split_inclusive` keeps each line's terminator, so the patch text stays
+    // byte-for-byte what git produced. `lines()` would strip the carriage
+    // return from every CRLF line, and the reassembled patch would then fail
+    // to apply against the real blobs — silently disabling hunk-level landing
+    // for any repository containing CRLF files.
+    for line in diff.split_inclusive('\n') {
         if line.starts_with("diff --git ") {
-            raw_files.push((format!("{line}\n"), Vec::new()));
+            raw_files.push((line.to_string(), Vec::new()));
             continue;
         }
         let Some((header, hunks)) = raw_files.last_mut() else {
@@ -114,13 +126,11 @@ pub(crate) fn parse_diff(diff: &str) -> DiffUnits {
         // Hunk body lines only start with ' ', '+', '-', or '\', so these
         // two prefixes are unambiguous section markers.
         if line.starts_with("@@ -") {
-            hunks.push(format!("{line}\n"));
+            hunks.push(line.to_string());
         } else if let Some(hunk) = hunks.last_mut() {
             hunk.push_str(line);
-            hunk.push('\n');
         } else {
             header.push_str(line);
-            header.push('\n');
         }
     }
 
@@ -228,17 +238,73 @@ impl DiffUnits {
         index
     }
 
+    /// Number of assignable units across every file.
+    pub(crate) fn unit_count(&self) -> usize {
+        self.files.iter().map(FileSection::unit_count).sum()
+    }
+
+    /// Collapses every file to a single whole-file unit, keeping the patch
+    /// text byte-identical. Used when a diff carries more hunks than can be
+    /// shown with enough content to group them: the model grouping whole
+    /// files it can actually read beats it guessing at thousands of hunks
+    /// whose bodies never fit in the prompt.
+    pub(crate) fn coarsened_to_files(&self) -> DiffUnits {
+        let files = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| FileSection {
+                atomic: true,
+                first_unit: index,
+                ..file.clone()
+            })
+            .collect();
+
+        DiffUnits { files }
+    }
+
     /// Hunk bodies for the prompt, binary payloads elided. When the full
     /// render exceeds `budget`, every unit gets a fair share of it instead of
     /// the tail units losing their bodies entirely — a hunk the model never
     /// saw is a hunk it forgets to assign.
     pub(crate) fn render_unit_bodies(&self, budget: usize) -> String {
-        let full = self.render_bodies_capped(usize::MAX);
-        if full.len() <= budget {
-            return full;
+        // Measured rather than rendered-then-discarded: building the whole
+        // body just to learn it is too big copies every byte of a diff that
+        // can run to tens of megabytes.
+        if self.full_bodies_len() <= budget {
+            return self.render_bodies_capped(usize::MAX);
         }
-        let per_unit = (budget / self.unit_ids().len().max(1)).max(MIN_UNIT_BODY_BYTES);
+        let per_unit = (budget / self.unit_count().max(1)).max(MIN_UNIT_BODY_BYTES);
         self.render_bodies_capped(per_unit)
+    }
+
+    /// Byte length `render_bodies_capped(usize::MAX)` would produce.
+    fn full_bodies_len(&self) -> usize {
+        self.files
+            .iter()
+            .map(|file| {
+                let trailing_blank_line = 1;
+                if file.atomic {
+                    let body = if file.is_binary() {
+                        0
+                    } else {
+                        file.hunks.iter().map(String::len).sum::<usize>()
+                    };
+                    unit_header_len(file.first_unit, &file.path, Some(file.label()))
+                        + body
+                        + trailing_blank_line
+                } else {
+                    file.hunks
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, hunk)| {
+                            unit_header_len(file.first_unit + offset, &file.path, None) + hunk.len()
+                        })
+                        .sum::<usize>()
+                        + trailing_blank_line
+                }
+            })
+            .sum()
     }
 
     fn render_bodies_capped(&self, cap: usize) -> String {
@@ -524,6 +590,67 @@ index 1111111..2222222
         assert!(trimmed.contains("(trimmed)"));
         assert!(trimmed.contains("[h2] small.txt"));
         assert!(trimmed.contains("+two"));
+    }
+
+    #[test]
+    fn crlf_diffs_round_trip_byte_for_byte() {
+        // `lines()` strips the carriage return from every CRLF line, and the
+        // reassembled patch then fails `git apply` — which silently demoted
+        // every land in a CRLF repository to whole-file grouping.
+        let diff = "diff --git a/win.txt b/win.txt\r\nindex 1111111..2222222 100644\r\n--- a/win.txt\r\n+++ b/win.txt\r\n@@ -1,2 +1,2 @@\r\n-one\r\n+ONE\r\n two\r\n@@ -9,2 +9,2 @@\r\n-nine\r\n+NINE\r\n ten\r\n";
+        let units = parse_diff(diff);
+
+        assert_eq!(units.unit_ids(), vec!["h1", "h2"]);
+        assert_eq!(units.assemble_patch(&ids(&["h1", "h2"])), diff);
+
+        let first = units.assemble_patch(&ids(&["h1"]));
+        assert!(first.contains("+ONE\r\n"), "carriage returns must survive");
+        assert!(!first.contains("+NINE"));
+    }
+
+    #[test]
+    fn no_newline_marker_round_trips() {
+        let diff = "diff --git a/a.txt b/a.txt\nindex 1..2 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n";
+        let units = parse_diff(diff);
+
+        assert_eq!(units.assemble_patch(&ids(&["h1"])), diff);
+    }
+
+    #[test]
+    fn full_bodies_len_matches_what_the_renderer_produces() {
+        // `render_unit_bodies` trusts this measurement instead of rendering
+        // the whole diff to find out how big it is.
+        for diff in [
+            SAMPLE,
+            "diff --git a/logo.png b/logo.png\nindex 1..2 100644\nGIT binary patch\nliteral 5\nMcmd0\n",
+        ] {
+            let units = parse_diff(diff);
+            assert_eq!(
+                units.full_bodies_len(),
+                units.render_bodies_capped(usize::MAX).len(),
+                "measured length drifted from the rendered length"
+            );
+        }
+    }
+
+    #[test]
+    fn coarsening_collapses_files_to_one_unit_without_changing_the_patch() {
+        let units = parse_diff(SAMPLE);
+        assert_eq!(units.unit_count(), 3);
+
+        let coarse = units.coarsened_to_files();
+        assert_eq!(coarse.unit_ids(), vec!["h1", "h2"]);
+        assert_eq!(coarse.all_files(), vec!["src/a.rs", "docs/b.md"]);
+
+        // Whole-file units still reproduce the original diff exactly, so
+        // verification and staging stay bit-for-bit correct.
+        assert_eq!(coarse.assemble_patch(&ids(&["h1", "h2"])), SAMPLE);
+
+        // src/a.rs is now one unit carrying both of its hunks.
+        let stats = coarse.file_stats(&ids(&["h1"]));
+        assert_eq!(stats[0].path, "src/a.rs");
+        assert_eq!((stats[0].selected, stats[0].total), (1, 1));
+        assert!(coarse.assemble_patch(&ids(&["h1"])).contains("+ELEVEN"));
     }
 
     #[test]

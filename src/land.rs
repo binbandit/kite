@@ -10,7 +10,9 @@ use crate::git::{
     has_unmerged_paths, is_ancestor, is_save_subject, kite_save_stack, subjects_missing_from_head,
 };
 use crate::hunks::{DiffUnits, FileStat, parse_diff};
-use crate::synth::{CommitGroup, normalize_groups, synthesize_groups};
+use crate::synth::{
+    CommitGroup, MAX_PLANNABLE_UNITS, normalize_groups, sanitize_commit_message, synthesize_groups,
+};
 use crate::ui::{Spinner, confirm, pluralize, print_ai_unavailable, prompt_line};
 
 /// Where the pre-land `HEAD` is parked so `kt undo` can restore it, plus the
@@ -84,7 +86,10 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
                     println!("{} Aborted — no history changed", "·".red());
                     return Ok(());
                 };
-                vec![whole_files_commit(message, scope.units.all_files())]
+                vec![whole_files_commit(
+                    sanitize_commit_message(&message),
+                    scope.units.all_files(),
+                )]
             }
         };
 
@@ -368,7 +373,23 @@ fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
     };
 
     let diff = diff_for_base(&stack.base)?;
-    let units = parse_diff(&diff);
+    let mut units = parse_diff(&diff);
+
+    // Past the plannable limit the prompt cannot carry enough of each hunk for
+    // the model to tell them apart, so it would be assigning ids it never saw
+    // the contents of. Group whole files instead, and say so.
+    if units.unit_count() > MAX_PLANNABLE_UNITS {
+        println!(
+            "{} {}",
+            "·".yellow(),
+            format!(
+                "{} in these saves — grouping by file instead of by hunk",
+                pluralize(units.unit_count(), "hunk")
+            )
+            .dimmed()
+        );
+        units = units.coarsened_to_files();
+    }
 
     if units.is_empty() {
         println!(
@@ -533,7 +554,21 @@ fn render_land_plan(commits: &[LandCommit], save_count: usize) -> String {
     );
 
     for (index, commit) in commits.iter().enumerate() {
-        plan.push_str(&format!("  {}. {}\n", index + 1, commit.message.bold()));
+        // Only the subject goes on the numbered line: a multi-line message
+        // would otherwise print flush-left through the file tree and wreck the
+        // one screen the user has to read before history is rewritten.
+        let mut lines = commit.message.lines();
+        let subject = lines.next().unwrap_or("").trim();
+        plan.push_str(&format!("  {}. {}\n", index + 1, subject.bold()));
+
+        let body_lines = lines.filter(|line| !line.trim().is_empty()).count();
+        if body_lines > 0 {
+            plan.push_str(&format!(
+                "     {}\n",
+                format!("+ {}", pluralize(body_lines, "body line")).dimmed()
+            ));
+        }
+
         for (position, file) in commit.files.iter().enumerate() {
             let last = position + 1 == commit.files.len();
             let glyph = if last { "└─" } else { "├─" };
@@ -875,6 +910,87 @@ mod tests {
 
         let landed_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
         assert_eq!(landed_tree, pre_land_tree);
+    }
+
+    #[test]
+    fn land_splits_hunks_inside_a_crlf_file() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        // Keep git from normalizing line endings, so the blobs really hold
+        // CRLF the way they do in a Windows-authored repository.
+        git(&repo.path, &["config", "core.autocrlf", "false"]);
+        write_file(&repo.path, ".gitattributes", "* -text\n");
+        git(&repo.path, &["add", ".gitattributes"]);
+        git(&repo.path, &["commit", "-m", "chore: pin line endings"]);
+
+        write_file(
+            &repo.path,
+            "code.txt",
+            "alpha\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\ni\r\nj\r\nk\r\nomega\r\n",
+        );
+        git(&repo.path, &["add", "code.txt"]);
+        git(&repo.path, &["commit", "-m", "chore: add code"]);
+
+        write_file(
+            &repo.path,
+            "code.txt",
+            "ALPHA\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\ni\r\nj\r\nk\r\nOMEGA\r\n",
+        );
+        git(&repo.path, &["add", "code.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let pre_land_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        assert_eq!(scope.units.unit_ids(), vec!["h1", "h2"]);
+
+        let groups = [
+            group("feat: upcase alpha", &["h1"]),
+            group("feat: upcase omega", &["h2"]),
+        ];
+        let commits = with_repo_cwd(&repo.path, || {
+            plan_commits(&scope.base, &scope.units, &groups)
+        });
+
+        // The whole point: CRLF content must still stage hunk by hunk rather
+        // than silently degrading to whole-file commits.
+        assert!(
+            matches!(commits[0].stage, StageOp::Patch(_)),
+            "CRLF file fell back to whole-file staging: {:?}",
+            commits[0].stage
+        );
+
+        execute_land_in_repo(&repo.path, &scope.base, &commits).expect("land should succeed");
+
+        let intermediate = git(&repo.path, &["show", "HEAD^:code.txt"]);
+        assert!(intermediate.contains("ALPHA\r\n"));
+        assert!(intermediate.contains("omega\r\n"));
+
+        assert_eq!(
+            git(&repo.path, &["rev-parse", "HEAD^{tree}"]),
+            pre_land_tree
+        );
+    }
+
+    #[test]
+    fn render_land_plan_keeps_multi_line_messages_out_of_the_file_tree() {
+        colored::control::set_override(false);
+
+        let plan = render_land_plan(
+            &[LandCommit {
+                message: "feat(api): add webhooks\n\nExplains the change\nover several lines."
+                    .to_string(),
+                files: vec![FileStat::whole("src/api.rs".to_string())],
+                stage: StageOp::Patch(String::new()),
+            }],
+            1,
+        );
+
+        assert!(plan.contains("  1. feat(api): add webhooks\n"));
+        assert!(plan.contains("+ 2 body lines"));
+        assert!(!plan.contains("\nExplains the change"));
+        assert!(plan.contains("     └─ src/api.rs\n"));
     }
 
     #[test]
