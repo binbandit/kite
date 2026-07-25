@@ -314,7 +314,7 @@ impl DiffUnits {
             let headings = if selected.len() < total {
                 selected
                     .iter()
-                    .map(|&offset| hunk_heading(&file.hunks[offset]))
+                    .filter_map(|&offset| hunk_heading(&file.hunks[offset]))
                     .collect()
             } else {
                 Vec::new()
@@ -350,13 +350,13 @@ impl DiffUnits {
     }
 }
 
-/// The function context git puts after the `@@` markers, or the raw `@@`
-/// line when there is none.
-fn hunk_heading(hunk: &str) -> String {
+/// The function context git puts after the `@@` markers. Files without one
+/// (data, lockfiles, markup) get no heading rather than a raw `@@` line.
+fn hunk_heading(hunk: &str) -> Option<String> {
     let header = hunk.lines().next().unwrap_or("");
     match header.rsplit_once("@@") {
-        Some((_, context)) if !context.trim().is_empty() => context.trim().to_string(),
-        _ => header.trim().to_string(),
+        Some((_, context)) if !context.trim().is_empty() => Some(context.trim().to_string()),
+        _ => None,
     }
 }
 
@@ -429,6 +429,14 @@ index 3333333..4444444 100644
         assert_eq!((stats[0].selected, stats[0].total), (1, 2));
         assert_eq!(stats[1].path, "docs/b.md");
         assert_eq!((stats[1].selected, stats[1].total), (1, 1));
+
+        // h1 carries no function context, so it contributes no heading rather
+        // than a raw `@@` line; h2 does.
+        assert!(stats[0].headings.is_empty());
+        assert_eq!(
+            units.file_stats(&ids(&["h2"]))[0].headings,
+            vec!["fn ten()".to_string()]
+        );
 
         assert_eq!(units.files_for(&ids(&["h2"])), vec!["src/a.rs"]);
     }
