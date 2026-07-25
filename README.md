@@ -107,7 +107,7 @@ npx skills add . --skill use-kite -a codex
 
 ### `kt go <idea>`
 
-Creates and checks out a new flow branch. If the branch already exists locally, Kite switches to it and prints a note that no new branch was created. Use it when you want to start or resume a branch for a piece of work. If you are already on the right branch, skip this command entirely.
+Creates and checks out a new flow branch. If the branch already exists — locally, or only on the remote — Kite switches to it instead of creating anything. A branch that exists only on `origin` is checked out with tracking, so resuming work from another machine, or picking up a colleague's branch, keeps their commits instead of starting a divergent branch with the same name. Use it when you want to start or resume a branch for a piece of work. If you are already on the right branch, skip this command entirely.
 
 `kt go` does not change how landing works. After it switches branches, you keep working normally with `kt`, `kt land`, and `kt publish` on that branch.
 
@@ -137,8 +137,10 @@ Synthesizes contiguous Kite quicksaves into a polished local history.
 - Requires an existing `HEAD` commit.
 - By default, requires a clean working tree. If you still have WIP changes, run `kt` first or stash them.
 - Use `--allow-dirty` to land while your worktree is dirty; `kt` temporarily stashes and restores those changes.
-- Only rewrites contiguous `[kite] save` commits at the top of history.
+- Requires a branch: on a detached `HEAD` Kite refuses before touching anything.
+- Only rewrites contiguous `[kite] save` commits at the top of history, following first-parent history so a merge cannot move the starting point.
 - Splits changes by hunk, so one file can contribute to multiple commits. Binary files, mode changes, and renames stay whole.
+- Very large sets of saves group by file instead of by hunk, and say so. Past a few hundred hunks the model cannot be shown enough of each one to tell them apart, and grouping whole files it can actually read beats guessing at hunks it never saw.
 - Verifies the hunk-level plan against a temporary index first; if the replayed commits would not reproduce your saved state bit-for-bit, Kite falls back to whole-file grouping.
 - Shows the proposed commit plan before rewriting anything.
 - Stores the pre-land `HEAD` in `refs/kite/pre_land` so `kt undo` can restore it later.
@@ -173,10 +175,13 @@ kt land --push
 
 Publishes the current branch after you review the rewritten local history.
 
-- Pushes with `--set-upstream origin <current-branch> --force-with-lease` — and nothing else.
+- Fetches the branch, then pushes with `--set-upstream origin <current-branch>`.
+- Forces only when it has to. If the remote is already an ancestor of your branch, the push is an ordinary fast-forward and nothing is forced.
 - Deliberately no `git pull --rebase` first: after a land, the remote still holds the old saves, and rebasing onto them would resurrect the history you just rewrote.
-- If someone else pushed to the branch, the lease rejects the push and Kite reports it; you decide how to reconcile.
+- When the remote holds commits your branch does not, Kite looks at what a force would discard. Kite saves are the history you just rewrote, so those go without ceremony. Anything else is someone's work: Kite lists the commits and asks before touching them.
 - If no remote exists, Kite exits without error and leaves the history local.
+
+A bare `--force-with-lease` is not enough for this, which is why Kite does not rely on it alone: the lease compares against your local remote-tracking ref, and when that ref does not exist — the normal case for a branch someone else created — git has nothing to compare and lets the push through.
 
 ```bash
 kt publish
@@ -213,7 +218,9 @@ kt pr --yes
 Attempts to restore the pre-land state.
 
 - Requires a clean working tree.
-- Hard-resets to `refs/kite/pre_land` and force-pushes if a remote exists.
+- Only undoes the branch that was landed. Landing records which branch the rollback belongs to, so running `kt undo` from somewhere else refuses and tells you where to go — it cannot reset an unrelated branch to unrelated history.
+- Asks first if the branch has moved since the land, since those newer commits would be discarded.
+- Hard-resets to `refs/kite/pre_land` and force-pushes that branch if a remote exists.
 - Deletes the rollback marker after a successful undo so you do not accidentally replay it twice.
 
 ```bash
@@ -243,6 +250,8 @@ export KITE_OPENAI_TIMEOUT_SECS="120"
 
 If the AI is unavailable, Kite shows the failure and keeps working: `kt land` asks for one manual commit message (leaving it blank aborts without changing history), and `kt pr` builds a deterministic draft from the template and the branch's commits.
 
+The failure it shows is the endpoint's own message — a rejected key, an unknown model, a schema the endpoint will not accept — so a misconfigured setup is diagnosable rather than just "the AI never works". Requests that cannot succeed on a retry are not retried.
+
 ## Why Kite Is Safe
 
 Kite keeps the risky parts explicit:
@@ -250,7 +259,8 @@ Kite keeps the risky parts explicit:
 - **Clean-worktree landing by default:** `kt land` refuses to run with staged or unstaged WIP, so scratch files do not get swept into a landed commit by surprise.
 - **Dirty worktree override:** `kt land --allow-dirty` temporarily stashes uncommitted changes, lands saved commits, then restores those changes.
 - **Preview before rewrite:** Kite shows the proposed commit plan before it rewrites history.
-- **Rollback marker:** Every successful land records the previous `HEAD` at `refs/kite/pre_land`.
+- **Rollback marker:** Every successful land records the previous `HEAD` at `refs/kite/pre_land`, along with the branch it belongs to, so `kt undo` can only ever rewind that branch.
+- **No clobbering other people:** `kt go` adopts a branch that already exists on the remote instead of forking over it, and `kt publish` refuses to silently discard remote commits that are not the saves you just landed.
 - **No dropped changes:** If the AI misses hunks, each one joins the commit already touching its file, or lands in a `chore: unclassified updates` commit — never silently omitted.
 - **Exact-tree verification:** A hunk-level plan is replayed in a temporary index before any rewrite and must reproduce the pre-land tree exactly, otherwise Kite lands whole files instead.
 - **Explicit publish:** Landing is local by default. Publishing remains a separate step unless you opt into `--push`.
