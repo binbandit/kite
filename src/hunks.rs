@@ -243,6 +243,15 @@ impl DiffUnits {
         self.files.iter().map(FileSection::unit_count).sum()
     }
 
+    /// Whether the hunks are too many *and* too large to present within
+    /// `budget`. Both halves matter: hundreds of small hunks still fit whole,
+    /// and demoting those to whole-file commits would throw away the hunk
+    /// splitting that is the point of `kt land`. Only when the content
+    /// genuinely cannot be shown does grouping by file beat grouping blind.
+    pub(crate) fn exceeds_prompt_budget(&self, budget: usize) -> bool {
+        self.unit_count() > budget / MIN_UNIT_BODY_BYTES && self.full_bodies_len() > budget
+    }
+
     /// Collapses every file to a single whole-file unit, keeping the patch
     /// text byte-identical. Used when a diff carries more hunks than can be
     /// shown with enough content to group them: the model grouping whole
@@ -631,6 +640,59 @@ index 1111111..2222222
                 "measured length drifted from the rendered length"
             );
         }
+    }
+
+    #[test]
+    fn many_small_hunks_keep_their_hunk_level_split() {
+        // Coarsening on hunk count alone would demote a branch full of small
+        // edits to whole-file commits, throwing away the splitting that is the
+        // whole point of `kt land`. Only content that cannot be shown counts.
+        let mut diff = String::new();
+        for file in 0..40 {
+            diff.push_str(&format!(
+                "diff --git a/f{file}.rs b/f{file}.rs\nindex 1111111..2222222 100644\n--- a/f{file}.rs\n+++ b/f{file}.rs\n"
+            ));
+            for hunk in 0..10 {
+                diff.push_str(&format!(
+                    "@@ -{0},1 +{0},1 @@\n-old {hunk}\n+new {hunk}\n",
+                    hunk * 10 + 1
+                ));
+            }
+        }
+        let units = parse_diff(&diff);
+
+        assert_eq!(units.unit_count(), 400);
+        assert!(
+            units.full_bodies_len() < 60_000,
+            "fixture should fit the budget"
+        );
+        assert!(
+            !units.exceeds_prompt_budget(60_000),
+            "400 small hunks fit whole and must keep hunk-level splitting"
+        );
+    }
+
+    #[test]
+    fn hunks_too_large_to_show_do_exceed_the_budget() {
+        let mut diff = String::new();
+        for file in 0..40 {
+            diff.push_str(&format!(
+                "diff --git a/f{file}.rs b/f{file}.rs\nindex 1111111..2222222 100644\n--- a/f{file}.rs\n+++ b/f{file}.rs\n"
+            ));
+            for hunk in 0..10 {
+                diff.push_str(&format!("@@ -{0},1 +{0},1 @@\n", hunk * 40 + 1));
+                for line in 0..20 {
+                    diff.push_str(&format!(
+                        "+padding line {line} carrying a good deal of text\n"
+                    ));
+                }
+            }
+        }
+        let units = parse_diff(&diff);
+
+        assert_eq!(units.unit_count(), 400);
+        assert!(units.full_bodies_len() > 60_000);
+        assert!(units.exceeds_prompt_budget(60_000));
     }
 
     #[test]

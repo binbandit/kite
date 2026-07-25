@@ -22,7 +22,7 @@ use crate::git::{
 };
 use crate::land::{land, publish_current_branch, undo, warn_if_on_recovery_branch};
 use crate::pr::{PrOptions, create_pull_request};
-use crate::ui::pluralize;
+use crate::ui::{Spinner, pluralize};
 
 const WORKFLOW_HELP: &str = "\
 Everyday flow:
@@ -178,30 +178,38 @@ fn go(name: &str) -> Result<()> {
         return Ok(());
     }
 
+    let remote_ref = format!("refs/remotes/origin/{name}");
+    let has_remote = has_remote();
+
+    // One fetch, covering both questions this command has to answer: does the
+    // branch already exist on the remote, and where is the default branch. It
+    // replaces the single-branch fetch the create path did anyway, so looking
+    // for an existing remote branch costs no extra round trip.
+    if has_remote && check_ref(&remote_ref).is_none() {
+        let spinner = Spinner::start("Checking origin");
+        let _ = execute_git(&["fetch", "origin"]);
+        spinner.stop();
+    }
+
     // A branch that exists only on the remote is someone's work in progress —
     // possibly your own from another machine. Branching off the default branch
     // instead would silently create a divergent branch with the same name, and
     // the next `kt publish` would overwrite theirs.
-    if has_remote() {
-        let remote_ref = format!("refs/remotes/origin/{name}");
-        let _ = execute_git(&["fetch", "origin", name]);
-        if check_ref(&remote_ref).is_some() {
-            execute_git(&["checkout", "--track", &format!("origin/{name}")])?;
-            println!(
-                "{} Switched to {} {}",
-                "✓".green(),
-                name.bold(),
-                "tracking origin".dimmed()
-            );
-            return Ok(());
-        }
+    if has_remote && check_ref(&remote_ref).is_some() {
+        execute_git(&["checkout", "--track", &format!("origin/{name}")])?;
+        println!(
+            "{} Switched to {} {}",
+            "✓".green(),
+            name.bold(),
+            "tracking origin".dimmed()
+        );
+        return Ok(());
     }
 
     let default_branch = get_default_branch()?;
     let remote_base = format!("origin/{default_branch}");
 
-    let base = if has_remote() {
-        let _ = execute_git(&["fetch", "origin", &default_branch]);
+    let base = if has_remote {
         match execute_git(&["checkout", "-b", name, &remote_base]) {
             Ok(_) => remote_base,
             Err(_) => {

@@ -10,16 +10,11 @@ use std::collections::HashSet;
 
 use crate::ai::{self, extract_json_block};
 use crate::git::{is_save_subject, recent_commit_style_examples};
-use crate::hunks::{DiffUnits, MIN_UNIT_BODY_BYTES};
+use crate::hunks::DiffUnits;
 
 const MAX_COMMIT_STYLE_EXAMPLES: usize = 6;
 const MAX_SYNTHESIS_ATTEMPTS: usize = 3;
 pub(crate) const MAX_DIFF_BYTES: usize = 60_000;
-
-/// Past this many units the body budget cannot give each hunk enough content
-/// for the model to tell them apart, and the prompt grows without bound. A
-/// land that big groups whole files instead — see `DiffUnits::coarsened_to_files`.
-pub(crate) const MAX_PLANNABLE_UNITS: usize = MAX_DIFF_BYTES / MIN_UNIT_BODY_BYTES;
 
 /// Used when the model returns a message Kite cannot let through.
 const FALLBACK_COMMIT_MESSAGE: &str = "chore: update";

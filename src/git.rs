@@ -347,6 +347,35 @@ pub(crate) fn current_branch_name() -> Result<String> {
     Ok(branch)
 }
 
+/// The checked-out branch read straight from `.git/HEAD`, with no subprocess.
+///
+/// `kt` runs constantly, so a spawn on its path is a cost users feel on every
+/// save. Returns `None` for a detached HEAD or any layout this cannot read —
+/// callers must treat that as "don't know", never as a branch name. Anything
+/// that rewrites or publishes history uses `current_branch_name` instead.
+pub(crate) fn head_branch_hint() -> Option<String> {
+    let root = find_repo_root().ok()??;
+
+    let dot_git = root.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        // Linked worktrees and submodules keep `.git` as a file holding
+        // `gitdir: <path>`.
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let target = PathBuf::from(pointer.strip_prefix("gitdir:")?.trim());
+        if target.is_absolute() {
+            target
+        } else {
+            root.join(target)
+        }
+    };
+
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?;
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
 /// True when the repository is mid-merge, mid-rebase, or otherwise holding
 /// unmerged index entries. Git's own message for this is a wall of hints.
 pub(crate) fn has_unmerged_paths(status: &str) -> bool {

@@ -7,11 +7,12 @@ use crate::ai::flatten_error;
 use crate::git::{
     KiteBase, apply_cached_patch, check_ref, commit_git, config_get, config_set, config_unset,
     current_branch_name, diff_for_base, execute_git, execute_git_with, has_head_commit, has_remote,
-    has_unmerged_paths, is_ancestor, is_save_subject, kite_save_stack, subjects_missing_from_head,
+    has_unmerged_paths, head_branch_hint, is_ancestor, is_save_subject, kite_save_stack,
+    subjects_missing_from_head,
 };
 use crate::hunks::{DiffUnits, FileStat, parse_diff};
 use crate::synth::{
-    CommitGroup, MAX_PLANNABLE_UNITS, normalize_groups, sanitize_commit_message, synthesize_groups,
+    CommitGroup, MAX_DIFF_BYTES, normalize_groups, sanitize_commit_message, synthesize_groups,
 };
 use crate::ui::{Spinner, confirm, pluralize, print_ai_unavailable, prompt_line};
 
@@ -48,9 +49,9 @@ enum StageOp {
 }
 
 pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> Result<()> {
-    if !land_preflight()? {
+    let Some(status) = land_preflight()? else {
         return Ok(());
-    }
+    };
 
     let stashed = if allow_dirty {
         stash_dirty_worktree_for_land()?
@@ -59,7 +60,9 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
     };
 
     let land_result = (async {
-        let Some(scope) = collect_land_scope(allow_dirty)? else {
+        // The preflight status predates the stash, so it only describes the
+        // tree the clean-worktree check cares about.
+        let Some(scope) = collect_land_scope(allow_dirty, Some(&status))? else {
             return Ok(());
         };
 
@@ -142,11 +145,12 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
 /// after a land the remote still holds the old saves, and rebasing onto them
 /// would resurrect the history we just rewrote.
 ///
-/// A bare `--force-with-lease` is not enough. The lease compares against the
-/// local remote-tracking ref, and when that ref does not exist — the usual
-/// case for a branch someone else created — git has nothing to compare and
-/// lets the push through, silently destroying their work. So we fetch, ask
-/// what would actually be dropped, and only decide from that.
+/// A bare `--force-with-lease` is not enough on its own. The lease compares
+/// against the local remote-tracking ref, and when that ref does not exist —
+/// the usual case for a branch someone else created — git has nothing to
+/// compare and lets the push through, silently destroying their work. So the
+/// lease is always given an explicit expected sha, and the one case with no
+/// sha to give is the one case worth a round trip to resolve.
 pub(crate) fn publish_current_branch() -> Result<()> {
     if !has_remote() {
         println!("{} No remote — history stays local", "·".dimmed());
@@ -156,11 +160,17 @@ pub(crate) fn publish_current_branch() -> Result<()> {
     let branch = current_branch_name()?;
     let remote_ref = format!("refs/remotes/origin/{branch}");
 
-    let spinner = Spinner::start(format!("Publishing {branch}"));
-    // Refresh the tracking ref so the decision reflects the real remote.
-    let _ = execute_git(&["fetch", "origin", &branch]);
-    let remote_sha = check_ref(&remote_ref);
-    spinner.stop();
+    // No fetch on the common path. The lease below is checked by git against
+    // the remote's real state at push time, so a tracking ref that has gone
+    // stale causes a safe rejection, never a clobber. Only when there is no
+    // tracking ref at all — nothing to lease against, which is precisely the
+    // dangerous case — is it worth a round trip to find out what is there.
+    let remote_sha = check_ref(&remote_ref).or_else(|| {
+        let spinner = Spinner::start(format!("Checking origin/{branch}"));
+        let _ = execute_git(&["fetch", "origin", &branch]);
+        spinner.stop();
+        check_ref(&remote_ref)
+    });
 
     let force = match &remote_sha {
         // Nothing on the remote yet, or the remote is already an ancestor:
@@ -182,10 +192,21 @@ pub(crate) fn publish_current_branch() -> Result<()> {
     let pushed = execute_git(&args);
     spinner.stop();
 
-    pushed.with_context(|| {
-        format!(
-            "Push rejected. `origin/{branch}` moved while Kite was publishing — rerun `kt publish` to see the new state."
-        )
+    pushed.map_err(|error| {
+        // A rejected lease has one cause and one fix, and git's four lines of
+        // remote URLs and ref arrows only bury them. Everything else — auth,
+        // a missing remote, a hook — still needs git's own words.
+        let detail = flatten_error(&format!("{error:#}"));
+        if ["stale info", "fetch first", "non-fast-forward"]
+            .iter()
+            .any(|marker| detail.contains(marker))
+        {
+            anyhow!(
+                "Push rejected — `origin/{branch}` has moved since you last fetched it. Run `git fetch origin {branch}` to see what changed, then rerun `kt publish`."
+            )
+        } else {
+            error.context(format!("Could not publish `{branch}`"))
+        }
     })?;
     println!("{} Published {}", "✓".green(), branch.bold());
     Ok(())
@@ -324,7 +345,9 @@ pub(crate) const RECOVERY_BRANCH_PREFIX: &str = "kite-recovery-";
 /// command they run behaves oddly for reasons they cannot see. Every command
 /// says so up front instead.
 pub(crate) fn warn_if_on_recovery_branch() {
-    let Ok(branch) = current_branch_name() else {
+    // Read rather than spawn: this runs before every command, including the
+    // quicksave people run dozens of times an hour.
+    let Some(branch) = head_branch_hint() else {
         return;
     };
     if !branch.starts_with(RECOVERY_BRANCH_PREFIX) {
@@ -354,28 +377,7 @@ pub(crate) fn warn_if_on_recovery_branch() {
 /// Everything that must hold before Kite touches the worktree. Run before
 /// `--allow-dirty` stashes anything, so a repository that cannot be landed
 /// never gets its work put away first and its diagnosis second.
-fn land_preflight() -> Result<bool> {
-    if !has_head_commit() {
-        println!(
-            "{} No commits yet — make an initial commit before landing",
-            "·".yellow()
-        );
-        return Ok(false);
-    }
-
-    current_branch_name()?;
-
-    let status = execute_git(&["status", "--porcelain"])?;
-    if has_unmerged_paths(&status) {
-        anyhow::bail!(
-            "This repository has unresolved merge conflicts. Resolve them and commit the merge before landing."
-        );
-    }
-
-    Ok(true)
-}
-
-fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
+fn land_preflight() -> Result<Option<String>> {
     if !has_head_commit() {
         println!(
             "{} No commits yet — make an initial commit before landing",
@@ -385,11 +387,40 @@ fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
     }
 
     // A detached HEAD has no branch to move onto the landed commits. Checked
-    // here so it costs nothing and reports before any work is done.
+    // here so it reports before any work is done — and before --allow-dirty
+    // has stashed anything.
     current_branch_name()?;
 
+    let status = execute_git(&["status", "--porcelain"])?;
+    if has_unmerged_paths(&status) {
+        anyhow::bail!(
+            "This repository has unresolved merge conflicts. Resolve them and commit the merge before landing."
+        );
+    }
+
+    Ok(Some(status))
+}
+
+/// `land_preflight` has already run when this is reached from `land`; the
+/// `status` it read is passed along so a large worktree is not walked twice.
+fn collect_land_scope(allow_dirty: bool, status: Option<&str>) -> Result<Option<LandScope>> {
+    if !has_head_commit() {
+        println!(
+            "{} No commits yet — make an initial commit before landing",
+            "·".yellow()
+        );
+        return Ok(None);
+    }
+
     if !allow_dirty {
-        let status = execute_git(&["status", "--porcelain"])?;
+        let owned;
+        let status = match status {
+            Some(status) => status,
+            None => {
+                owned = execute_git(&["status", "--porcelain"])?;
+                &owned
+            }
+        };
         if !status.trim().is_empty() {
             anyhow::bail!(
                 "Working directory must be clean before `kt land`. Run `kt` to snapshot current work, or use `kt land --allow-dirty` to stash it temporarily."
@@ -409,10 +440,10 @@ fn collect_land_scope(allow_dirty: bool) -> Result<Option<LandScope>> {
     let diff = diff_for_base(&stack.base)?;
     let mut units = parse_diff(&diff);
 
-    // Past the plannable limit the prompt cannot carry enough of each hunk for
-    // the model to tell them apart, so it would be assigning ids it never saw
-    // the contents of. Group whole files instead, and say so.
-    if units.unit_count() > MAX_PLANNABLE_UNITS {
+    // Only when the hunks are too many *and* too large to show: the model
+    // would otherwise be assigning ids whose contents it never saw. Hundreds
+    // of small hunks still fit whole and keep their hunk-level split.
+    if units.exceeds_prompt_budget(MAX_DIFF_BYTES) {
         println!(
             "{} {}",
             "·".yellow(),
@@ -740,7 +771,7 @@ mod tests {
         repo: &std::path::Path,
         allow_dirty: bool,
     ) -> Result<Option<LandScope>> {
-        with_repo_cwd(repo, || collect_land_scope(allow_dirty))
+        with_repo_cwd(repo, || collect_land_scope(allow_dirty, None))
     }
 
     fn execute_land_in_repo(
@@ -1295,7 +1326,7 @@ mod tests {
         git(&repo.path, &["add", "nested/feature.txt"]);
         git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
 
-        let scope = with_repo_cwd(&nested, || collect_land_scope(false))
+        let scope = with_repo_cwd(&nested, || collect_land_scope(false, None))
             .expect("land scope should collect")
             .expect("kite saves should be landable");
 
