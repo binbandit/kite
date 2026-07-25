@@ -674,6 +674,10 @@ fn execute_land(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
         Local::now().format("%Y%m%d%H%M%S")
     );
 
+    // Kept so a land that fails cannot overwrite the rollback marker left by
+    // the last one that succeeded.
+    let previous_marker = PreLandMarker::capture();
+
     execute_git(&["update-ref", PRE_LAND_REF, pre_land_sha.trim()])?;
     config_set(PRE_LAND_BRANCH_KEY, &original_branch)?;
     // Cleared until the land succeeds, so a stale value can never make `kt
@@ -684,9 +688,29 @@ fn execute_land(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
         create_commits(commits)?;
         finalize_landed_branch(&original_branch, &recovery_branch)
     }) {
-        anyhow::bail!(
-            "{}",
-            render_land_failure(&err, &original_branch, &recovery_branch)
+        // A failed land is almost always a hook rejecting a commit, and the
+        // fix belongs on the branch the user was already on. Nothing they
+        // wrote is at stake — their saves are still on `original_branch`,
+        // which is not moved until the final step, and landing stages through
+        // the index without ever writing the worktree — so put them back
+        // instead of stranding them on a branch full of derived commits.
+        return Err(
+            match return_to_original_branch(&original_branch, pre_land_sha.trim(), &recovery_branch)
+            {
+                Ok(()) => {
+                    previous_marker.restore();
+                    anyhow!("{}", render_recovered_failure(&err, &original_branch))
+                }
+                Err(restore_error) => anyhow!(
+                    "{}",
+                    render_stranded_failure(
+                        &err,
+                        &original_branch,
+                        &recovery_branch,
+                        &restore_error
+                    )
+                ),
+            },
         );
     }
 
@@ -697,27 +721,83 @@ fn execute_land(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
     Ok(())
 }
 
-fn render_land_failure(
+/// Undoes a failed landing attempt, leaving the user exactly where they
+/// started.
+///
+/// Safe by construction: `original_branch` is only moved by the final step, so
+/// while landing is in progress it still points at every save. A *mixed* reset
+/// is deliberate — it clears the half-staged index but leaves the worktree
+/// alone, so files a pre-commit hook rewrote (a formatter, say) survive.
+fn return_to_original_branch(
+    original_branch: &str,
+    pre_land_sha: &str,
+    recovery_branch: &str,
+) -> Result<()> {
+    execute_git(&["reset", "--mixed", pre_land_sha])?;
+    execute_git(&["checkout", original_branch])?;
+    // Only ever held commits rebuilt from scratch on the next attempt.
+    let _ = execute_git(&["branch", "-D", recovery_branch]);
+    Ok(())
+}
+
+fn render_recovered_failure(err: &anyhow::Error, original_branch: &str) -> String {
+    format!(
+        "{err:#}\n\nNothing changed — you are still on `{original_branch}` with every save intact.\nFix the problem above, then run `kt land` again."
+    )
+}
+
+/// The cleanup itself failed, which is the only case left where the user has
+/// to be told about the temporary branch at all.
+fn render_stranded_failure(
     err: &anyhow::Error,
     original_branch: &str,
     recovery_branch: &str,
+    restore_error: &anyhow::Error,
 ) -> String {
-    let mut message = format!(
-        "{err}\n\nLanding stopped before updating `{original_branch}`.\nKite kept the in-progress landing state on recovery branch `{recovery_branch}` so partial commits or staged changes are not lost."
-    );
+    format!(
+        "{err:#}\n\nKite could not put you back on `{original_branch}`: {restore_error:#}\nThe half-finished landing is on `{recovery_branch}`, and `{original_branch}` still has every save.\nRun `git reset --mixed {original_branch}` then `git switch {original_branch}` to get back; nothing on it was changed.\nRollback ref: `{PRE_LAND_REF}`."
+    )
+}
 
-    if current_branch_name()
-        .map(|branch| branch == recovery_branch)
-        .unwrap_or(false)
-    {
-        message.push_str(&format!("\nYou are currently on `{recovery_branch}`."));
+/// The rollback marker as it stood before a land began.
+struct PreLandMarker {
+    sha: Option<String>,
+    branch: Option<String>,
+    head: Option<String>,
+}
+
+impl PreLandMarker {
+    fn capture() -> Self {
+        Self {
+            sha: check_ref(PRE_LAND_REF),
+            branch: config_get(PRE_LAND_BRANCH_KEY),
+            head: config_get(PRE_LAND_HEAD_KEY),
+        }
     }
 
-    message.push_str(&format!(
-        "\nFix the issue there and rerun `kt land`, or run `git switch {original_branch}` if you want to abandon this landing attempt.\nRecovery ref: `refs/kite/pre_land`."
-    ));
+    /// Puts the marker back after a failed land, so `kt undo` still refers to
+    /// the last land that actually happened rather than one that did not.
+    fn restore(&self) {
+        match &self.sha {
+            Some(sha) => {
+                let _ = execute_git(&["update-ref", PRE_LAND_REF, sha]);
+            }
+            None => {
+                let _ = execute_git(&["update-ref", "-d", PRE_LAND_REF]);
+            }
+        }
+        restore_config(PRE_LAND_BRANCH_KEY, self.branch.as_deref());
+        restore_config(PRE_LAND_HEAD_KEY, self.head.as_deref());
+    }
+}
 
-    message
+fn restore_config(key: &str, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            let _ = config_set(key, value);
+        }
+        None => config_unset(key),
+    }
 }
 
 fn prepare_landing_branch(base: &KiteBase, temp_branch: &str) -> Result<()> {
@@ -1369,12 +1449,102 @@ mod tests {
 
         let rendered = format!("{err:#}");
         assert!(rendered.contains(&format!(
-            "Landing stopped before updating `{original_branch}`"
+            "you are still on `{original_branch}` with every save intact"
         )));
-        assert!(rendered.contains("recovery branch `kite-recovery-"));
-        assert!(rendered.contains("Fix the issue there and rerun `kt land`"));
+        assert!(rendered.contains("run `kt land` again"));
+        // The temporary branch is an implementation detail of a successful
+        // land; a failure should never make the user deal with it.
+        assert!(!rendered.contains("kite-recovery-"));
 
         let current_branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
-        assert!(current_branch.trim().starts_with("kite-recovery-"));
+        assert_eq!(current_branch.trim(), original_branch);
+
+        let leftovers = git(&repo.path, &["branch", "--list", "kite-recovery-*"]);
+        assert!(
+            leftovers.trim().is_empty(),
+            "a failed land left a branch behind: {leftovers}"
+        );
+
+        let status = git(&repo.path, &["status", "--porcelain"]);
+        assert!(
+            status.trim().is_empty(),
+            "a failed land left staged changes to clean up: {status}"
+        );
+    }
+
+    #[test]
+    fn failed_land_leaves_the_saves_and_the_previous_rollback_marker_alone() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        // A first land that succeeds, so there is a real rollback marker.
+        write_file(&repo.path, "tracked.txt", "first save\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+        let first_pre_land = git(&repo.path, &["rev-parse", "HEAD"]);
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("scope")
+            .expect("saves");
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: first", &["tracked.txt"])],
+        )
+        .expect("first land should succeed");
+
+        // A second land that fails.
+        write_file(&repo.path, "tracked.txt", "second save\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 13:00:00"]);
+        let saves_head = git(&repo.path, &["rev-parse", "HEAD"]);
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("scope")
+            .expect("saves");
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: second", &["missing.txt"])],
+        )
+        .expect_err("second land should fail");
+
+        // The saves are exactly where they were.
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saves_head);
+
+        // And `kt undo` still points at the land that actually happened.
+        let marker = git(&repo.path, &["rev-parse", PRE_LAND_REF]);
+        assert_eq!(
+            marker.trim(),
+            first_pre_land.trim(),
+            "a failed land clobbered the previous land's rollback marker"
+        );
+    }
+
+    #[test]
+    fn failed_land_keeps_files_a_hook_rewrote() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("scope")
+            .expect("saves");
+
+        // Stand in for a formatter hook that rewrites the worktree before the
+        // commit is rejected: cleanup must not throw its work away.
+        write_file(&repo.path, "tracked.txt", "reformatted by a hook\n");
+
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: land", &["missing.txt"])],
+        )
+        .expect_err("land should fail");
+
+        let content = std::fs::read_to_string(repo.path.join("tracked.txt"))
+            .expect("worktree file should exist");
+        assert_eq!(content, "reformatted by a hook\n");
     }
 }

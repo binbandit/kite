@@ -266,15 +266,14 @@ fn render_commit_failure(message: &str, details: &str) -> String {
         "Git rejected the commit"
     };
 
+    // Deliberately says nothing about what was left behind: the caller undoes
+    // the whole attempt and is the only one that knows the resulting state.
     if details.is_empty() {
-        return format!(
-            "{} for `{}`. Staged changes were left in place.",
-            summary, message
-        );
+        return format!("{} for `{}`.", summary, message);
     }
 
     format!(
-        "{} for `{}`. Staged changes were left in place.\n\n{}",
+        "{} for `{}`.\n\n{}",
         summary,
         message,
         indent_block(details)
@@ -636,8 +635,9 @@ mod tests {
         );
 
         assert!(rendered.contains("Git hook blocked the commit"));
-        assert!(rendered.contains("Staged changes were left in place."));
         assert!(rendered.contains("  pre-commit: cargo fmt --check failed"));
+        // The caller undoes the attempt, so this must not claim otherwise.
+        assert!(!rendered.contains("left in place"));
     }
 
     #[test]
