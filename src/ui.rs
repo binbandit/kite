@@ -1,8 +1,7 @@
 use anyhow::Result;
 use colored::*;
 use std::io::{self, IsTerminal, Write};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -12,11 +11,14 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 const SPINNER_TICK: Duration = Duration::from_millis(80);
 
 /// Transient activity indicator for slow steps (AI calls, pushes). It animates
-/// `message` on the current line and erases itself on `stop`, so the lines
-/// printed afterwards are the only record of what happened. When stdout is not
-/// a terminal it prints nothing at all.
+/// `message` on the current line and erases itself when it goes away, so the
+/// lines printed afterwards are the only record of what happened. When stdout
+/// is not a terminal it prints nothing at all.
+///
+/// Cleanup lives in `Drop`, not only in `stop`, so an early return through `?`
+/// cannot leave a thread scribbling over the error message that follows it.
 pub(crate) struct Spinner {
-    animation: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    animation: Option<(Sender<()>, JoinHandle<()>)>,
 }
 
 impl Spinner {
@@ -26,20 +28,19 @@ impl Spinner {
         }
 
         let message = message.into();
-        let stop = Arc::new(AtomicBool::new(false));
-        let animation = {
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                for frame in SPINNER_FRAMES.iter().cycle() {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    print!("\r{} {}... ", frame.cyan(), message);
-                    let _ = io::stdout().flush();
-                    std::thread::sleep(SPINNER_TICK);
+        // A channel rather than a polled flag: dropping the sender wakes the
+        // thread at once instead of up to one tick later.
+        let (stop, stopped) = mpsc::channel();
+        let animation = std::thread::spawn(move || {
+            for frame in SPINNER_FRAMES.iter().cycle() {
+                print!("\r{} {}... ", frame.cyan(), message);
+                let _ = io::stdout().flush();
+                match stopped.recv_timeout(SPINNER_TICK) {
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    _ => break,
                 }
-            })
-        };
+            }
+        });
 
         Self {
             animation: Some((stop, animation)),
@@ -47,12 +48,20 @@ impl Spinner {
     }
 
     pub(crate) fn stop(self) {
-        if let Some((stop, animation)) = self.animation {
-            stop.store(true, Ordering::Relaxed);
-            let _ = animation.join();
-            print!("\r\x1b[2K");
-            let _ = io::stdout().flush();
-        }
+        drop(self);
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        let Some((stop, animation)) = self.animation.take() else {
+            return;
+        };
+
+        drop(stop);
+        let _ = animation.join();
+        print!("\r\x1b[2K");
+        let _ = io::stdout().flush();
     }
 }
 

@@ -97,7 +97,16 @@ pub(crate) async fn synthesize_groups(units: &DiffUnits) -> Result<Vec<CommitGro
                     last_error = error;
                 }
             },
-            Err(error) => last_error = error,
+            Err(error) => {
+                // A rejected key, an unknown model or a schema the endpoint
+                // will not accept fails identically every time; repeating it
+                // only makes the user wait three times as long to find out.
+                let worth_retrying = ai::is_retryable(&error);
+                last_error = error;
+                if !worth_retrying {
+                    break;
+                }
+            }
         }
     }
 
@@ -171,6 +180,11 @@ pub(crate) fn sanitize_commit_message(message: &str) -> String {
     trimmed.to_string()
 }
 
+/// Deliberately free of `minItems`/`minLength`. Strict structured-output
+/// implementations — and OpenAI-compatible proxies especially — reject
+/// keywords outside the supported subset with a 400, which would take the AI
+/// path down entirely. Emptiness is checked in `parse_groups` and coverage in
+/// `validate_group_coverage`, where a bad reply can be retried instead.
 fn groups_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -179,17 +193,15 @@ fn groups_schema() -> serde_json::Value {
         "properties": {
             "groups": {
                 "type": "array",
-                "minItems": 1,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "required": ["message", "hunks"],
                     "properties": {
-                        "message": { "type": "string", "minLength": 1 },
+                        "message": { "type": "string" },
                         "hunks": {
                             "type": "array",
-                            "minItems": 1,
-                            "items": { "type": "string", "minLength": 1 }
+                            "items": { "type": "string" }
                         }
                     }
                 }

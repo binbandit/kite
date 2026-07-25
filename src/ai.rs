@@ -13,6 +13,10 @@ const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 120;
 
+/// Enough of an error payload to identify the problem, without pasting an
+/// HTML error page into the terminal.
+const MAX_ERROR_BODY_CHARS: usize = 400;
+
 /// One structured request: a system prompt, a user prompt, and the JSON schema
 /// the reply must satisfy (enforced natively by the Responses API).
 pub(crate) struct Request<'a> {
@@ -20,6 +24,31 @@ pub(crate) struct Request<'a> {
     pub(crate) user: &'a str,
     pub(crate) schema_name: &'a str,
     pub(crate) schema: serde_json::Value,
+}
+
+/// An AI call that failed, and whether trying the same request again could
+/// plausibly succeed. Retrying a rejected key, an unknown model, or a schema
+/// the endpoint will not accept just spends the user's time three times over.
+#[derive(Debug)]
+pub(crate) struct AiError {
+    message: String,
+    retryable: bool,
+}
+
+impl std::fmt::Display for AiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AiError {}
+
+/// Parse and coverage problems carry no `AiError` and are always worth
+/// another attempt — that retry loop is what makes synthesis reliable.
+pub(crate) fn is_retryable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<AiError>()
+        .is_none_or(|failure| failure.retryable)
 }
 
 pub(crate) async fn complete<T>(
@@ -79,15 +108,84 @@ async fn ask_openai(request: &Request<'_>) -> Result<String> {
         http_request = http_request.header("x-portkey-api-key", portkey_api_key);
     }
 
-    let response = http_request
-        .send()
-        .await
-        .context("Failed to send request to OpenAI Responses API")?
-        .error_for_status()
-        .context("OpenAI Responses API returned non-success status")?;
+    let response = http_request.send().await.map_err(|error| AiError {
+        message: format!("Could not reach {responses_url}: {error}"),
+        // Timeouts, connection resets and DNS blips are all worth another go.
+        retryable: true,
+    })?;
 
-    let json: serde_json::Value = response.json().await?;
+    let status = response.status();
+    if !status.is_success() {
+        // The body is where the endpoint says what was actually wrong —
+        // an unknown model, a rejected schema, an expired key. Dropping it,
+        // as `error_for_status` does, leaves the user with a bare status code
+        // and an AI that appears to never work for no stated reason.
+        let body = response.text().await.unwrap_or_default();
+        return Err(AiError {
+            message: describe_api_failure(status, &body),
+            retryable: is_retryable_status(status),
+        }
+        .into());
+    }
+
+    let body = response.text().await.map_err(|error| AiError {
+        message: format!("Could not read the reply from {responses_url}: {error}"),
+        retryable: true,
+    })?;
+
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|error| AiError {
+        message: format!(
+            "{responses_url} returned a non-JSON reply ({error}): {}",
+            elide(&body, MAX_ERROR_BODY_CHARS)
+        ),
+        retryable: true,
+    })?;
+
     Ok(extract_openai_output_text(&json))
+}
+
+/// 4xx means the request itself is wrong and will stay wrong; the throttling
+/// and server-side codes are the ones worth repeating.
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 408 | 409 | 425 | 429)
+}
+
+/// Pulls the human-readable reason out of an error payload, and adds the fix
+/// for the mistakes that are otherwise a guessing game.
+fn describe_api_failure(status: reqwest::StatusCode, body: &str) -> String {
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| {
+            ["/error/message", "/message", "/detail"]
+                .iter()
+                .find_map(|pointer| {
+                    json.pointer(pointer)
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned)
+                })
+        })
+        .unwrap_or_else(|| elide(body.trim(), MAX_ERROR_BODY_CHARS));
+
+    let hint = match status.as_u16() {
+        401 | 403 => " — check the API key in KITE_OPENAI_API_KEY or OPENAI_API_KEY",
+        404 => " — check the model in KITE_OPENAI_MODEL and the base URL",
+        429 => " — rate limited or out of quota",
+        _ => "",
+    };
+
+    if detail.is_empty() {
+        format!("AI request failed ({status}){hint}")
+    } else {
+        format!("AI request failed ({status}): {detail}{hint}")
+    }
+}
+
+fn elide(text: &str, max_chars: usize) -> String {
+    let mut elided: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        elided.push('…');
+    }
+    elided
 }
 
 fn url_uses_portkey(url: &str) -> bool {
@@ -320,6 +418,66 @@ mod tests {
 
         let invalid = parse_timeout_secs("slow").expect_err("non-number should fail");
         assert!(format!("{invalid:#}").contains("invalid digit"));
+    }
+
+    #[test]
+    fn describe_api_failure_surfaces_the_endpoints_own_message() {
+        // `error_for_status` threw this away, leaving users with a bare status
+        // code and no way to tell why the AI never worked.
+        let body = r#"{"error":{"message":"Invalid schema for response_format 'commit_groups'.","type":"invalid_request_error"}}"#;
+        let described = describe_api_failure(reqwest::StatusCode::BAD_REQUEST, body);
+
+        assert!(described.contains("400 Bad Request"));
+        assert!(described.contains("Invalid schema for response_format 'commit_groups'."));
+    }
+
+    #[test]
+    fn describe_api_failure_adds_hints_and_survives_non_json_bodies() {
+        let unauthorized = describe_api_failure(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"Incorrect API key."}}"#,
+        );
+        assert!(unauthorized.contains("check the API key"));
+
+        let not_found = describe_api_failure(reqwest::StatusCode::NOT_FOUND, "<html>nope</html>");
+        assert!(not_found.contains("<html>nope</html>"));
+        assert!(not_found.contains("check the model"));
+
+        let empty = describe_api_failure(reqwest::StatusCode::BAD_GATEWAY, "");
+        assert_eq!(empty, "AI request failed (502 Bad Gateway)");
+    }
+
+    #[test]
+    fn only_transient_statuses_are_worth_retrying() {
+        // Repeating a rejected key or an unsupported schema just makes the
+        // user wait three times as long for the same failure.
+        for code in [400, 401, 403, 404, 422] {
+            let status = reqwest::StatusCode::from_u16(code).expect("valid status");
+            assert!(!is_retryable_status(status), "{code} should not retry");
+        }
+        for code in [408, 409, 425, 429, 500, 502, 503] {
+            let status = reqwest::StatusCode::from_u16(code).expect("valid status");
+            assert!(is_retryable_status(status), "{code} should retry");
+        }
+    }
+
+    #[test]
+    fn parse_failures_stay_retryable() {
+        let parse_failure = anyhow::anyhow!("Model reply contained no commit groups");
+        assert!(is_retryable(&parse_failure));
+
+        let hard_failure: anyhow::Error = AiError {
+            message: "AI request failed (401 Unauthorized)".to_string(),
+            retryable: false,
+        }
+        .into();
+        assert!(!is_retryable(&hard_failure));
+    }
+
+    #[test]
+    fn elide_truncates_on_character_boundaries() {
+        assert_eq!(elide("héllo", 10), "héllo");
+        assert_eq!(elide("héllo", 2), "hé…");
     }
 
     #[test]

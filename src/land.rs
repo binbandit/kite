@@ -317,6 +317,40 @@ fn guard_undo_target(branch: &str) -> Result<()> {
     anyhow::bail!("Undo cancelled — nothing changed")
 }
 
+pub(crate) const RECOVERY_BRANCH_PREFIX: &str = "kite-recovery-";
+
+/// A land that was interrupted — Ctrl-C, a crash, a terminal closed — leaves
+/// the user parked on the temporary branch with no explanation, and the next
+/// command they run behaves oddly for reasons they cannot see. Every command
+/// says so up front instead.
+pub(crate) fn warn_if_on_recovery_branch() {
+    let Ok(branch) = current_branch_name() else {
+        return;
+    };
+    if !branch.starts_with(RECOVERY_BRANCH_PREFIX) {
+        return;
+    }
+
+    println!(
+        "{} You are on {}, left by an interrupted `kt land`.",
+        "!".yellow(),
+        branch.bold()
+    );
+    match config_get(PRE_LAND_BRANCH_KEY) {
+        Some(landed_branch) => println!(
+            "  {}",
+            format!(
+                "Run `git switch {landed_branch}` to abandon it, or `git reset --hard {PRE_LAND_REF}` there to get your saves back."
+            )
+            .dimmed()
+        ),
+        None => println!(
+            "  {}",
+            format!("Your pre-land state is at `{PRE_LAND_REF}`.").dimmed()
+        ),
+    }
+}
+
 /// Everything that must hold before Kite touches the worktree. Run before
 /// `--allow-dirty` stashes anything, so a repository that cannot be landed
 /// never gets its work put away first and its diagnosis second.
@@ -604,7 +638,10 @@ fn execute_land(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
     // rewrite strands the user on the recovery branch.
     let original_branch = current_branch_name()?;
     let pre_land_sha = execute_git(&["rev-parse", "HEAD"])?;
-    let recovery_branch = format!("kite-recovery-{}", Local::now().format("%Y%m%d%H%M%S"));
+    let recovery_branch = format!(
+        "{RECOVERY_BRANCH_PREFIX}{}",
+        Local::now().format("%Y%m%d%H%M%S")
+    );
 
     execute_git(&["update-ref", PRE_LAND_REF, pre_land_sha.trim()])?;
     config_set(PRE_LAND_BRANCH_KEY, &original_branch)?;

@@ -506,14 +506,17 @@ async fn draft_with_ai(
     ai::complete(&request, parse_draft).await
 }
 
+/// No `minLength`, for the same reason as `groups_schema`: keywords outside
+/// the strict structured-output subset get the whole request rejected, and
+/// `parse_draft` already refuses an empty title or body.
 fn draft_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["title", "body"],
         "properties": {
-            "title": { "type": "string", "minLength": 1 },
-            "body": { "type": "string", "minLength": 1 }
+            "title": { "type": "string" },
+            "body": { "type": "string" }
         }
     })
 }
