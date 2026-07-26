@@ -20,7 +20,7 @@ use crate::git::{
     has_staged_changes, has_unmerged_paths, is_inside_git_repository, is_staged_status_line,
     kite_save_stack,
 };
-use crate::land::{land, publish_current_branch, undo, warn_if_on_recovery_branch};
+use crate::land::{heal_interrupted_land, land, publish_current_branch, undo};
 use crate::pr::{PrOptions, create_pull_request};
 use crate::ui::{Spinner, pluralize};
 
@@ -92,7 +92,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<()> {
     let inside_repo = is_inside_git_repository()?;
     if inside_repo {
-        warn_if_on_recovery_branch();
+        heal_interrupted_land();
     }
 
     match cli.command {

@@ -145,7 +145,9 @@ Synthesizes contiguous Kite quicksaves into a polished local history.
 - Shows the proposed commit plan before rewriting anything.
 - Stores the pre-land `HEAD` in `refs/kite/pre_land` so `kt undo` can restore it later.
 - Creates normal `git commit`s, so hooks do run during landing.
-- If landing fails — a pre-commit hook rejecting a commit is the usual reason — Kite undoes the attempt and leaves you on your branch, with your saves intact and nothing staged. Fix the problem and run `kt land` again. Landing builds the new commits without moving your branch or touching your working tree, so a failed attempt has nothing to salvage; files a hook rewrote are kept.
+- Landing never creates a branch. It builds the new commits on a detached `HEAD` and only moves your branch once they all exist.
+- If landing fails for any reason — a rejected pre-commit hook is the usual one — Kite undoes the attempt and leaves you exactly where you started: on your branch, saves intact, nothing staged, no branch to clean up. Fix the problem and run `kt land` again. Files a hook rewrote are kept as unstaged changes.
+- If landing is interrupted rather than failing — Ctrl-C, a crash, a closed terminal — the next `kt` command notices and puts you back the same way.
 - Lands locally by default. Use `kt publish` afterward, or pass `--push` to publish immediately after landing.
 
 ```bash
@@ -261,7 +263,7 @@ Kite keeps the risky parts explicit:
 - **Preview before rewrite:** Kite shows the proposed commit plan before it rewrites history.
 - **Rollback marker:** Every successful land records the previous `HEAD` at `refs/kite/pre_land`, along with the branch it belongs to, so `kt undo` can only ever rewind that branch.
 - **No clobbering other people:** `kt go` adopts a branch that already exists on the remote instead of forking over it, and `kt publish` refuses to silently discard remote commits that are not the saves you just landed.
-- **Failure leaves no mess:** a land that fails puts you back on your branch with nothing staged, because it never moved your branch or wrote to your working tree in the first place.
+- **Failure leaves no mess:** landing creates no branch and never writes to your working tree, so a land that fails or is interrupted puts you back on your branch with nothing staged and nothing to clean up.
 - **No dropped changes:** If the AI misses hunks, each one joins the commit already touching its file, or lands in a `chore: unclassified updates` commit — never silently omitted.
 - **Exact-tree verification:** A hunk-level plan is replayed in a temporary index before any rewrite and must reproduce the pre-land tree exactly, otherwise Kite lands whole files instead.
 - **Explicit publish:** Landing is local by default. Publishing remains a separate step unless you opt into `--push`.
