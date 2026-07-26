@@ -33,6 +33,15 @@ pub(crate) struct Request<'a> {
 pub(crate) struct AiError {
     message: String,
     retryable: bool,
+    /// The provider refused the native strict-schema `format` field, so the
+    /// same request stands a chance if retried as a plain JSON-object reply.
+    native_schema_rejected: bool,
+}
+
+impl AiError {
+    fn rejects_native_schema(&self) -> bool {
+        self.native_schema_rejected
+    }
 }
 
 impl std::fmt::Display for AiError {
@@ -81,8 +90,28 @@ fn http_client() -> &'static reqwest::Client {
 async fn ask_openai(request: &Request<'_>) -> Result<String> {
     let (base_url, model, api_key) = openai_env_config()?;
     let timeout = env_duration_secs("KITE_OPENAI_TIMEOUT_SECS", DEFAULT_OPENAI_TIMEOUT_SECS)?;
+    let responses_url = format!("{}/responses", base_url.trim_end_matches('/'));
 
-    let body = serde_json::json!({
+    // Prefer the native strict-schema format: OpenAI enforces it server-side.
+    match send_responses(&responses_url, &api_key, timeout, strict_schema_body(&model, request))
+        .await
+    {
+        Err(failure) if failure.rejects_native_schema() => {
+            // Some gateway providers (notably Bedrock-hosted Anthropic) reject
+            // the `format` field outright. Fall back to a schema-less JSON reply
+            // and describe the shape in the prompt instead; `extract_json_block`
+            // tolerates the fenced or prose-wrapped output that results.
+            send_responses(&responses_url, &api_key, timeout, json_object_body(&model, request))
+                .await
+                .map_err(Into::into)
+        }
+        other => other.map_err(Into::into),
+    }
+}
+
+/// The strict, server-enforced schema request — correct wherever it is honored.
+fn strict_schema_body(model: &str, request: &Request<'_>) -> serde_json::Value {
+    serde_json::json!({
         "model": model,
         "instructions": request.system,
         "input": request.user,
@@ -94,15 +123,36 @@ async fn ask_openai(request: &Request<'_>) -> Result<String> {
                 "schema": request.schema
             }
         }
-    });
+    })
+}
 
-    let responses_url = format!("{}/responses", base_url.trim_end_matches('/'));
+/// The portable request: ask for any JSON object and carry the schema in the
+/// prompt, so providers that refuse a `format` field still return usable JSON.
+fn json_object_body(model: &str, request: &Request<'_>) -> serde_json::Value {
+    let instructions = format!(
+        "{}\n\nRespond with a single JSON object and nothing else. It must satisfy this JSON Schema:\n{}",
+        request.system, request.schema
+    );
+    serde_json::json!({
+        "model": model,
+        "instructions": instructions,
+        "input": request.user,
+        "text": { "format": { "type": "json_object" } }
+    })
+}
+
+async fn send_responses(
+    responses_url: &str,
+    api_key: &str,
+    timeout: Duration,
+    body: serde_json::Value,
+) -> std::result::Result<String, AiError> {
     let mut http_request = http_client()
-        .post(&responses_url)
+        .post(responses_url)
         .timeout(timeout)
         .bearer_auth(api_key)
         .json(&body);
-    if url_uses_portkey(&responses_url)
+    if url_uses_portkey(responses_url)
         && let Some(portkey_api_key) = first_non_empty_env(&["PORTKEY_API_KEY"])
     {
         http_request = http_request.header("x-portkey-api-key", portkey_api_key);
@@ -112,6 +162,7 @@ async fn ask_openai(request: &Request<'_>) -> Result<String> {
         message: format!("Could not reach {responses_url}: {error}"),
         // Timeouts, connection resets and DNS blips are all worth another go.
         retryable: true,
+        native_schema_rejected: false,
     })?;
 
     let status = response.status();
@@ -124,13 +175,15 @@ async fn ask_openai(request: &Request<'_>) -> Result<String> {
         return Err(AiError {
             message: describe_api_failure(status, &body),
             retryable: is_retryable_status(status),
-        }
-        .into());
+            native_schema_rejected: status == reqwest::StatusCode::BAD_REQUEST
+                && mentions_format_rejection(&body),
+        });
     }
 
     let body = response.text().await.map_err(|error| AiError {
         message: format!("Could not read the reply from {responses_url}: {error}"),
         retryable: true,
+        native_schema_rejected: false,
     })?;
 
     let json: serde_json::Value = serde_json::from_str(&body).map_err(|error| AiError {
@@ -139,9 +192,17 @@ async fn ask_openai(request: &Request<'_>) -> Result<String> {
             elide(&body, MAX_ERROR_BODY_CHARS)
         ),
         retryable: true,
+        native_schema_rejected: false,
     })?;
 
     Ok(extract_openai_output_text(&json))
+}
+
+/// A gateway rejecting the `format` field looks like a 400 complaining that the
+/// output format / extra inputs are not permitted.
+fn mentions_format_rejection(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("extra inputs are not permitted") || body.contains("output_config.format")
 }
 
 /// 4xx means the request itself is wrong and will stay wrong; the throttling
@@ -470,6 +531,7 @@ mod tests {
         let hard_failure: anyhow::Error = AiError {
             message: "AI request failed (401 Unauthorized)".to_string(),
             retryable: false,
+            native_schema_rejected: false,
         }
         .into();
         assert!(!is_retryable(&hard_failure));
@@ -485,5 +547,33 @@ mod tests {
     fn url_uses_portkey_detects_portkey_hosts_case_insensitively() {
         assert!(url_uses_portkey("https://example.PortKey.ai/v1/responses"));
         assert!(!url_uses_portkey("https://api.openai.com/v1/responses"));
+    }
+
+    #[test]
+    fn mentions_format_rejection_spots_the_bedrock_anthropic_refusal() {
+        // The exact 400 a Bedrock-hosted Anthropic model returns for `format`.
+        let body = r#"{"error":{"message":"bedrock error: The model returned the following errors: output_config.format: Extra inputs are not permitted"}}"#;
+        assert!(mentions_format_rejection(body));
+
+        // An unrelated 400 must not trigger the JSON-object fallback.
+        let unrelated = r#"{"error":{"message":"Invalid schema for response_format 'commit_groups'."}}"#;
+        assert!(!mentions_format_rejection(unrelated));
+    }
+
+    #[test]
+    fn json_object_body_embeds_the_schema_and_drops_strict_format() {
+        let request = Request {
+            system: "You are terse.",
+            user: "Group the files.",
+            schema_name: "commit_groups",
+            schema: json!({ "type": "object" }),
+        };
+        let body = json_object_body("@bedrock-au/au.anthropic.claude-opus-4-8", &request);
+
+        assert_eq!(body["text"]["format"]["type"], "json_object");
+        let instructions = body["instructions"].as_str().expect("instructions string");
+        assert!(instructions.contains("You are terse."));
+        assert!(instructions.contains("JSON Schema"));
+        assert!(instructions.contains("\"type\":\"object\""));
     }
 }
