@@ -125,6 +125,7 @@ The zero-friction quicksave. Run this constantly while you work.
 - If you already staged a deliberate subset, Kite quicksaves only that staged selection.
 - Otherwise Kite runs `git add -A` and snapshots tracked plus untracked changes.
 - Quicksaves use `--no-verify`, so hooks stay out of the way while you are in the flow.
+- Saved one you did not mean to? `kt undo` puts it straight back in your working tree.
 
 ```bash
 kt
@@ -217,7 +218,15 @@ kt pr --yes
 
 ### `kt undo`
 
-Attempts to restore the pre-land state.
+Reverses the most recent thing Kite did — the last quicksave if there is one on top of history, otherwise the last land. Run it repeatedly to walk back through your saves and then the land beneath them, in the order they happened.
+
+**Undoing a quicksave**
+
+- Uncommits the save and puts its changes back in your working tree, exactly as they were before you ran `kt`.
+- Never touches the working tree, so edits you made after the save survive and the tree does not need to be clean.
+- Entirely local — nothing is pushed.
+
+**Undoing a land**
 
 - Requires a clean working tree.
 - Only undoes the branch that was landed. Landing records which branch the rollback belongs to, so running `kt undo` from somewhere else refuses and tells you where to go — it cannot reset an unrelated branch to unrelated history.

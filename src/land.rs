@@ -246,9 +246,58 @@ fn confirm_discarding_remote_commits(branch: &str, remote_sha: &str) -> Result<(
     )
 }
 
+/// Reverses the most recent thing Kite did on this branch.
+///
+/// A quicksave sitting on top of history is by definition more recent than any
+/// land beneath it, so that goes first; otherwise this undoes the last land.
+/// Running it repeatedly walks back through saves and then the land, which is
+/// the order they happened in.
 pub(crate) fn undo() -> Result<()> {
+    if !has_head_commit() {
+        println!("{} Nothing to undo — no commits yet", "·".yellow());
+        return Ok(());
+    }
+
+    let head_subject = execute_git(&["log", "-1", "--pretty=%s"]).unwrap_or_default();
+    if is_save_subject(&head_subject) {
+        return undo_last_save(head_subject.trim());
+    }
+
+    undo_last_land()
+}
+
+/// Uncommits the quicksave on top of history, putting its changes back in the
+/// working tree. A *mixed* reset, so the result is the state the user was in
+/// before they ran `kt` — and it never touches the working tree, so edits made
+/// since the save survive and nothing has to be clean first.
+fn undo_last_save(subject: &str) -> Result<()> {
+    match check_ref("HEAD~1") {
+        Some(parent) => execute_git(&["reset", "--mixed", &parent]).map(|_| ())?,
+        None => {
+            // The save is the repository's very first commit: there is no
+            // parent to reset onto, so make the branch unborn again. The index
+            // and working tree are left exactly as they are.
+            let branch = current_branch_name()?;
+            execute_git(&["update-ref", "-d", &format!("refs/heads/{branch}")])?;
+        }
+    }
+
+    println!(
+        "{} Undid {} {}",
+        "✓".green(),
+        subject.bold(),
+        "— your changes are back in the working tree".dimmed()
+    );
+    Ok(())
+}
+
+fn undo_last_land() -> Result<()> {
     let Some(pre_land_sha) = check_ref(PRE_LAND_REF) else {
-        println!("{} Nothing to undo — no land recorded", "·".yellow());
+        println!(
+            "{} {}",
+            "·".yellow(),
+            "Nothing to undo — no quicksave on top and no land recorded".dimmed()
+        );
         return Ok(());
     };
 
@@ -1273,6 +1322,119 @@ mod tests {
 
         let status = git(&repo.path, &["status", "--porcelain"]);
         assert!(status.trim().is_empty());
+    }
+
+    #[test]
+    fn undo_uncommits_the_last_quicksave_and_restores_the_pre_save_state() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "my work\n");
+        write_file(&repo.path, "brand-new.txt", "new file\n");
+        let before = git(&repo.path, &["status", "--porcelain"]);
+        let head_before = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        // What `kt` does: stage everything, commit with the save prefix.
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+        assert!(
+            git(&repo.path, &["status", "--porcelain"])
+                .trim()
+                .is_empty()
+        );
+
+        undo_in_repo(&repo.path).expect("undo should uncommit the save");
+
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), head_before);
+        // Exactly the state the user was in before running `kt`, down to the
+        // new file being untracked again.
+        assert_eq!(git(&repo.path, &["status", "--porcelain"]), before);
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("tracked.txt")).unwrap(),
+            "my work\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("brand-new.txt")).unwrap(),
+            "new file\n"
+        );
+    }
+
+    #[test]
+    fn undo_of_a_quicksave_keeps_edits_made_since_and_needs_no_clean_tree() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "saved\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        // Kept working after the save — undo must not require a clean tree,
+        // and must not roll the newer edit back.
+        write_file(&repo.path, "tracked.txt", "newer than the save\n");
+
+        undo_in_repo(&repo.path).expect("undo should work with a dirty tree");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("tracked.txt")).unwrap(),
+            "newer than the save\n"
+        );
+        assert_eq!(
+            git(&repo.path, &["log", "-1", "--pretty=%s"]).trim(),
+            "chore: initial"
+        );
+    }
+
+    #[test]
+    fn undo_takes_the_quicksave_before_the_land_beneath_it() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "first\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("scope")
+            .expect("saves");
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: landed", &["tracked.txt"])],
+        )
+        .expect("land should succeed");
+        let landed_head = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        // A save on top is more recent than the land, so it goes first.
+        write_file(&repo.path, "tracked.txt", "second\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 13:00:00"]);
+
+        undo_in_repo(&repo.path).expect("undo should take the save");
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), landed_head);
+
+        // With the save gone, the next undo reverses the land itself.
+        git(&repo.path, &["checkout", "--", "tracked.txt"]);
+        undo_in_repo(&repo.path).expect("undo should now take the land");
+        assert_eq!(
+            git(&repo.path, &["log", "-1", "--pretty=%s"]).trim(),
+            "[kite] save 12:00:00"
+        );
+    }
+
+    #[test]
+    fn undo_of_a_root_quicksave_leaves_the_branch_unborn_with_the_work_intact() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_root_kite_repo();
+
+        undo_in_repo(&repo.path).expect("undo should handle a root save");
+
+        assert!(
+            check_ref_in(&repo.path, "HEAD").is_none(),
+            "the branch should be unborn again"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("tracked.txt")).unwrap(),
+            "base\n"
+        );
     }
 
     #[test]

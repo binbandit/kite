@@ -75,7 +75,7 @@ enum Commands {
         #[arg(short = 'y', long)]
         yes: bool,
     },
-    /// Instantly revert the last land operation
+    /// Undo the last quicksave, or the last land when there is no quicksave
     Undo,
 }
 
