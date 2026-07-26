@@ -209,6 +209,7 @@ fn openai_env_config() -> Result<(String, String, String)> {
         "OPENAI_API_KEY",
         "KITE_API_KEY",
         "OPENAI_KEY",
+        "AI_GATEWAY_API_KEY",
     ])
     .context(
         "No OpenAI API key found in KITE_OPENAI_API_KEY, OPENAI_API_KEY, KITE_API_KEY, or OPENAI_KEY",

@@ -244,7 +244,7 @@ Both `kt land` and `kt pr` use one AI, reached through the OpenAI Responses API,
 
 - Base URL env precedence: `KITE_OPENAI_URL`, `KITE_OPENAI_BASE_URL`, `OPENAI_URL`, `OPENAI_BASE_URL`
 - Model env precedence: `KITE_OPENAI_MODEL`, `OPENAI_MODEL`
-- API key env precedence: `KITE_OPENAI_API_KEY`, `OPENAI_API_KEY`, `KITE_API_KEY`, `OPENAI_KEY`
+- API key env precedence: `KITE_OPENAI_API_KEY`, `OPENAI_API_KEY`, `KITE_API_KEY`, `OPENAI_KEY`, `AI_GATEWAY_API_KEY`
 - Timeout env: `KITE_OPENAI_TIMEOUT_SECS`
 - Default base URL: `https://api.openai.com/v1`
 - Default model: `gpt-5.4-mini`
