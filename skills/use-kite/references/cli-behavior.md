@@ -36,6 +36,7 @@
 - Show the proposed grouped commit plan before rewriting anything (split files are annotated like `(1/2 hunks)`); `--yes` skips only the confirmation prompt.
 - Record the pre-land `HEAD` at `refs/kite/pre_land`.
 - If rewriting fails mid-land, keep the in-progress state on a `kite-recovery-*` branch so partial commits or staged changes are preserved.
+- Work on a detached `HEAD` too: leave the landed commits under `HEAD` itself and move no branch. `--push` needs a branch, so it is refused up front when `HEAD` is detached.
 - Rewrite history locally by default.
 - If `--push` is passed, publish immediately after a successful local land.
 - If AI misses hunks, each joins the commit already touching its file when that is unambiguous; the rest land in a final `chore: unclassified updates` commit.
@@ -43,13 +44,14 @@
 ### `kt publish`
 
 - If no remote exists, print a note and exit successfully.
+- Require a branch: `git push` has to be told which remote ref to write, so a detached `HEAD` is refused with the commit it is on and a `git switch -c <name>` hint.
 - Push the current branch with `--set-upstream origin <branch> --force-with-lease` — no `pull --rebase` first, so a land never gets rebased onto the remote's stale saves.
 - A rejected lease (someone else pushed) is reported as an error for the user to reconcile manually.
 
 ### `kt pr [--draft] [--base <branch>] [--yes]`
 
 - Requires the GitHub CLI (`gh`) to be installed and authenticated (checked offline via `gh auth token`), and a remote to exist.
-- Refuses to run on the base branch or with unlanded `[kite] save` commits (run `kt land` first).
+- Refuses to run on the base branch, on a detached `HEAD`, or with unlanded `[kite] save` commits (run `kt land` first).
 - If an open pull request already exists for the branch, pushes any new commits, asks the AI whether the body still reflects the branch, and offers a refreshed body (`gh pr edit`) after preview and confirmation; if it still fits, prints "nothing to update". Without AI the existing body is left untouched. Merged or closed PRs do not block a new one.
 - Fetches `origin/<branch>` and publishes when the remote is missing the branch or out of date.
 - Gathers context for the draft:
@@ -63,9 +65,11 @@
 
 ### `kt undo`
 
-- Require a clean working tree.
-- Reset hard to `refs/kite/pre_land`, then delete that ref.
-- If a remote exists, force-push the current branch with `--force-with-lease`.
+- Reverse the most recent thing Kite did: the quicksave on top of history if there is one, otherwise the last land.
+- Undoing a quicksave is a mixed reset, so it needs no clean tree and keeps edits made since.
+- Undoing a land requires a clean working tree, resets hard to `refs/kite/pre_land`, then deletes that ref.
+- Only undo a land where it happened — a branch, or a detached `HEAD`. Anywhere else it refuses and says where to go.
+- If a remote exists and the land was on a branch, force-push that branch with `--force-with-lease`. A detached land was never publishable, so the remote is left alone.
 
 ## OpenAI environment variables
 

@@ -5,10 +5,10 @@ use std::collections::HashSet;
 
 use crate::ai::flatten_error;
 use crate::git::{
-    KiteBase, apply_cached_patch, check_ref, commit_git, config_get, config_set, config_unset,
-    current_branch_name, diff_for_base, execute_git, execute_git_with, has_head_commit, has_remote,
-    has_unmerged_paths, head_branch_hint, is_ancestor, is_save_subject, kite_save_stack,
-    subjects_missing_from_head,
+    DETACHED_TARGET, Head, KiteBase, apply_cached_patch, branch_to_publish, check_ref, commit_git,
+    config_get, config_set, config_unset, diff_for_base, execute_git, execute_git_with,
+    has_head_commit, has_remote, has_unmerged_paths, head_branch_hint, head_position, is_ancestor,
+    is_save_subject, kite_save_stack, short_sha, subjects_missing_from_head,
 };
 use crate::hunks::{DiffUnits, FileStat, parse_diff};
 use crate::synth::{
@@ -17,7 +17,8 @@ use crate::synth::{
 use crate::ui::{Spinner, confirm, pluralize, print_ai_unavailable, prompt_line};
 
 /// Where the pre-land `HEAD` is parked so `kt undo` can restore it, plus the
-/// local config keys recording which branch that land belongs to and where it
+/// local config keys recording which branch that land belongs to — or
+/// `DETACHED_TARGET` when it was landed on a detached `HEAD` — and where it
 /// left `HEAD`.
 const PRE_LAND_REF: &str = "refs/kite/pre_land";
 const PRE_LAND_BRANCH_KEY: &str = "kite.preland.branch";
@@ -49,7 +50,7 @@ enum StageOp {
 }
 
 pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> Result<()> {
-    let Some(status) = land_preflight()? else {
+    let Some(status) = land_preflight(push)? else {
         return Ok(());
     };
 
@@ -157,7 +158,7 @@ pub(crate) fn publish_current_branch() -> Result<()> {
         return Ok(());
     }
 
-    let branch = current_branch_name()?;
+    let branch = branch_to_publish()?;
     let remote_ref = format!("refs/remotes/origin/{branch}");
 
     // No fetch on the common path. The lease below is checked by git against
@@ -277,8 +278,18 @@ fn undo_last_save(subject: &str) -> Result<()> {
             // The save is the repository's very first commit: there is no
             // parent to reset onto, so make the branch unborn again. The index
             // and working tree are left exactly as they are.
-            let branch = current_branch_name()?;
-            execute_git(&["update-ref", "-d", &format!("refs/heads/{branch}")])?;
+            match head_position()? {
+                Head::Branch(branch) => {
+                    execute_git(&["update-ref", "-d", &format!("refs/heads/{branch}")])?;
+                }
+                // Only a branch can be unborn. A detached `HEAD` has to point
+                // at some commit, and deleting the save would leave nowhere for
+                // it to point.
+                Head::Detached(sha) => anyhow::bail!(
+                    "{} is the first commit in this repository and HEAD is detached, so there is nothing to move it back to. Run `git switch -c <name>` first, then `kt undo`.",
+                    short_sha(&sha)
+                ),
+            }
         }
     }
 
@@ -301,8 +312,8 @@ fn undo_last_land() -> Result<()> {
         return Ok(());
     };
 
-    let branch = current_branch_name()?;
-    guard_undo_target(&branch)?;
+    let head = head_position()?;
+    guard_undo_target(&head)?;
 
     let status = execute_git(&["status", "--porcelain"])?;
     if !status.trim().is_empty() {
@@ -316,21 +327,31 @@ fn undo_last_land() -> Result<()> {
     config_unset(PRE_LAND_BRANCH_KEY);
     config_unset(PRE_LAND_HEAD_KEY);
 
-    if has_remote() {
-        let spinner = Spinner::start("Reverting remote");
-        let reverted = execute_git(&[
-            "push",
-            "--force-with-lease",
-            "origin",
-            &format!("{pre_land_sha}:refs/heads/{branch}"),
-        ]);
-        spinner.stop();
-        if reverted.is_err() {
-            println!(
-                "{} Remote not reverted — it may have diverged",
-                "·".yellow()
-            );
+    match &head {
+        Head::Branch(branch) if has_remote() => {
+            let spinner = Spinner::start("Reverting remote");
+            let reverted = execute_git(&[
+                "push",
+                "--force-with-lease",
+                "origin",
+                &format!("{pre_land_sha}:refs/heads/{branch}"),
+            ]);
+            spinner.stop();
+            if reverted.is_err() {
+                println!(
+                    "{} Remote not reverted — it may have diverged",
+                    "·".yellow()
+                );
+            }
         }
+        // Nothing to revert: a detached land was never publishable, so the
+        // remote cannot be holding the history it produced.
+        Head::Detached(_) if has_remote() => println!(
+            "{} {}",
+            "·".dimmed(),
+            "Remote untouched — a detached HEAD has no branch to revert".dimmed()
+        ),
+        _ => {}
     }
 
     println!("{} Restored pre-land saves", "✓".green());
@@ -338,24 +359,28 @@ fn undo_last_land() -> Result<()> {
 }
 
 /// `refs/kite/pre_land` is a single repo-wide ref, so on its own it says
-/// nothing about which branch it belongs to. Without this guard, landing on
-/// one branch and undoing on another hard-resets — and force-pushes — the
-/// wrong branch to an unrelated commit.
-fn guard_undo_target(branch: &str) -> Result<()> {
-    let Some(landed_branch) = config_get(PRE_LAND_BRANCH_KEY) else {
-        // Recorded by a Kite that predates this guard: we cannot tell which
-        // branch it belongs to, so make the user look before it resets.
+/// nothing about where it belongs. Without this guard, landing in one place and
+/// undoing in another hard-resets — and force-pushes — the wrong branch to an
+/// unrelated commit.
+fn guard_undo_target(head: &Head) -> Result<()> {
+    let Some(landed_target) = config_get(PRE_LAND_BRANCH_KEY) else {
+        // Recorded by a Kite that predates this guard: we cannot tell where it
+        // belongs, so make the user look before it resets.
         if confirm(&format!(
-            "The recorded land has no branch attached. Reset `{branch}` to it anyway?"
+            "The recorded land has no branch attached. Reset {} to it anyway?",
+            head.describe()
         ))? {
             return Ok(());
         }
         anyhow::bail!("Undo cancelled — nothing changed");
     };
 
-    if landed_branch != branch {
+    if landed_target != head.land_key() {
         anyhow::bail!(
-            "The last land was on `{landed_branch}`, but you are on `{branch}`. Run `git switch {landed_branch}` first — undoing here would reset `{branch}` to unrelated history."
+            "The last land was on {}, but you are on {}. {} — undoing here would reset unrelated history.",
+            describe_landed_target(&landed_target),
+            head.describe(),
+            recover_landed_target(&landed_target)
         );
     }
 
@@ -379,12 +404,41 @@ fn guard_undo_target(branch: &str) -> Result<()> {
         .unwrap_or(0);
 
     if confirm(&format!(
-        "`{branch}` has moved since that land. Undo will discard {} made since. Continue?",
+        "{} has moved since that land. Undo will discard {} made since. Continue?",
+        head.describe(),
         pluralize(added, "commit")
     ))? {
         return Ok(());
     }
     anyhow::bail!("Undo cancelled — nothing changed")
+}
+
+/// A recorded land target read back from config, which is a branch name or
+/// `DETACHED_TARGET` — never a `Head`, because the commit a detached land
+/// started from is not what the marker keeps.
+fn describe_landed_target(landed_target: &str) -> String {
+    if landed_target == DETACHED_TARGET {
+        "a detached HEAD".to_string()
+    } else {
+        format!("`{landed_target}`")
+    }
+}
+
+/// How to get back to where a land happened. For a detached land that is the
+/// commit it left `HEAD` on, which the marker records; without it there is no
+/// name to offer, so the instruction stays honest about that.
+fn recover_landed_target(landed_target: &str) -> String {
+    if landed_target != DETACHED_TARGET {
+        return format!("Run `git switch {landed_target}` first");
+    }
+
+    match config_get(PRE_LAND_HEAD_KEY) {
+        Some(landed_head) => format!(
+            "Check that commit out again with `git switch --detach {}`",
+            short_sha(&landed_head)
+        ),
+        None => "Check out the commit that land left behind first".to_string(),
+    }
 }
 
 const LANDING_BRANCH_PREFIX: &str = "kite-landing-";
@@ -412,9 +466,9 @@ pub(crate) fn heal_interrupted_land() {
         None => None, // detached: mid-land, or the user's own checkout
     };
 
-    // A land in progress has recorded its branch but not the head it
+    // A land in progress has recorded its target but not the head it
     // produced. Any other combination means no land is half-done.
-    let (Some(pre_land_sha), Some(original_branch), None) = (
+    let (Some(pre_land_sha), Some(landed_target), None) = (
         check_ref(PRE_LAND_REF),
         config_get(PRE_LAND_BRANCH_KEY),
         config_get(PRE_LAND_HEAD_KEY),
@@ -427,22 +481,34 @@ pub(crate) fn heal_interrupted_land() {
         "·".yellow()
     );
 
+    // The pre-land sha is exactly where a detached land started, so it is the
+    // commit `HEAD` has to go back to.
+    let target = if landed_target == DETACHED_TARGET {
+        Head::Detached(pre_land_sha.clone())
+    } else {
+        Head::Branch(landed_target)
+    };
+
     let landing_branch = parked_branch.unwrap_or_default();
-    match return_to_original_branch(&original_branch, &pre_land_sha, &landing_branch) {
+    match restore_head(&target, &pre_land_sha, &landing_branch) {
         Ok(()) => {
             // The land never happened, so stop the marker looking in-progress.
             let _ = config_set(PRE_LAND_HEAD_KEY, &pre_land_sha);
             println!(
                 "  {}",
-                format!("Back on {original_branch} with every save intact — nothing was landed.")
-                    .dimmed()
+                format!(
+                    "Back on {} with every save intact — nothing was landed.",
+                    target.describe()
+                )
+                .dimmed()
             );
         }
         Err(error) => println!(
             "  {}",
             format!(
-                "Could not do it automatically ({}). Run `git switch {original_branch}` — it still has every save.",
-                flatten_error(&format!("{error:#}"))
+                "Could not do it automatically ({}). Run `{}` — it still has every save.",
+                flatten_error(&format!("{error:#}")),
+                target.switch_command()
             )
             .dimmed()
         ),
@@ -452,7 +518,7 @@ pub(crate) fn heal_interrupted_land() {
 /// Everything that must hold before Kite touches the worktree. Run before
 /// `--allow-dirty` stashes anything, so a repository that cannot be landed
 /// never gets its work put away first and its diagnosis second.
-fn land_preflight() -> Result<Option<String>> {
+fn land_preflight(push: bool) -> Result<Option<String>> {
     if !has_head_commit() {
         println!(
             "{} No commits yet — make an initial commit before landing",
@@ -461,10 +527,13 @@ fn land_preflight() -> Result<Option<String>> {
         return Ok(None);
     }
 
-    // A detached HEAD has no branch to move onto the landed commits. Checked
-    // here so it reports before any work is done — and before --allow-dirty
-    // has stashed anything.
-    current_branch_name()?;
+    // Landing itself works on a detached HEAD — it moves HEAD onto the landed
+    // commits — but publishing needs a branch name. Checked here so it reports
+    // before any work is done, rather than after the rewrite has happened and
+    // there is nothing left to do but the push that cannot run.
+    if push {
+        branch_to_publish()?;
+    }
 
     let status = execute_git(&["status", "--porcelain"])?;
     if has_unmerged_paths(&status) {
@@ -739,12 +808,14 @@ fn execute_land(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
         anyhow::bail!("Refusing to land an empty plan — that would discard the saves.");
     }
 
-    // Resolved before anything is rewritten: on a detached HEAD there is no
-    // branch to point at the landed commits, and discovering that afterwards
-    // would mean unwinding a rewrite that had already happened.
-    let original_branch = current_branch_name()?;
+    // Resolved before anything is rewritten, so the landed commits have a
+    // recorded home: a branch to move, or the detached HEAD to leave sitting on
+    // them. Discovering it afterwards would mean unwinding a rewrite that had
+    // already happened.
+    let target = head_position()?;
     let pre_land_sha = execute_git(&["rev-parse", "HEAD"])?;
-    // Only ever used by a root rewrite, which cannot be done detached.
+    // Only ever used by a root rewrite, which is the one case that cannot build
+    // its commits on a detached HEAD.
     let landing_branch = format!(
         "{LANDING_BRANCH_PREFIX}{}",
         Local::now().format("%Y%m%d%H%M%S")
@@ -755,32 +826,30 @@ fn execute_land(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
     let previous_marker = PreLandMarker::capture();
 
     execute_git(&["update-ref", PRE_LAND_REF, pre_land_sha.trim()])?;
-    config_set(PRE_LAND_BRANCH_KEY, &original_branch)?;
+    config_set(PRE_LAND_BRANCH_KEY, &target.land_key())?;
     // Cleared until the land succeeds, so a stale value can never make `kt
     // undo` think HEAD is untouched.
     config_unset(PRE_LAND_HEAD_KEY);
 
     if let Err(err) = prepare_landing_head(base, &landing_branch).and_then(|landing| {
         create_commits(commits)?;
-        finalize_landed_branch(&original_branch, &landing)
+        finalize_landed_head(&target, &landing)
     }) {
         // A failed land is almost always a hook rejecting a commit, and the
-        // fix belongs on the branch the user was already on. Nothing they
-        // wrote is at stake — their saves are still on `original_branch`,
-        // which is not moved until the final step, and landing stages through
-        // the index without ever writing the worktree — so put them back
-        // instead of stranding them on a branch full of derived commits.
+        // fix belongs where the user already was. Nothing they wrote is at
+        // stake — their saves are still reachable from `target`, which is not
+        // moved until the final step, and landing stages through the index
+        // without ever writing the worktree — so put them back instead of
+        // stranding them on a pile of derived commits.
         return Err(
-            match return_to_original_branch(&original_branch, pre_land_sha.trim(), &landing_branch)
-            {
+            match restore_head(&target, pre_land_sha.trim(), &landing_branch) {
                 Ok(()) => {
                     previous_marker.restore();
-                    anyhow!("{}", render_recovered_failure(&err, &original_branch))
+                    anyhow!("{}", render_recovered_failure(&err, &target))
                 }
-                Err(restore_error) => anyhow!(
-                    "{}",
-                    render_stranded_failure(&err, &original_branch, &restore_error)
-                ),
+                Err(restore_error) => {
+                    anyhow!("{}", render_stranded_failure(&err, &target, &restore_error))
+                }
             },
         );
     }
@@ -792,29 +861,46 @@ fn execute_land(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
     Ok(())
 }
 
-/// Undoes a failed landing attempt, leaving the user exactly where they
-/// started.
+/// Undoes a failed or interrupted landing attempt, leaving the user exactly
+/// where they started.
 ///
-/// Safe by construction: `original_branch` is only moved by the final step, so
-/// while landing is in progress it still points at every save. A *mixed* reset
-/// is deliberate — it clears the half-staged index but leaves the worktree
-/// alone, so files a pre-commit hook rewrote (a formatter, say) survive.
-fn return_to_original_branch(
-    original_branch: &str,
-    pre_land_sha: &str,
-    landing_branch: &str,
-) -> Result<()> {
+/// Safe by construction: a branch target is only moved by the final step, so
+/// while landing is in progress it still points at every save, and the pre-land
+/// sha holds them for a detached one. A *mixed* reset is deliberate — it clears
+/// the half-staged index but leaves the worktree alone, so files a pre-commit
+/// hook rewrote (a formatter, say) survive.
+fn restore_head(target: &Head, pre_land_sha: &str, landing_branch: &str) -> Result<()> {
     execute_git(&["reset", "--mixed", pre_land_sha])?;
-    execute_git(&["checkout", original_branch])?;
+
+    match target {
+        Head::Branch(branch) => {
+            execute_git(&["checkout", branch])?;
+        }
+        // A root rewrite parks HEAD on an orphan branch even when the user was
+        // detached, so getting back means detaching again. Asked of git rather
+        // than read from `.git/HEAD`: this only ever runs while recovering, so
+        // the subprocess is free, and a layout the fast path cannot read would
+        // otherwise leave HEAD on the temporary branch. The reset above already
+        // made the index and worktree match, so this moves HEAD alone.
+        Head::Detached(_) if matches!(head_position(), Ok(Head::Branch(_))) => {
+            execute_git(&["checkout", "--detach", pre_land_sha])?;
+        }
+        // A detached land builds its commits detached, so the reset was enough.
+        Head::Detached(_) => {}
+    }
+
     // Exists only after a root rewrite, and only ever held commits the next
     // attempt rebuilds from scratch.
-    let _ = execute_git(&["branch", "-D", landing_branch]);
+    if !landing_branch.is_empty() {
+        let _ = execute_git(&["branch", "-D", landing_branch]);
+    }
     Ok(())
 }
 
-fn render_recovered_failure(err: &anyhow::Error, original_branch: &str) -> String {
+fn render_recovered_failure(err: &anyhow::Error, target: &Head) -> String {
     format!(
-        "{err:#}\n\nNothing changed — you are still on `{original_branch}` with every save intact.\nFix the problem above, then run `kt land` again."
+        "{err:#}\n\nNothing changed — you are still on {} with every save intact.\nFix the problem above, then run `kt land` again.",
+        target.describe()
     )
 }
 
@@ -822,11 +908,23 @@ fn render_recovered_failure(err: &anyhow::Error, original_branch: &str) -> Strin
 /// to be told about the temporary branch at all.
 fn render_stranded_failure(
     err: &anyhow::Error,
-    original_branch: &str,
+    target: &Head,
     restore_error: &anyhow::Error,
 ) -> String {
+    let (safety, recovery) = match target {
+        Head::Branch(branch) => (
+            format!("`{branch}` still has every save and was never changed."),
+            format!("Run `git reset --mixed {branch}` then `git switch {branch}` to get back."),
+        ),
+        Head::Detached(sha) => (
+            format!("Every save is still reachable from {sha} and was never changed."),
+            format!("Run `git reset --mixed {sha}` then `git switch --detach {sha}` to get back."),
+        ),
+    };
+
     format!(
-        "{err:#}\n\nKite could not put you back on `{original_branch}`: {restore_error:#}\n`{original_branch}` still has every save and was never changed.\nRun `git reset --mixed {original_branch}` then `git switch {original_branch}` to get back.\nRollback ref: `{PRE_LAND_REF}`."
+        "{err:#}\n\nKite could not put you back on {}: {restore_error:#}\n{safety}\n{recovery}\nRollback ref: `{PRE_LAND_REF}`.",
+        target.describe()
     )
 }
 
@@ -871,12 +969,13 @@ fn restore_config(key: &str, value: Option<&str>) {
     }
 }
 
-/// Where the landed commits get built before the branch is moved onto them.
+/// Where the landed commits get built before `HEAD` settles onto them.
 ///
 /// Detached wherever possible, so an ordinary land creates no branch at all
 /// and there is nothing left behind to clean up if it stops early. Rewriting
 /// from the root needs an *unborn* HEAD, and `checkout --orphan <name>` is the
-/// only way git offers to get one — so that one case still names a branch.
+/// only way git offers to get one — so that one case still names a branch, even
+/// when the user was detached to begin with.
 #[derive(Clone, Debug)]
 enum LandingHead {
     Detached,
@@ -915,10 +1014,25 @@ fn create_commits(commits: &[LandCommit]) -> Result<()> {
     Ok(())
 }
 
-fn finalize_landed_branch(original_branch: &str, landing: &LandingHead) -> Result<()> {
+fn finalize_landed_head(target: &Head, landing: &LandingHead) -> Result<()> {
     let new_head = execute_git(&["rev-parse", "HEAD"])?;
-    execute_git(&["branch", "-f", original_branch, new_head.trim()])?;
-    execute_git(&["checkout", original_branch])?;
+
+    match target {
+        Head::Branch(branch) => {
+            execute_git(&["branch", "-f", branch, new_head.trim()])?;
+            execute_git(&["checkout", branch])?;
+        }
+        // A detached land is already sitting on the landed commits, so there is
+        // nothing to move — except after a root rewrite, where the commits were
+        // built on the orphan branch and HEAD has to come off it before that
+        // branch is deleted.
+        Head::Detached(_) => {
+            if matches!(landing, LandingHead::Orphan(_)) {
+                execute_git(&["checkout", "--detach", new_head.trim()])?;
+            }
+        }
+    }
+
     if let LandingHead::Orphan(branch) = landing {
         let _ = execute_git(&["branch", "-D", branch]);
     }
@@ -1437,6 +1551,24 @@ mod tests {
         );
     }
 
+    /// The one thing a detached `HEAD` genuinely cannot do: there is no unborn
+    /// detached state for it to become, so this has to say so rather than
+    /// deleting the commit HEAD points at.
+    #[test]
+    fn undo_of_a_detached_root_quicksave_explains_it_needs_a_branch() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_root_kite_repo();
+        git(&repo.path, &["checkout", "-q", "--detach"]);
+        let head_before = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        let err = undo_in_repo(&repo.path).expect_err("a detached root save cannot be unmade");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("HEAD is detached"));
+        assert!(rendered.contains("git switch -c"));
+
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), head_before);
+    }
+
     #[test]
     fn undo_refuses_when_the_land_belongs_to_another_branch() {
         let _lock = acquire_cwd_lock();
@@ -1512,7 +1644,7 @@ mod tests {
     }
 
     #[test]
-    fn land_refuses_on_a_detached_head_before_touching_history() {
+    fn land_preflight_accepts_a_detached_head_but_refuses_to_publish_from_one() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
 
@@ -1523,15 +1655,310 @@ mod tests {
 
         git(&repo.path, &["checkout", "-q", "--detach"]);
 
-        let err = with_repo_cwd(&repo.path, land_preflight)
-            .expect_err("a detached HEAD should be refused up front");
+        // Landing moves HEAD itself, so it needs no branch.
+        with_repo_cwd(&repo.path, || land_preflight(false))
+            .expect("a detached HEAD should be landable");
+
+        // `--push` does need one, and must say so before anything is rewritten.
+        let err = with_repo_cwd(&repo.path, || land_preflight(true))
+            .expect_err("publishing a detached HEAD should be refused up front");
         assert!(format!("{err:#}").contains("HEAD is detached"));
+        assert!(format!("{err:#}").contains("git switch -c"));
 
         assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), head_before);
-        let recovery = git(&repo.path, &["branch", "--list", "kite-recovery-*"]);
+        let recovery = git(&repo.path, &["branch", "--list", "kite-*"]);
         assert!(
             recovery.trim().is_empty(),
             "nothing should have been rewritten"
+        );
+    }
+
+    #[test]
+    fn execute_land_moves_a_detached_head_onto_the_landed_commits() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let branch = branch.trim().to_string();
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        git(&repo.path, &["checkout", "-q", "--detach"]);
+        let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
+        let pre_land_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
+
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: land tracked change", &["tracked.txt"])],
+        )
+        .expect("a detached land should succeed");
+
+        // HEAD is still detached — just on the landed commit now.
+        assert!(
+            with_repo_cwd(&repo.path, head_branch_hint).is_none(),
+            "landing must not attach HEAD to a branch"
+        );
+        assert_eq!(
+            git(&repo.path, &["log", "-1", "--pretty=%s"]).trim(),
+            "feat: land tracked change"
+        );
+        assert_eq!(
+            git(&repo.path, &["rev-parse", "HEAD^{tree}"]),
+            pre_land_tree
+        );
+
+        // The branch the user deliberately stepped off is left where it was.
+        assert_eq!(
+            git(&repo.path, &["rev-parse", &branch]),
+            pre_land_sha,
+            "a detached land moved a branch it was not on"
+        );
+
+        let recorded = git(&repo.path, &["config", "--local", PRE_LAND_BRANCH_KEY]);
+        assert_eq!(recorded.trim(), DETACHED_TARGET);
+        assert_eq!(
+            git(&repo.path, &["rev-parse", PRE_LAND_REF]).trim(),
+            pre_land_sha.trim()
+        );
+
+        let leftovers = git(&repo.path, &["branch", "--list", "kite-*"]);
+        assert!(
+            leftovers.trim().is_empty(),
+            "a detached land left a branch behind: {leftovers}"
+        );
+    }
+
+    #[test]
+    fn execute_land_rewrites_root_history_from_a_detached_head() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_root_kite_repo();
+        let branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let branch = branch.trim().to_string();
+
+        git(&repo.path, &["checkout", "-q", "--detach"]);
+        let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("root kite save should be landable");
+        assert!(matches!(scope.base, KiteBase::Root));
+
+        let groups = [group("feat: bootstrap project", &["h1"])];
+        let commits = with_repo_cwd(&repo.path, || {
+            plan_commits(&scope.base, &scope.units, &groups)
+        });
+        execute_land_in_repo(&repo.path, &scope.base, &commits)
+            .expect("a detached root land should succeed");
+
+        // A root rewrite has to build on an orphan branch; HEAD must come back
+        // off it, and the branch must not be left behind.
+        assert!(
+            with_repo_cwd(&repo.path, head_branch_hint).is_none(),
+            "a root land left HEAD attached to the orphan branch"
+        );
+        assert_eq!(
+            git(&repo.path, &["log", "-1", "--pretty=%s"]).trim(),
+            "feat: bootstrap project"
+        );
+        assert_eq!(git(&repo.path, &["rev-parse", &branch]), pre_land_sha);
+
+        let leftovers = git(&repo.path, &["branch", "--list", "kite-*"]);
+        assert!(
+            leftovers.trim().is_empty(),
+            "a detached root land left a branch behind: {leftovers}"
+        );
+    }
+
+    /// The awkward corner: a root rewrite has to build on an orphan branch, so
+    /// recovering a detached one means getting HEAD back off that branch as well
+    /// as back to the right commit.
+    #[test]
+    fn a_failed_detached_root_land_detaches_back_off_the_orphan_branch() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_root_kite_repo();
+        git(&repo.path, &["checkout", "-q", "--detach"]);
+        let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("root kite save should be landable");
+        assert!(matches!(scope.base, KiteBase::Root));
+
+        let err = execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: bootstrap", &["missing.txt"])],
+        )
+        .expect_err("land should fail when a grouped file cannot be staged");
+        assert!(format!("{err:#}").contains("the detached HEAD at"));
+
+        assert!(
+            with_repo_cwd(&repo.path, head_branch_hint).is_none(),
+            "recovery left HEAD on the orphan branch"
+        );
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), pre_land_sha);
+        let leftovers = git(&repo.path, &["branch", "--list", "kite-*"]);
+        assert!(
+            leftovers.trim().is_empty(),
+            "a failed detached root land left a branch behind: {leftovers}"
+        );
+        assert!(
+            git(&repo.path, &["status", "--porcelain"])
+                .trim()
+                .is_empty(),
+            "a failed land left staged changes to clean up"
+        );
+    }
+
+    #[test]
+    fn undo_restores_a_detached_land_without_touching_the_remote() {
+        let _lock = acquire_cwd_lock();
+        let (repo, _remote) = crate::test_support::init_repo_with_remote_branch("teammate-work");
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        git(&repo.path, &["checkout", "-q", "--detach"]);
+        let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: land tracked change", &["tracked.txt"])],
+        )
+        .expect("a detached land should succeed");
+
+        undo_in_repo(&repo.path).expect("undo should restore a detached land");
+
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), pre_land_sha);
+        assert!(with_repo_cwd(&repo.path, head_branch_hint).is_none());
+        assert!(
+            check_ref_in(&repo.path, PRE_LAND_REF).is_none(),
+            "a successful undo consumes the marker"
+        );
+    }
+
+    #[test]
+    fn undo_refuses_when_the_land_was_on_a_branch_and_head_is_detached() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let branch = branch.trim().to_string();
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: land tracked change", &["tracked.txt"])],
+        )
+        .expect("land should succeed");
+
+        // Same commit, but reached without the branch — undo would leave the
+        // branch pointing at the landed history it was supposed to remove.
+        git(&repo.path, &["checkout", "-q", "--detach"]);
+        let protected_head = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        let err = undo_in_repo(&repo.path).expect_err("undo should refuse on a detached HEAD");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(&format!("The last land was on `{branch}`")));
+        assert!(rendered.contains("the detached HEAD at"));
+
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), protected_head);
+        assert!(
+            check_ref_in(&repo.path, PRE_LAND_REF).is_some(),
+            "a refused undo must keep the rollback marker"
+        );
+    }
+
+    #[test]
+    fn undo_refuses_a_detached_land_from_a_branch_and_says_where_to_go() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        git(&repo.path, &["checkout", "-q", "--detach"]);
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: land tracked change", &["tracked.txt"])],
+        )
+        .expect("a detached land should succeed");
+        let landed_head = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        // Picking the landed work up on a branch is a different place from the
+        // one that land recorded, so undoing here would rewind a ref the land
+        // never touched.
+        git(&repo.path, &["checkout", "-q", "-b", "picked-up"]);
+        let protected_head = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        let err = undo_in_repo(&repo.path).expect_err("undo should refuse on a branch");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("The last land was on a detached HEAD"));
+        // The landed commit is the only way back, so the message names it.
+        assert!(rendered.contains(&format!(
+            "git switch --detach {}",
+            short_sha(landed_head.trim())
+        )));
+
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), protected_head);
+        assert!(check_ref_in(&repo.path, PRE_LAND_REF).is_some());
+    }
+
+    #[test]
+    fn an_interrupted_detached_land_heals_itself_back_to_the_same_commit() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+        git(&repo.path, &["checkout", "-q", "--detach"]);
+        let saves_head = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        // What a detached land killed mid-rewrite leaves: a marker saying the
+        // land had no branch, no landed head recorded, HEAD on a partial commit.
+        git(&repo.path, &["update-ref", PRE_LAND_REF, saves_head.trim()]);
+        git(
+            &repo.path,
+            &["config", "--local", PRE_LAND_BRANCH_KEY, DETACHED_TARGET],
+        );
+        git(&repo.path, &["reset", "-q", "--soft", "HEAD~1"]);
+        git(&repo.path, &["reset", "-q"]);
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-qm", "feat: half a landing"]);
+
+        with_repo_cwd(&repo.path, heal_interrupted_land);
+
+        assert!(
+            with_repo_cwd(&repo.path, head_branch_hint).is_none(),
+            "healing a detached land must not attach HEAD to a branch"
+        );
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saves_head);
+        assert!(
+            git(&repo.path, &["status", "--porcelain"])
+                .trim()
+                .is_empty()
         );
     }
 
@@ -1551,7 +1978,7 @@ mod tests {
             .current_dir(&repo.path)
             .output();
 
-        let err = with_repo_cwd(&repo.path, land_preflight)
+        let err = with_repo_cwd(&repo.path, || land_preflight(false))
             .expect_err("a conflicted repo should be refused");
         assert!(format!("{err:#}").contains("unresolved merge conflicts"));
     }

@@ -138,7 +138,7 @@ Synthesizes contiguous Kite quicksaves into a polished local history.
 - Requires an existing `HEAD` commit.
 - By default, requires a clean working tree. If you still have WIP changes, run `kt` first or stash them.
 - Use `--allow-dirty` to land while your worktree is dirty; `kt` temporarily stashes and restores those changes.
-- Requires a branch: on a detached `HEAD` Kite refuses before touching anything.
+- Works on a detached `HEAD`: the landed commits are left under `HEAD` itself and no branch is moved. `--push` still needs a branch, and says so before anything is rewritten.
 - Only rewrites contiguous `[kite] save` commits at the top of history, following first-parent history so a merge cannot move the starting point.
 - Splits changes by hunk, so one file can contribute to multiple commits. Binary files, mode changes, and renames stay whole.
 - Very large sets of saves group by file instead of by hunk, and say so. Past a few hundred hunks the model cannot be shown enough of each one to tell them apart, and grouping whole files it can actually read beats guessing at hunks it never saw.
@@ -146,8 +146,8 @@ Synthesizes contiguous Kite quicksaves into a polished local history.
 - Shows the proposed commit plan before rewriting anything.
 - Stores the pre-land `HEAD` in `refs/kite/pre_land` so `kt undo` can restore it later.
 - Creates normal `git commit`s, so hooks do run during landing.
-- Landing never creates a branch. It builds the new commits on a detached `HEAD` and only moves your branch once they all exist.
-- If landing fails for any reason — a rejected pre-commit hook is the usual one — Kite undoes the attempt and leaves you exactly where you started: on your branch, saves intact, nothing staged, no branch to clean up. Fix the problem and run `kt land` again. Files a hook rewrote are kept as unstaged changes.
+- Landing never creates a branch. It builds the new commits on a detached `HEAD` and only moves your branch — or, if you were already detached, `HEAD` itself — once they all exist.
+- If landing fails for any reason — a rejected pre-commit hook is the usual one — Kite undoes the attempt and leaves you exactly where you started: on your branch or your detached commit, saves intact, nothing staged, no branch to clean up. Fix the problem and run `kt land` again. Files a hook rewrote are kept as unstaged changes.
 - If landing is interrupted rather than failing — Ctrl-C, a crash, a closed terminal — the next `kt` command notices and puts you back the same way.
 - Lands locally by default. Use `kt publish` afterward, or pass `--push` to publish immediately after landing.
 
@@ -183,6 +183,7 @@ Publishes the current branch after you review the rewritten local history.
 - Deliberately no `git pull --rebase` first: after a land, the remote still holds the old saves, and rebasing onto them would resurrect the history you just rewrote.
 - When the remote holds commits your branch does not, Kite looks at what a force would discard. Kite saves are the history you just rewrote, so those go without ceremony. Anything else is someone's work: Kite lists the commits and asks before touching them.
 - If no remote exists, Kite exits without error and leaves the history local.
+- Requires a branch. `git push` has to be told which remote ref to write, and a detached `HEAD` supplies no name, so Kite names the commit you are on and points you at `git switch -c <name>`.
 
 A bare `--force-with-lease` is not enough for this, which is why Kite does not rely on it alone: the lease compares against your local remote-tracking ref, and when that ref does not exist — the normal case for a branch someone else created — git has nothing to compare and lets the push through.
 
@@ -194,7 +195,7 @@ kt publish
 
 Opens a GitHub pull request for the current branch using the [GitHub CLI](https://cli.github.com) (`gh`). It is deliberately smart about the draft:
 
-- Requires `gh` to be installed and authenticated, and a remote to exist.
+- Requires `gh` to be installed and authenticated, a remote to exist, and a branch to open the pull request from — a detached `HEAD` is refused the same way `kt publish` refuses it.
 - Refuses to run with unlanded saves so the pull request always shows polished commits — run `kt land` first.
 - Publishes the branch automatically when the remote is missing it or behind it.
 - If a pull request is already open for the branch, Kite pushes any new commits, checks whether the body still reflects the branch, and offers a refreshed body when it doesn't — preserving the existing structure and any human-written notes. Without AI, the existing body is never touched.
@@ -225,18 +226,31 @@ Reverses the most recent thing Kite did — the last quicksave if there is one o
 - Uncommits the save and puts its changes back in your working tree, exactly as they were before you ran `kt`.
 - Never touches the working tree, so edits you made after the save survive and the tree does not need to be clean.
 - Entirely local — nothing is pushed.
+- The one case it cannot handle: a save that is the repository's very first commit while `HEAD` is detached. There is no unborn detached state to return to, so Kite says so instead of deleting the commit `HEAD` points at.
 
 **Undoing a land**
 
 - Requires a clean working tree.
-- Only undoes the branch that was landed. Landing records which branch the rollback belongs to, so running `kt undo` from somewhere else refuses and tells you where to go — it cannot reset an unrelated branch to unrelated history.
-- Asks first if the branch has moved since the land, since those newer commits would be discarded.
-- Hard-resets to `refs/kite/pre_land` and force-pushes that branch if a remote exists.
+- Only undoes where the land happened. Landing records that place — a branch, or a detached `HEAD` — so running `kt undo` from somewhere else refuses and tells you where to go, naming the commit to `git switch --detach` back onto when the land was detached. It cannot reset an unrelated branch to unrelated history.
+- Asks first if `HEAD` has moved since the land, since those newer commits would be discarded.
+- Hard-resets to `refs/kite/pre_land` and force-pushes that branch if a remote exists. A detached land was never publishable, so there is nothing to revert on the remote and Kite says as much.
 - Deletes the rollback marker after a successful undo so you do not accidentally replay it twice.
 
 ```bash
 kt undo
 ```
+
+### Detached `HEAD`
+
+Kite works on a detached `HEAD` — bisecting, reviewing a colleague's commit, sitting on a tag — without asking you to invent a branch first.
+
+- `kt` quicksaves as usual. The snapshots stack on `HEAD` exactly as they would on a branch.
+- `kt land` rewrites those saves and leaves `HEAD` detached on the landed commits. No branch is created, and the branch you stepped off is not moved.
+- `kt undo` rewinds the detached `HEAD`, and refuses if you have since moved somewhere else — a land recorded on a branch will not be undone from a detached `HEAD`, and vice versa. The refusal names the commit to `git switch --detach` back onto.
+- An interrupted land heals the same way it does on a branch: `HEAD` goes back to the commit it started from with every save intact.
+- `kt publish`, `kt pr`, and `kt land --push` need a branch, because `git push` has to be told which remote ref to write and a detached `HEAD` supplies no name. They refuse before anything is rewritten and tell you the commit you are on, so `git switch -c <name>` is a one-liner away.
+
+Nothing about the detached path is a special mode: the same rollback marker, plan preview, and exact-tree verification apply.
 
 ## Configuration & AI
 
@@ -270,9 +284,9 @@ Kite keeps the risky parts explicit:
 - **Clean-worktree landing by default:** `kt land` refuses to run with staged or unstaged WIP, so scratch files do not get swept into a landed commit by surprise.
 - **Dirty worktree override:** `kt land --allow-dirty` temporarily stashes uncommitted changes, lands saved commits, then restores those changes.
 - **Preview before rewrite:** Kite shows the proposed commit plan before it rewrites history.
-- **Rollback marker:** Every successful land records the previous `HEAD` at `refs/kite/pre_land`, along with the branch it belongs to, so `kt undo` can only ever rewind that branch.
+- **Rollback marker:** Every successful land records the previous `HEAD` at `refs/kite/pre_land`, along with where it belongs — the branch, or a detached `HEAD` — so `kt undo` can only ever rewind that one place.
 - **No clobbering other people:** `kt go` adopts a branch that already exists on the remote instead of forking over it, and `kt publish` refuses to silently discard remote commits that are not the saves you just landed.
-- **Failure leaves no mess:** landing creates no branch and never writes to your working tree, so a land that fails or is interrupted puts you back on your branch with nothing staged and nothing to clean up.
+- **Failure leaves no mess:** landing creates no branch and never writes to your working tree, so a land that fails or is interrupted puts you back where you were — branch or detached commit — with nothing staged and nothing to clean up.
 - **No dropped changes:** If the AI misses hunks, each one joins the commit already touching its file, or lands in a `chore: unclassified updates` commit — never silently omitted.
 - **Exact-tree verification:** A hunk-level plan is replayed in a temporary index before any rewrite and must reproduce the pre-land tree exactly, otherwise Kite lands whole files instead.
 - **Explicit publish:** Landing is local by default. Publishing remains a separate step unless you opt into `--push`.

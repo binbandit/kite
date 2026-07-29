@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 use crate::ai::{self, extract_json_block};
 use crate::git::{
-    SAVE_PREFIX, check_ref, current_branch_name, execute_git, get_default_branch, has_remote,
+    SAVE_PREFIX, branch_to_publish, check_ref, execute_git, get_default_branch, has_remote,
     kite_save_stack, repo_root,
 };
 use crate::land::publish_current_branch;
@@ -91,7 +91,7 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
         );
     }
 
-    let branch = current_branch_name()?;
+    let branch = branch_to_publish()?;
     let base = match options.base {
         Some(base) => base,
         None => get_default_branch()?,
