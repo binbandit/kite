@@ -198,10 +198,10 @@ Opens a GitHub pull request for the current branch using the [GitHub CLI](https:
 - Refuses to run with unlanded saves so the pull request always shows polished commits — run `kt land` first.
 - Publishes the branch automatically when the remote is missing it or behind it.
 - If a pull request is already open for the branch, Kite pushes any new commits, checks whether the body still reflects the branch, and offers a refreshed body when it doesn't — preserving the existing structure and any human-written notes. Without AI, the existing body is never touched.
-- Finds the repository's pull request template in the places GitHub looks (`.github/`, the repo root, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`), fills it in, and drops sections that don't apply — no empty headings, no `N/A`, no leftover boilerplate.
+- With AI available, finds the repository's pull request template in the places GitHub looks (`.github/`, the repo root, `docs/`, and `.github/PULL_REQUEST_TEMPLATE/`), fills it in, and drops sections that don't apply — no empty headings, no `N/A`, no leftover boilerplate.
 - Discovers PR-related agent skills installed on the machine (`.claude/skills`, `.agents/skills`, and `skills` in the repo; `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills` per user) and treats them as your own instructions for how the pull request must be written — they take precedence over the default rules.
 - Uses recent merged pull request titles from the repository as style examples for the new title.
-- Drafts the title and body with the same AI as `kt land`. Without AI, it falls back to a deterministic draft built from the template and the branch's commits.
+- Drafts the title and body with the same AI as `kt land`. Without AI, a new PR uses a clean generic `## Summary` section populated from the branch's commit subjects and never copies an unfilled repository template.
 - Always previews the pull request and asks for confirmation before creating anything.
 
 ```bash
@@ -259,7 +259,7 @@ export KITE_OPENAI_TIMEOUT_SECS="120"
 
 **Manual fallback**
 
-If the AI is unavailable, Kite shows the failure and keeps working: `kt land` asks for one manual commit message (leaving it blank aborts without changing history), and `kt pr` builds a deterministic draft from the template and the branch's commits.
+If the AI is unavailable, Kite shows the failure and keeps working: `kt land` asks for one manual commit message (leaving it blank aborts without changing history), and a new `kt pr` uses a clean generic `## Summary` section populated from the branch's commit subjects without copying an unfilled repository template.
 
 The failure it shows is the endpoint's own message — a rejected key, an unknown model, a schema the endpoint will not accept — so a misconfigured setup is diagnosable rather than just "the AI never works". Requests that cannot succeed on a retry are not retried.
 

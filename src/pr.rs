@@ -24,6 +24,7 @@ use crate::ui::{Spinner, confirm, pluralize, print_ai_unavailable};
 
 const MAX_COMMIT_SUBJECTS: usize = 50;
 const MAX_PR_TITLE_EXAMPLES: usize = 8;
+const MAX_PR_DRAFT_ATTEMPTS: usize = 2;
 const MAX_SKILLS: usize = 3;
 const MAX_SKILL_BYTES: usize = 4_000;
 const MAX_TEMPLATE_BYTES: usize = 6_000;
@@ -210,9 +211,12 @@ fn print_flow_header(branch: &str, base: &str) {
 /// Whitespace-insensitive comparison, so a model that only reflows the text
 /// it was told to return verbatim doesn't trigger a pointless update.
 fn drafts_match(draft: &PrDraft, existing: &ExistingPr) -> bool {
-    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalize(&draft.title) == normalize(&existing.title)
-        && normalize(&draft.body) == normalize(&existing.body)
+    normalize_whitespace(&draft.title) == normalize_whitespace(&existing.title)
+        && normalize_whitespace(&draft.body) == normalize_whitespace(&existing.body)
+}
+
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Checks for a working, authenticated `gh` up front — one offline spawn
@@ -495,15 +499,45 @@ async fn draft_with_ai(
     title_examples: &[String],
     existing: Option<&ExistingPr>,
 ) -> Result<PrDraft> {
-    let user = build_pr_input(context, title_examples, existing);
-    let request = ai::Request {
-        system: SYSTEM_PROMPT,
-        user: &user,
-        schema_name: "pull_request",
-        schema: draft_schema(),
-    };
+    let input = build_pr_input(context, title_examples, existing);
+    let mut feedback: Option<String> = None;
+    let mut last_error = anyhow::anyhow!("PR drafting was not attempted");
 
-    ai::complete(&request, parse_draft).await
+    for attempt in 0..MAX_PR_DRAFT_ATTEMPTS {
+        let user = match &feedback {
+            None => input.clone(),
+            Some(problem) => format!(
+                "{input}\n\nYour previous draft was rejected: {problem}.\nReturn a corrected title and body. Fill every retained template section with real content, and remove empty headings, placeholders, and instructional comments."
+            ),
+        };
+        let request = ai::Request {
+            system: SYSTEM_PROMPT,
+            user: &user,
+            schema_name: "pull_request",
+            schema: draft_schema(),
+        };
+
+        match ai::complete(&request, parse_draft).await {
+            Ok(draft) => {
+                match validate_draft_against_template(&draft, context.template.as_ref(), existing) {
+                    Ok(()) => return Ok(draft),
+                    Err(error) => {
+                        feedback = Some(format!("{error:#}"));
+                        last_error = error;
+                    }
+                }
+            }
+            Err(error) => {
+                if !ai::is_retryable(&error) || attempt + 1 == MAX_PR_DRAFT_ATTEMPTS {
+                    return Err(error);
+                }
+                feedback = Some(format!("{error:#}"));
+                last_error = error;
+            }
+        }
+    }
+
+    Err(last_error)
 }
 
 /// No `minLength`, for the same reason as `groups_schema`: keywords outside
@@ -590,8 +624,58 @@ fn parse_draft(raw: &str) -> Result<PrDraft> {
     Ok(draft)
 }
 
-/// Builds a serviceable pull request without AI: the template (or a summary
-/// heading) plus the branch's commits.
+/// Refuses the two template failures Kite can identify without guessing at a
+/// repository's Markdown conventions: the raw template, or the same skeleton
+/// after its HTML instructions were removed. Everything else is left to the
+/// prompt so required legal text and machine markers remain valid.
+fn validate_draft_against_template(
+    draft: &PrDraft,
+    template: Option<&Guidance>,
+    existing: Option<&ExistingPr>,
+) -> Result<()> {
+    // The refresh prompt explicitly permits a verbatim no-op. Validate only
+    // revisions; the caller will recognize this match and skip `gh pr edit`.
+    if existing.is_some_and(|pr| drafts_match(draft, pr)) {
+        return Ok(());
+    }
+
+    let Some(template) = template else {
+        return Ok(());
+    };
+
+    let body = normalize_whitespace(&draft.body);
+    let raw_template = normalize_whitespace(&template.content);
+    let stripped_template = normalize_whitespace(&strip_html_comments(&template.content));
+
+    if (!raw_template.is_empty() && body == raw_template)
+        || (!stripped_template.is_empty() && body == stripped_template)
+    {
+        anyhow::bail!("Model reply left the PR template unfilled");
+    }
+
+    Ok(())
+}
+
+fn strip_html_comments(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(start) = rest.find("<!--") {
+        stripped.push_str(&rest[..start]);
+        let after_open = &rest[start + 4..];
+        let Some(end) = after_open.find("-->") else {
+            return stripped;
+        };
+        stripped.push('\n');
+        rest = &after_open[end + 3..];
+    }
+    stripped.push_str(rest);
+    stripped
+}
+
+/// Builds a truthful pull request without AI. Arbitrary template sections
+/// cannot be filled safely from commit subjects alone, so use those subjects
+/// as a clean summary instead of uploading placeholders or unchecked claims.
 fn fallback_draft(context: &PrContext) -> PrDraft {
     let title = if context.commits.len() == 1 {
         context.commits[0].clone()
@@ -599,11 +683,7 @@ fn fallback_draft(context: &PrContext) -> PrDraft {
         humanize_branch(&context.branch)
     };
 
-    let mut body = match &context.template {
-        Some(template) => format!("{}\n\n", template.content.trim()),
-        None => "## Summary\n\n".to_string(),
-    };
-    body.push_str("### Commits\n");
+    let mut body = "## Summary\n\n".to_string();
     for subject in &context.commits {
         body.push_str(&format!("- {subject}\n"));
     }
@@ -666,7 +746,9 @@ fn gh_pr_create(draft: &PrDraft, base: &str, as_draft: bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TempDir, write_file};
+    use crate::test_support::{
+        TempDir, acquire_cwd_lock, git, init_repo, with_repo_cwd, write_file,
+    };
 
     fn context(template: Option<Guidance>, commits: Vec<&str>) -> PrContext {
         PrContext {
@@ -828,6 +910,64 @@ mod tests {
     }
 
     #[test]
+    fn template_validation_rejects_raw_and_comment_stripped_skeletons() {
+        let template = Guidance {
+            label: ".github/pull_request_template.md".to_string(),
+            content: "## Summary\n<!-- Describe the change. -->\n\n## Testing\n<!-- List verification. -->"
+                .to_string(),
+        };
+        let raw = PrDraft {
+            title: "feat: add webhooks".to_string(),
+            body: template.content.clone(),
+        };
+        let stripped = PrDraft {
+            title: "feat: add webhooks".to_string(),
+            body: "## Summary\n\n## Testing".to_string(),
+        };
+
+        assert!(validate_draft_against_template(&raw, Some(&template), None).is_err());
+        assert!(validate_draft_against_template(&stripped, Some(&template), None).is_err());
+    }
+
+    #[test]
+    fn template_validation_accepts_filled_sections_and_fixed_boilerplate() {
+        let template = Guidance {
+            label: ".github/pull_request_template.md".to_string(),
+            content: "By submitting, I agree to the contributor terms.\n\n## Summary\n<!-- Describe the change. -->\n<!-- codecov: keep -->"
+                .to_string(),
+        };
+        let filled = PrDraft {
+            title: "feat: add webhooks".to_string(),
+            body: "By submitting, I agree to the contributor terms.\n\n## Summary\n\nAdds signed webhook delivery.\n\n<!-- codecov: keep -->"
+                .to_string(),
+        };
+
+        assert!(validate_draft_against_template(&filled, Some(&template), None).is_ok());
+    }
+
+    #[test]
+    fn template_validation_allows_an_unchanged_existing_body() {
+        let template = Guidance {
+            label: ".github/pull_request_template.md".to_string(),
+            content: "## Summary\n\n## Follow-up".to_string(),
+        };
+        let existing = ExistingPr {
+            url: "https://example.com/pull/1".to_string(),
+            title: "feat: add webhooks".to_string(),
+            body: template.content.clone(),
+            base: "main".to_string(),
+        };
+        let unchanged = PrDraft {
+            title: existing.title.clone(),
+            body: existing.body.clone(),
+        };
+
+        assert!(
+            validate_draft_against_template(&unchanged, Some(&template), Some(&existing)).is_ok()
+        );
+    }
+
+    #[test]
     fn fallback_draft_uses_single_commit_subject_as_title() {
         let draft = fallback_draft(&context(None, vec!["feat(api): add webhooks"]));
 
@@ -837,17 +977,64 @@ mod tests {
     }
 
     #[test]
-    fn fallback_draft_keeps_template_and_humanizes_branch_for_title() {
+    fn fallback_draft_never_copies_an_unfilled_template() {
         let template = Guidance {
             label: ".github/pull_request_template.md".to_string(),
-            content: "## Checklist\n- [ ] Tests\n".to_string(),
+            content: "## Summary\n<!-- Describe the change. -->\n\n## Testing\n<!-- List verification. -->\n\n## Screenshots\n<!-- Add screenshots. -->\n".to_string(),
         };
         let draft = fallback_draft(&context(Some(template), vec!["feat: one", "fix: two"]));
 
         assert_eq!(draft.title, "Add webhooks");
-        assert!(draft.body.starts_with("## Checklist"));
-        assert!(draft.body.contains("- feat: one"));
-        assert!(draft.body.contains("- fix: two"));
+        assert_eq!(draft.body, "## Summary\n\n- feat: one\n- fix: two\n");
+        assert!(!draft.body.contains("<!--"));
+        assert!(!draft.body.contains("## Screenshots"));
+    }
+
+    #[test]
+    fn handwritten_commit_populates_the_no_ai_draft() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let base = git(&repo.path, &["branch", "--show-current"])
+            .trim()
+            .to_string();
+
+        write_file(
+            &repo.path,
+            ".github/PULL_REQUEST_TEMPLATE.md",
+            "## Summary\n<!-- Describe the change. -->\n\n## Testing\n<!-- List verification. -->\n",
+        );
+        git(&repo.path, &["add", ".github/PULL_REQUEST_TEMPLATE.md"]);
+        git(
+            &repo.path,
+            &["commit", "-m", "chore: add pull request template"],
+        );
+
+        git(&repo.path, &["checkout", "-b", "feat/manual-webhooks"]);
+        write_file(&repo.path, "src/api.rs", "pub fn verify_signature() {}\n");
+        git(&repo.path, &["add", "src/api.rs"]);
+        git(
+            &repo.path,
+            &["commit", "-m", "feat(api): validate webhook signatures"],
+        );
+
+        let context = with_repo_cwd(&repo.path, || {
+            collect_pr_context("feat/manual-webhooks".to_string(), base)
+        })
+        .expect("PR context should include a hand-written commit");
+        let draft = fallback_draft(&context);
+
+        assert_eq!(
+            context.commits,
+            vec!["feat(api): validate webhook signatures"]
+        );
+        assert!(context.diff.contains("src/api.rs"));
+        assert_eq!(draft.title, "feat(api): validate webhook signatures");
+        assert_eq!(
+            draft.body,
+            "## Summary\n\n- feat(api): validate webhook signatures\n"
+        );
+        assert!(!draft.body.contains("Describe the change"));
+        assert!(!draft.body.contains("## Testing"));
     }
 
     #[test]
