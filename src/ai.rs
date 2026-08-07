@@ -566,7 +566,8 @@ mod tests {
         assert!(mentions_format_rejection(body));
 
         // An unrelated 400 must not trigger the JSON-object fallback.
-        let unrelated = r#"{"error":{"message":"Invalid schema for response_format 'commit_groups'."}}"#;
+        let unrelated =
+            r#"{"error":{"message":"Invalid schema for response_format 'commit_groups'."}}"#;
         assert!(!mentions_format_rejection(unrelated));
     }
 
