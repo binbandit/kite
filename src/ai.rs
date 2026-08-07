@@ -93,17 +93,27 @@ async fn ask_openai(request: &Request<'_>) -> Result<String> {
     let responses_url = format!("{}/responses", base_url.trim_end_matches('/'));
 
     // Prefer the native strict-schema format: OpenAI enforces it server-side.
-    match send_responses(&responses_url, &api_key, timeout, strict_schema_body(&model, request))
-        .await
+    match send_responses(
+        &responses_url,
+        &api_key,
+        timeout,
+        strict_schema_body(&model, request),
+    )
+    .await
     {
         Err(failure) if failure.rejects_native_schema() => {
             // Some gateway providers (notably Bedrock-hosted Anthropic) reject
             // the `format` field outright. Fall back to a schema-less JSON reply
             // and describe the shape in the prompt instead; `extract_json_block`
             // tolerates the fenced or prose-wrapped output that results.
-            send_responses(&responses_url, &api_key, timeout, json_object_body(&model, request))
-                .await
-                .map_err(Into::into)
+            send_responses(
+                &responses_url,
+                &api_key,
+                timeout,
+                json_object_body(&model, request),
+            )
+            .await
+            .map_err(Into::into)
         }
         other => other.map_err(Into::into),
     }
