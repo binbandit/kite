@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 use crate::ai::{self, extract_json_block};
 use crate::git::{
-    SAVE_PREFIX, check_ref, current_branch_name, execute_git, get_default_branch, has_remote,
+    SAVE_PREFIX, branch_to_publish, check_ref, execute_git, get_default_branch, has_remote,
     kite_save_stack, repo_root,
 };
 use crate::land::publish_current_branch;
@@ -85,6 +85,9 @@ struct PrContext {
 }
 
 pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
+    // A detached HEAD cannot become a PR head branch. Check this before `gh`
+    // auth or remote setup so the actionable local diagnosis is never masked.
+    let branch = branch_to_publish()?;
     ensure_gh_ready()?;
     if !has_remote() {
         anyhow::bail!(
@@ -92,7 +95,6 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
         );
     }
 
-    let branch = current_branch_name()?;
     let base = match options.base {
         Some(base) => base,
         None => get_default_branch()?,

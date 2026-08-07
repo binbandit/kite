@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -70,6 +72,39 @@ pub(crate) fn repo_root() -> Result<PathBuf> {
 
 pub(crate) fn is_inside_git_repository() -> Result<bool> {
     Ok(find_repo_root()?.is_some())
+}
+
+/// An advisory lock held for one complete Kite command in this worktree.
+/// Atomic refs serialize repository-wide marker transitions, while this lock
+/// closes the smaller race where a second `kt undo` could otherwise recover a
+/// live land owned by the same worktree.
+#[derive(Debug)]
+pub(crate) struct WorktreeCommandLock(File);
+
+impl Drop for WorktreeCommandLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
+pub(crate) fn lock_current_worktree() -> Result<WorktreeCommandLock> {
+    let lock_path = PathBuf::from(current_worktree_key()?).join("kite-command.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "Could not open Kite's worktree lock at {}",
+                lock_path.display()
+            )
+        })?;
+    file.try_lock_exclusive().with_context(|| {
+        "Another Kite command is already running in this worktree. Wait for it to finish, then retry."
+    })?;
+    Ok(WorktreeCommandLock(file))
 }
 
 fn git_command() -> Result<Command> {
@@ -324,26 +359,129 @@ pub(crate) fn has_head_commit() -> bool {
     check_ref("HEAD").is_some()
 }
 
-/// The checked-out branch, or an error when HEAD is detached.
+/// Where `HEAD` points.
 ///
 /// Deliberately the only way to ask. `rev-parse --abbrev-ref HEAD` answers
-/// "HEAD" when detached, and every caller then treated that as a branch name:
-/// `kt land` rewrote history and only failed at `git branch -f HEAD`, and
-/// `kt publish` would have pushed a remote branch literally called HEAD.
-/// Every command that rewrites or publishes history needs a real branch, and
-/// finding out afterwards leaves the user stranded.
-pub(crate) fn current_branch_name() -> Result<String> {
-    let branch = execute_git(&["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map(|output| output.trim().to_string())
-        .unwrap_or_default();
+/// "HEAD" when detached, and callers that took that for a branch name went on
+/// to rewrite history and fail at `git branch -f HEAD`, or push a remote
+/// branch literally called HEAD. Making the two cases distinct types means a
+/// caller has to say which one it can handle: `kt land` and `kt undo` move
+/// `HEAD` itself and work either way, while the commands that push ask for a
+/// branch with `branch_to_publish`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Head {
+    Branch(String),
+    Detached(String),
+}
 
-    if branch.is_empty() {
-        anyhow::bail!(
-            "HEAD is detached, so there is no branch to update. Switch to a branch first with `git switch <branch>`."
-        );
+/// How a detached `HEAD` is recorded as a land's target. Ref names cannot
+/// contain spaces, so this can never collide with a branch name.
+pub(crate) const DETACHED_TARGET: &str = "(detached HEAD)";
+
+impl Head {
+    /// Stable kind of target recorded by a land. Deliberately excludes the
+    /// commit: a land moves `HEAD`, so the sha is not stable. Detached targets
+    /// are paired with `current_worktree_key` to identify the exact checkout.
+    pub(crate) fn land_key(&self) -> String {
+        match self {
+            Head::Branch(branch) => branch.clone(),
+            Head::Detached(_) => DETACHED_TARGET.to_string(),
+        }
     }
 
-    Ok(branch)
+    /// How this position reads in a message. A detached `HEAD` has no name of
+    /// its own, so it is described by the commit it sits on.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Head::Branch(branch) => format!("`{branch}`"),
+            Head::Detached(sha) => format!("the detached HEAD at {}", short_sha(sha)),
+        }
+    }
+}
+
+pub(crate) fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+/// Where `HEAD` points, or an error when it cannot be resolved at all.
+///
+/// An unborn branch reads as `Head::Branch`: git knows the name, it just has
+/// no commit yet, which is exactly what `kt undo` needs to unmake a root save.
+pub(crate) fn head_position() -> Result<Head> {
+    if let Some(symbolic_ref) = head_symbolic_ref()
+        && let Some(branch) = symbolic_ref.strip_prefix("refs/heads/")
+        && !branch.is_empty()
+    {
+        return Ok(Head::Branch(branch.to_string()));
+    }
+
+    let sha = execute_git(&["rev-parse", "HEAD"])
+        .context("Could not resolve HEAD. Make an initial commit first.")?;
+    Ok(Head::Detached(sha.trim().to_string()))
+}
+
+/// The exact ref to which `HEAD` is symbolic, including Kite's temporary
+/// transaction branch. Ordinary callers should use `head_position`; recovery
+/// needs the full ref so it can prove HEAD is still on the transaction it owns.
+pub(crate) fn head_symbolic_ref() -> Option<String> {
+    execute_git(&["symbolic-ref", "--quiet", "HEAD"])
+        .ok()
+        .map(|output| output.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+/// The checked-out branch, or an error when `HEAD` is detached.
+///
+/// Only for the commands that push. `git push` has to be told which remote ref
+/// to write and a detached `HEAD` supplies no name, so `kt publish` and `kt pr`
+/// need a real branch — and finding that out after a rewrite would leave the
+/// user stranded. Everything else uses `head_position` and works detached.
+pub(crate) fn branch_to_publish() -> Result<String> {
+    match head_position()? {
+        Head::Branch(branch) => Ok(branch),
+        Head::Detached(sha) => anyhow::bail!(
+            "HEAD is detached at {}, so there is no branch to push. Create one with `git switch -c <name>`, then try again.",
+            short_sha(&sha)
+        ),
+    }
+}
+
+/// Stable identity for this checkout, including linked worktrees.
+///
+/// Atomic rollback metadata is repository-wide, so a detached marker needs
+/// this extra identity to distinguish one linked worktree from another. Git
+/// gives each worktree its own administrative directory even when several
+/// point at detached commits.
+pub(crate) fn current_worktree_key() -> Result<String> {
+    let git_dir = execute_git(&["rev-parse", "--absolute-git-dir"])?;
+    let git_dir = git_dir.trim();
+    if git_dir.is_empty() {
+        anyhow::bail!("Could not identify the current Git worktree.");
+    }
+    Ok(git_dir.to_string())
+}
+
+/// Names an unfinished Git operation in this worktree, if there is one.
+///
+/// A clean index does not mean Git is idle: an interactive rebase, bisect, or
+/// no-conflict cherry-pick can all leave `HEAD` detached without any unmerged
+/// paths. Kite must not mistake that temporary checkout for an ordinary
+/// detached worktree and start its own history rewrite on top of it.
+pub(crate) fn active_git_operation() -> Result<Option<&'static str>> {
+    let git_dir = PathBuf::from(current_worktree_key()?);
+    let markers = [
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase or am"),
+        ("MERGE_HEAD", "merge"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+        ("BISECT_START", "bisect"),
+        ("sequencer", "sequenced cherry-pick or revert"),
+    ];
+
+    Ok(markers
+        .into_iter()
+        .find_map(|(path, operation)| git_dir.join(path).exists().then_some(operation)))
 }
 
 /// The checked-out branch read straight from `.git/HEAD`, with no subprocess.
@@ -351,7 +489,7 @@ pub(crate) fn current_branch_name() -> Result<String> {
 /// `kt` runs constantly, so a spawn on its path is a cost users feel on every
 /// save. Returns `None` for a detached HEAD or any layout this cannot read —
 /// callers must treat that as "don't know", never as a branch name. Anything
-/// that rewrites or publishes history uses `current_branch_name` instead.
+/// that rewrites or publishes history uses `head_position` instead.
 pub(crate) fn head_branch_hint() -> Option<String> {
     let root = find_repo_root().ok()??;
 
@@ -394,9 +532,8 @@ pub(crate) fn is_save_subject(subject: &str) -> bool {
     subject.trim_start().starts_with(SAVE_PREFIX)
 }
 
-/// Local repository config, used to remember which branch a land belongs to.
-/// Config handles every branch name; a `refs/kite/pre_land/<branch>` ref
-/// would hit directory/file conflicts for names like `feat` and `feat/x`.
+/// Reads legacy local marker config written by Kite versions before rollback
+/// state moved into one atomic ref-backed object.
 pub(crate) fn config_get(key: &str) -> Option<String> {
     let output = git_command()
         .ok()?
@@ -413,12 +550,11 @@ pub(crate) fn config_get(key: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-pub(crate) fn config_set(key: &str, value: &str) -> Result<()> {
-    execute_git_quiet(&["config", "--local", key, value])
-}
-
-pub(crate) fn config_unset(key: &str) {
-    let _ = execute_git_quiet(&["config", "--local", "--unset", key]);
+pub(crate) fn config_unset(key: &str) -> Result<()> {
+    if config_get(key).is_none() {
+        return Ok(());
+    }
+    execute_git_quiet(&["config", "--local", "--unset", key])
 }
 
 /// True when `ancestor` is reachable from `descendant`, i.e. pushing
@@ -652,6 +788,86 @@ mod tests {
         assert!(!has_staged_changes(" M src/main.rs\n"));
         assert!(!has_staged_changes("?? scratch.txt\n"));
         assert!(!has_staged_changes(" M src/main.rs\n?? scratch.txt\n"));
+    }
+
+    #[test]
+    fn worktree_command_lock_rejects_a_second_live_command() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        let first = with_repo_cwd(&repo.path, lock_current_worktree)
+            .expect("first command should acquire the worktree lock");
+        let error = with_repo_cwd(&repo.path, lock_current_worktree)
+            .expect_err("a second live command must be rejected");
+        assert!(format!("{error:#}").contains("Another Kite command"));
+
+        drop(first);
+        with_repo_cwd(&repo.path, lock_current_worktree)
+            .expect("the lock should be released when the command exits");
+    }
+
+    #[test]
+    fn head_position_names_a_branch_and_reports_a_detached_commit() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let branch = git(&repo.path, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .trim()
+            .to_string();
+        let sha = git(&repo.path, &["rev-parse", "HEAD"]).trim().to_string();
+
+        assert_eq!(
+            with_repo_cwd(&repo.path, head_position).expect("HEAD should resolve"),
+            Head::Branch(branch.clone())
+        );
+        assert_eq!(
+            with_repo_cwd(&repo.path, branch_to_publish).expect("a branch should be publishable"),
+            branch
+        );
+
+        git(&repo.path, &["checkout", "-q", "--detach"]);
+
+        assert_eq!(
+            with_repo_cwd(&repo.path, head_position).expect("a detached HEAD should resolve"),
+            Head::Detached(sha.clone())
+        );
+
+        // Nothing to name in a `git push`, and the message has to say which
+        // commit the user is sitting on to be worth anything.
+        let err = with_repo_cwd(&repo.path, branch_to_publish)
+            .expect_err("a detached HEAD has no branch to push");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(&short_sha(&sha)));
+        assert!(rendered.contains("git switch -c"));
+    }
+
+    /// Git knows the branch name before the first commit exists, and `kt undo`
+    /// relies on that to make a branch unborn again after a root save.
+    #[test]
+    fn head_position_reads_an_unborn_branch_as_a_branch() {
+        let _lock = acquire_cwd_lock();
+        let repo = crate::test_support::TempDir::new("kite-test-unborn");
+        git(&repo.path, &["init", "-q"]);
+
+        let expected = git(&repo.path, &["symbolic-ref", "--short", "HEAD"])
+            .trim()
+            .to_string();
+
+        assert_eq!(
+            with_repo_cwd(&repo.path, head_position).expect("an unborn HEAD should resolve"),
+            Head::Branch(expected)
+        );
+    }
+
+    #[test]
+    fn a_detached_land_key_cannot_be_mistaken_for_a_branch() {
+        assert_eq!(Head::Branch("feat/x".to_string()).land_key(), "feat/x");
+        assert_eq!(
+            Head::Detached("0123456789abcdef".to_string()).land_key(),
+            DETACHED_TARGET
+        );
+        // Ref names cannot contain spaces, which is the whole reason this marker
+        // is safe to store in the same config key as a branch name.
+        assert!(DETACHED_TARGET.contains(' '));
     }
 
     #[test]

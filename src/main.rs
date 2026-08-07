@@ -16,11 +16,11 @@ use colored::*;
 use std::process::ExitCode;
 
 use crate::git::{
-    SAVE_PREFIX, check_ref, execute_git, execute_git_quiet, get_default_branch, has_remote,
-    has_staged_changes, has_unmerged_paths, is_inside_git_repository, is_staged_status_line,
-    kite_save_stack,
+    SAVE_PREFIX, active_git_operation, check_ref, execute_git, execute_git_quiet,
+    get_default_branch, has_remote, has_staged_changes, has_unmerged_paths,
+    is_inside_git_repository, is_staged_status_line, kite_save_stack, lock_current_worktree,
 };
-use crate::land::{heal_interrupted_land, land, publish_current_branch, undo};
+use crate::land::{land, publish_current_branch, recovery_blocks_commands, undo};
 use crate::pr::{PrOptions, create_pull_request};
 use crate::ui::{Spinner, pluralize};
 
@@ -91,8 +91,16 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     let inside_repo = is_inside_git_repository()?;
-    if inside_repo {
-        heal_interrupted_land();
+    let _command_lock = if inside_repo {
+        Some(lock_current_worktree()?)
+    } else {
+        None
+    };
+    let interrupted_land = inside_repo && recovery_blocks_commands()?;
+    if interrupted_land && !matches!(&cli.command, Some(Commands::Undo)) {
+        anyhow::bail!(
+            "A `kt land` was interrupted in this worktree. Run `kt undo` to recover its saves before doing anything else."
+        );
     }
 
     match cli.command {
@@ -128,6 +136,10 @@ fn render_help() -> String {
 }
 
 fn save() -> Result<()> {
+    if let Some(operation) = active_git_operation()? {
+        anyhow::bail!("Git has a {operation} in progress. Finish or abort it before running `kt`.");
+    }
+
     // -uall lists files inside untracked directories, so the count is honest.
     let status = execute_git(&["status", "--porcelain", "-uall"])?;
 
@@ -171,6 +183,12 @@ fn save() -> Result<()> {
 }
 
 fn go(name: &str) -> Result<()> {
+    if let Some(operation) = active_git_operation()? {
+        anyhow::bail!(
+            "Git has a {operation} in progress. Finish or abort it before running `kt go`."
+        );
+    }
+
     let local_ref = format!("refs/heads/{name}");
     if check_ref(&local_ref).is_some() {
         execute_git(&["checkout", name])?;
@@ -379,7 +397,37 @@ mod tests {
             .output();
 
         let err = run_save_in_repo(&repo.path).expect_err("save should refuse a conflicted tree");
-        assert!(format!("{err:#}").contains("unresolved merge conflicts"));
+        assert!(format!("{err:#}").contains("merge in progress"));
+    }
+
+    #[test]
+    fn dispatch_blocks_an_incomplete_recovery_marker_before_saving() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let head_before = git(&repo.path, &["rev-parse", "HEAD"]);
+        let branch = git(&repo.path, &["branch", "--show-current"]);
+        write_file(&repo.path, "tracked.txt", "must stay uncommitted\n");
+
+        // A pre-atomic interrupted marker with no owner is ambiguous. The
+        // default command must stop at dispatch rather than creating another
+        // save on top of history it cannot safely classify.
+        git(
+            &repo.path,
+            &["update-ref", "refs/kite/pre_land", head_before.trim()],
+        );
+        git(
+            &repo.path,
+            &["config", "--local", "kite.preland.branch", branch.trim()],
+        );
+
+        let error = crate::test_support::with_repo_cwd(&repo.path, || run(Cli { command: None }))
+            .expect_err("an incomplete marker must stop command dispatch");
+        assert!(format!("{error:#}").contains("rollback marker is incomplete"));
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), head_before);
+        assert!(
+            git(&repo.path, &["status", "--porcelain"]).contains("tracked.txt"),
+            "the pending edit was unexpectedly committed"
+        );
     }
 
     #[test]
