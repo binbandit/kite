@@ -270,7 +270,12 @@ enum StageOp {
     WholeFiles(Vec<String>),
 }
 
-pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> Result<()> {
+pub(crate) async fn land(
+    push: bool,
+    auto_confirm: bool,
+    allow_dirty: bool,
+    tag: Option<String>,
+) -> Result<()> {
     let Some(status) = land_preflight(push)? else {
         return Ok(());
     };
@@ -292,7 +297,7 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
         let synthesized = synthesize_groups(&scope.units).await;
         spinner.stop();
 
-        let commits = match synthesized {
+        let mut commits = match synthesized {
             Ok(raw_groups) => {
                 let groups = normalize_groups(raw_groups, &scope.units);
                 if groups.is_empty() {
@@ -317,6 +322,12 @@ pub(crate) async fn land(push: bool, auto_confirm: bool, allow_dirty: bool) -> R
                 )]
             }
         };
+
+        if let Some(tag) = tag.as_deref().filter(|s| !s.trim().is_empty()) {
+            for commit in &mut commits {
+                commit.message = append_tag_to_message(&commit.message, tag);
+            }
+        }
 
         print!("{}", render_land_plan(&commits, scope.save_count));
 
@@ -1335,6 +1346,39 @@ fn whole_files_commit(message: String, files: Vec<String>) -> LandCommit {
 /// Renders the proposed history as a numbered list of commits, each with a
 /// small file tree underneath. Files split across commits show how many of
 /// their hunks each commit takes and which parts they are.
+fn append_tag_to_message(message: &str, tag: &str) -> String {
+    let tag_token = tag.trim();
+    if tag_token.is_empty() {
+        return message.to_string();
+    }
+
+    let mut lines = message.lines();
+    let first = lines.next().unwrap_or("").trim_end();
+
+    // Allocate the suffix once; only allocate/join the body when it exists.
+    let suffix = format!(" [{tag_token}]");
+    if first.ends_with(&suffix) {
+        return message.to_string();
+    }
+
+    let new_first = if first.is_empty() {
+        format!("[{tag_token}]")
+    } else {
+        format!("{first}{suffix}")
+    };
+
+    // If there is no body, we're done.
+    let Some(first_body_line) = lines.next() else {
+        return new_first;
+    };
+
+    let mut rest_lines = Vec::new();
+    rest_lines.push(first_body_line);
+    rest_lines.extend(lines.collect::<Vec<_>>());
+
+    format!("{new_first}\n{}", rest_lines.join("\n"))
+}
+
 fn render_land_plan(commits: &[LandCommit], save_count: usize) -> String {
     let mut plan = format!(
         "{} Plan: {} {} {}\n\n",
@@ -2112,6 +2156,27 @@ mod tests {
         );
         git(repo, &["add", "code.txt"]);
         git(repo, &["commit", "-m", "[kite] save 12:00:00"]);
+    }
+
+    #[test]
+    fn append_tag_to_message_appends_suffix() {
+        assert_eq!(append_tag_to_message("feat: add thing", "PROJ-123"), "feat: add thing [PROJ-123]");
+    }
+
+    #[test]
+    fn append_tag_to_message_is_idempotent() {
+        assert_eq!(
+            append_tag_to_message("feat: add thing [PROJ-123]", "PROJ-123"),
+            "feat: add thing [PROJ-123]"
+        );
+    }
+
+    #[test]
+    fn append_tag_to_message_preserves_body() {
+        assert_eq!(
+            append_tag_to_message("feat: add thing\n\nBody line", "PROJ-123"),
+            "feat: add thing [PROJ-123]\n\nBody line"
+        );
     }
 
     #[test]

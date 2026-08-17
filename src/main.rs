@@ -60,6 +60,9 @@ enum Commands {
         /// Skip the confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Reference tag to append to landed commit titles (e.g. PROJ-123)
+        #[arg(short = 't', long)]
+        tag: Option<String>,
     },
     /// Publish the current branch after reviewing local history
     Publish,
@@ -114,7 +117,8 @@ fn run(cli: Cli) -> Result<()> {
             push,
             allow_dirty,
             yes,
-        }) => block_on(land(push, yes, allow_dirty)),
+            tag,
+        }) => block_on(land(push, yes, allow_dirty, tag)),
         Some(Commands::Publish) => publish_current_branch(),
         Some(Commands::Pr { draft, base, yes }) => {
             block_on(create_pull_request(PrOptions { draft, base, yes }))
