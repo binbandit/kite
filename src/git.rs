@@ -237,9 +237,21 @@ pub(crate) fn is_staged_status_line(line: &str) -> bool {
         .is_some_and(|status_code| status_code != ' ' && status_code != '?')
 }
 
-pub(crate) fn commit_git(message: &str) -> Result<()> {
+/// Whether a commit runs the repository's Git hooks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hooks {
+    Run,
+    Skip,
+}
+
+pub(crate) fn commit_git(message: &str, hooks: Hooks) -> Result<()> {
+    let mut args = vec!["commit", "-m", message];
+    if hooks == Hooks::Skip {
+        args.push("--no-verify");
+    }
+
     let output = git_command()?
-        .args(["commit", "-m", message])
+        .args(&args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

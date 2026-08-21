@@ -6,9 +6,9 @@ use std::collections::HashSet;
 
 use crate::ai::flatten_error;
 use crate::git::{
-    DETACHED_TARGET, Head, KiteBase, active_git_operation, apply_cached_patch, branch_to_publish,
-    check_ref, commit_git, config_get, config_unset, current_worktree_key, diff_for_base,
-    execute_git, execute_git_with, has_head_commit, has_remote, has_unmerged_paths,
+    DETACHED_TARGET, Head, Hooks, KiteBase, active_git_operation, apply_cached_patch,
+    branch_to_publish, check_ref, commit_git, config_get, config_unset, current_worktree_key,
+    diff_for_base, execute_git, execute_git_with, has_head_commit, has_remote, has_unmerged_paths,
     head_branch_hint, head_position, head_symbolic_ref, is_ancestor, is_save_subject,
     kite_save_stack, short_sha, subjects_missing_from_head,
 };
@@ -270,12 +270,23 @@ enum StageOp {
     WholeFiles(Vec<String>),
 }
 
-pub(crate) async fn land(
-    push: bool,
-    auto_confirm: bool,
-    allow_dirty: bool,
-    tag: Option<String>,
-) -> Result<()> {
+pub(crate) struct LandOptions {
+    pub(crate) push: bool,
+    pub(crate) yes: bool,
+    pub(crate) allow_dirty: bool,
+    pub(crate) tag: Option<String>,
+    pub(crate) hooks: Hooks,
+}
+
+pub(crate) async fn land(options: LandOptions) -> Result<()> {
+    let LandOptions {
+        push,
+        yes: auto_confirm,
+        allow_dirty,
+        tag,
+        hooks,
+    } = options;
+
     let Some(status) = land_preflight(push)? else {
         return Ok(());
     };
@@ -341,7 +352,7 @@ pub(crate) async fn land(
             return Ok(());
         }
 
-        execute_land(&scope.base, &commits)?;
+        execute_land(&scope.base, &commits, hooks)?;
 
         if push {
             println!("{} Landed", "✓".green());
@@ -1429,7 +1440,7 @@ fn render_land_plan(commits: &[LandCommit], save_count: usize) -> String {
     plan
 }
 
-fn execute_land(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
+fn execute_land(base: &KiteBase, commits: &[LandCommit], hooks: Hooks) -> Result<()> {
     if commits.is_empty() {
         anyhow::bail!("Refusing to land an empty plan — that would discard the saves.");
     }
@@ -1463,7 +1474,7 @@ fn execute_land(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
 
     if let Err(err) =
         prepare_landing_head(base, pre_land_sha.trim(), &transaction_ref).and_then(|_| {
-            create_commits(commits)?;
+            create_commits(commits, hooks)?;
             finalize_landed_head(&target, pre_land_sha.trim(), &transaction_ref)
         })
     {
@@ -2012,7 +2023,7 @@ fn prepare_landing_head(base: &KiteBase, pre_land_sha: &str, transaction_ref: &s
     Ok(())
 }
 
-fn create_commits(commits: &[LandCommit]) -> Result<()> {
+fn create_commits(commits: &[LandCommit], hooks: Hooks) -> Result<()> {
     for commit in commits {
         match &commit.stage {
             StageOp::Patch(patch) => apply_cached_patch(patch)?,
@@ -2022,7 +2033,7 @@ fn create_commits(commits: &[LandCommit]) -> Result<()> {
                 }
             }
         }
-        commit_git(&commit.message)?;
+        commit_git(&commit.message, hooks)?;
     }
 
     Ok(())
@@ -2093,7 +2104,7 @@ mod tests {
         base: &KiteBase,
         commits: &[LandCommit],
     ) -> Result<()> {
-        with_repo_cwd(repo, || execute_land(base, commits))
+        with_repo_cwd(repo, || execute_land(base, commits, Hooks::Run))
     }
 
     fn undo_in_repo(repo: &std::path::Path) -> Result<()> {
@@ -2139,6 +2150,19 @@ mod tests {
         }
     }
 
+    fn install_pre_commit_hook(repo: &std::path::Path, script: &str) {
+        write_file(repo, ".git/hooks/pre-commit", script);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                repo.join(".git/hooks/pre-commit"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("hook should be executable");
+        }
+    }
+
     /// Two edits far enough apart to produce two hunks in one file.
     fn save_two_hunk_change(repo: &std::path::Path) {
         write_file(
@@ -2160,7 +2184,10 @@ mod tests {
 
     #[test]
     fn append_tag_to_message_appends_suffix() {
-        assert_eq!(append_tag_to_message("feat: add thing", "PROJ-123"), "feat: add thing [PROJ-123]");
+        assert_eq!(
+            append_tag_to_message("feat: add thing", "PROJ-123"),
+            "feat: add thing [PROJ-123]"
+        );
     }
 
     #[test]
@@ -3451,6 +3478,7 @@ mod tests {
                     "feat: land nested change",
                     &["nested/feature.txt"],
                 )],
+                Hooks::Run,
             )
         })
         .expect("land should succeed from a nested directory");
@@ -3507,6 +3535,38 @@ mod tests {
     }
 
     #[test]
+    fn skipping_hooks_lands_history_a_pre_commit_hook_would_reject() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        write_file(&repo.path, "tracked.txt", "saved change\n");
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("scope")
+            .expect("saves");
+        let commits = [files_commit("feat: landed", &["tracked.txt"])];
+
+        install_pre_commit_hook(&repo.path, "#!/bin/sh\necho 'pre-commit: nope'\nexit 1\n");
+
+        // The negative control: without it the second land could pass for
+        // reasons that have nothing to do with hooks.
+        let error = execute_land_in_repo(&repo.path, &scope.base, &commits)
+            .expect_err("a rejecting hook should block an ordinary land");
+        assert!(format!("{error:#}").contains("Git hook blocked the commit"));
+
+        // The failed land put the saves back, so the same plan can be retried
+        // with hooks skipped.
+        with_repo_cwd(&repo.path, || {
+            execute_land(&scope.base, &commits, Hooks::Skip)
+        })
+        .expect("skipping hooks should land the same plan");
+
+        let landed = git(&repo.path, &["log", "-1", "--pretty=%s"]);
+        assert_eq!(landed.trim(), "feat: landed");
+    }
+
+    #[test]
     fn landing_removes_its_exact_temporary_branch() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
@@ -3517,18 +3577,10 @@ mod tests {
             .expect("saves");
 
         // A hook is the only way to observe the repository mid-land.
-        write_file(
+        install_pre_commit_hook(
             &repo.path,
-            ".git/hooks/pre-commit",
             "#!/bin/sh\ngit branch --format='%(refname:short)' >> .git/seen\n",
         );
-        let hook = repo.path.join(".git/hooks/pre-commit");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
-                .expect("hook should be executable");
-        }
 
         let groups = [group("feat: top", &["h1"]), group("feat: bottom", &["h2"])];
         let commits = with_repo_cwd(&repo.path, || {
