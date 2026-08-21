@@ -16,11 +16,11 @@ use colored::*;
 use std::process::ExitCode;
 
 use crate::git::{
-    SAVE_PREFIX, active_git_operation, check_ref, execute_git, execute_git_quiet,
-    get_default_branch, has_remote, has_staged_changes, has_unmerged_paths,
+    Hooks, SAVE_PREFIX, active_git_operation, check_ref, commit_git, execute_git,
+    execute_git_quiet, get_default_branch, has_remote, has_staged_changes, has_unmerged_paths,
     is_inside_git_repository, is_staged_status_line, kite_save_stack, lock_current_worktree,
 };
-use crate::land::{land, publish_current_branch, recovery_blocks_commands, undo};
+use crate::land::{LandOptions, land, publish_current_branch, recovery_blocks_commands, undo};
 use crate::pr::{PrOptions, create_pull_request};
 use crate::ui::{Spinner, pluralize};
 
@@ -63,6 +63,9 @@ enum Commands {
         /// Reference tag to append to landed commit titles (e.g. PROJ-123)
         #[arg(short = 't', long)]
         tag: Option<String>,
+        /// Skip Git hooks while creating the landed commits
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Publish the current branch after reviewing local history
     Publish,
@@ -118,7 +121,14 @@ fn run(cli: Cli) -> Result<()> {
             allow_dirty,
             yes,
             tag,
-        }) => block_on(land(push, yes, allow_dirty, tag)),
+            no_verify,
+        }) => block_on(land(LandOptions {
+            push,
+            yes,
+            allow_dirty,
+            tag,
+            hooks: if no_verify { Hooks::Skip } else { Hooks::Run },
+        })),
         Some(Commands::Publish) => publish_current_branch(),
         Some(Commands::Pr { draft, base, yes }) => {
             block_on(create_pull_request(PrOptions { draft, base, yes }))
@@ -176,7 +186,7 @@ fn save() -> Result<()> {
     };
 
     let msg = format!("{SAVE_PREFIX} {}", Local::now().format("%H:%M:%S"));
-    execute_git_quiet(&["commit", "-m", &msg, "--no-verify"])?;
+    commit_git(&msg, Hooks::Skip)?;
 
     println!(
         "{} {}",
