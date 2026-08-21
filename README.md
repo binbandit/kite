@@ -146,7 +146,7 @@ Synthesizes contiguous Kite quicksaves into a polished local history.
 - Verifies the hunk-level plan against a temporary index first; if the replayed commits would not reproduce your saved state bit-for-bit, Kite falls back to whole-file grouping.
 - Shows the proposed commit plan before rewriting anything.
 - Stores the pre-land `HEAD` in `refs/kite/pre_land` and updates the full rollback transaction atomically, so `kt undo` can restore it later without linked worktrees observing a half-written marker.
-- Creates normal `git commit`s, so hooks do run during landing.
+- Creates normal `git commit`s, so hooks do run during landing. Pass `--no-verify` to skip them.
 - Landing builds on one uniquely named temporary branch so ordinary Git hooks see a normal checkout. It records that exact ref, moves your branch with a compare-and-swap — or, if you were already detached, moves `HEAD` itself — and removes the temporary branch before returning.
 - If landing fails for any reason — a rejected pre-commit hook is the usual one — Kite undoes the attempt and leaves you exactly where you started: on your branch or your detached commit, saves intact, nothing staged, no branch to clean up. Fix the problem and run `kt land` again. Files a hook rewrote are kept as unstaged changes.
 - If landing is interrupted rather than failing — Ctrl-C, a crash, a closed terminal — the next `kt` command stops and asks you to run `kt undo`. Recovery is explicit because a worktree id alone cannot prove that a detached commit checked out later is still Kite's partial rewrite.
@@ -168,6 +168,17 @@ Land without a clean worktree:
 kt land --allow-dirty
 ```
 
+Land without running the commit hooks (`--push` still runs the pre-push hook):
+
+```bash
+kt land --no-verify
+```
+
+Tag every landed commit title with a reference:
+
+```bash
+kt land --tag PROJ-123
+```
 
 Land and publish in one step:
 

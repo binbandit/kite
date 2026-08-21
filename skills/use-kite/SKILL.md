@@ -41,7 +41,7 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 - A detached `HEAD` is fine for `kt`, `kt land`, and `kt undo` — they move `HEAD` itself. Only `kt publish`, `kt pr`, and `kt land --push` need a branch, so create one with `git switch -c <name>` when the user actually wants to push.
 - Kite refuses history-changing commands during an active rebase, merge, cherry-pick, revert, bisect, `git am`, or sequencer operation; finish or abort Git's operation first.
 - If landing falls back to manual mode, provide a commit message that matches the repo's existing style when possible.
-- If a landed commit is blocked by hooks, leave the staged changes intact and help fix the hook failure.
+- If a landed commit is blocked by hooks, leave the staged changes intact and help fix the hook failure. Only reach for `kt land --no-verify` when the user asks to bypass the hooks.
 - After running any Kite command, summarize what changed in the worktree, branch, and remote state.
 
 ## Reference

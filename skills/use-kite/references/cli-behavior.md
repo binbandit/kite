@@ -22,7 +22,7 @@
 - The normal recommended workflow is still to let Kite quicksave everything; staged-only quicksaves are an explicit override.
 - Pass `--no-verify`, so Git hooks do not run for quicksaves.
 
-### `kt land [--push] [--yes] [--allow-dirty]`
+### `kt land [--push] [--yes] [--allow-dirty] [--tag <tag>] [--no-verify]`
 
 - Require an existing `HEAD` commit. If the repo has no commits yet, Kite prints a warning and exits.
 - By default, require a clean working tree. If the user still has WIP changes, they should `kt` them first or stash them.
@@ -36,6 +36,8 @@
 - Show the proposed grouped commit plan before rewriting anything (split files are annotated like `(1/2 hunks)`); `--yes` skips only the confirmation prompt.
 - Record the pre-land `HEAD` at `refs/kite/pre_land`, and store the complete transaction phase, target, owner, and keepalive in one atomic compare-and-swap marker.
 - Build commits on one exact, transaction-owned temporary branch for hook compatibility, then delete only that recorded ref with its expected commit id.
+- Run the repository's commit hooks by default; `--no-verify` commits with `git commit --no-verify`, so the `pre-commit` and `commit-msg` hooks do not run. Landing never bypasses the `pre-push` hook — `--push` publishes normally.
+- `--tag <tag>` appends ` [<tag>]` to every landed commit title, skipping titles that already carry it.
 - If the process is interrupted mid-land, block further commands in that worktree until an explicit `kt undo` restores the recorded target and saves. Never infer ownership from detached `HEAD` alone.
 - Work on a detached `HEAD` too: leave the landed commits under `HEAD` itself and move no branch. `--push` needs a branch, so it is refused up front when `HEAD` is detached.
 - Refuse history-changing Kite commands while Git has a merge, rebase, cherry-pick, revert, bisect, `git am`, or sequencer operation in progress.
