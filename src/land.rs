@@ -152,6 +152,12 @@ fn pre_land_state() -> PreLandState {
 
     match (sha, target, landed_head, owner) {
         (None, None, None, None) => PreLandState::Empty { state_oid: None },
+        // A bare pointer with no branch, landed HEAD, or owner beside it
+        // records no land: there is no target to restore and no owner to
+        // restore it in. Versions before the atomic state ref left these
+        // behind on completion, and treating one as a broken marker bricked
+        // every later command in the repository, `kt undo` included.
+        (Some(_), None, None, None) => PreLandState::Empty { state_oid: None },
         (Some(pre_land_sha), Some(target), Some(landed_head), owner) => {
             PreLandState::Completed(RecordedLand {
                 state_oid: None,
@@ -1676,11 +1682,10 @@ impl PreLandMarker {
 
     fn stable(&self, legacy_keepalive_ref: &str) -> Result<(StableLand, Option<String>)> {
         let Some(recorded) = &self.recorded else {
-            if self.sha.is_none()
-                && self.branch.is_none()
-                && self.head.is_none()
-                && self.worktree.is_none()
-            {
+            // A bare `pre_land` pointer is not a marker either: with nothing
+            // recorded beside it there is no land to carry forward, and the
+            // install that follows overwrites the pointer itself.
+            if self.branch.is_none() && self.head.is_none() && self.worktree.is_none() {
                 return Ok((StableLand::Empty, None));
             }
             anyhow::bail!("Kite's previous rollback marker is incomplete");
@@ -2051,6 +2056,58 @@ mod tests {
         assert!(plan.contains("     └─ src/hooks.rs\n"));
         assert!(plan.contains("  2. docs: refresh readme\n"));
         assert!(plan.contains("     └─ README.md\n"));
+    }
+
+    /// The state a repository landed by a pre-atomic Kite is left in: a
+    /// pointer with nothing recorded beside it. It used to classify as a
+    /// broken marker, which blocked every command in the repository —
+    /// including the `kt undo` the error told you to run.
+    #[test]
+    fn a_bare_pre_land_pointer_does_not_block_commands() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let head = git(&repo.path, &["rev-parse", "HEAD"]);
+
+        git(&repo.path, &["update-ref", PRE_LAND_REF, head.trim()]);
+
+        let (state, blocks) = with_repo_cwd(&repo.path, || {
+            (pre_land_state(), recovery_blocks_commands())
+        });
+
+        assert!(matches!(state, PreLandState::Empty { .. }), "{state:?}");
+        assert!(!blocks.expect("a bare pointer must not fail the recovery check"));
+    }
+
+    #[test]
+    fn landing_replaces_a_bare_pre_land_pointer() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let stale = git(&repo.path, &["rev-parse", "HEAD"]).trim().to_string();
+        git(&repo.path, &["update-ref", PRE_LAND_REF, &stale]);
+
+        save_two_file_change(&repo.path);
+        let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit(
+                "feat: land over the stale pointer",
+                &["code.txt", "docs.txt"],
+            )],
+        )
+        .expect("a stale pointer must not stop a land");
+
+        // The pointer now describes this land, and `kt undo` can use it.
+        assert_eq!(
+            check_ref_in(&repo.path, PRE_LAND_REF).as_deref(),
+            Some(pre_land_sha.as_str())
+        );
+        undo_in_repo(&repo.path).expect("the landed history should undo");
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]).trim(), pre_land_sha);
     }
 
     #[test]
