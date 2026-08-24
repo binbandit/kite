@@ -186,7 +186,7 @@ Land and publish in one step:
 kt land --push
 ```
 
-### `kt publish`
+### `kt publish` (alias: `kt push`)
 
 Publishes the current branch after you review the rewritten local history.
 

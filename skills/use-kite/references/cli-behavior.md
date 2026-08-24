@@ -45,7 +45,7 @@
 - If `--push` is passed, publish immediately after a successful local land.
 - If AI misses files, they land in a final `chore: unclassified updates` commit rather than being dropped.
 
-### `kt publish`
+### `kt publish` (alias: `kt push`)
 
 - If no remote exists, print a note and exit successfully.
 - Require a branch: `git push` has to be told which remote ref to write, so a detached `HEAD` is refused with the commit it is on and a `git switch -c <name>` hint.
