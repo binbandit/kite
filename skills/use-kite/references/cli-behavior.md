@@ -22,7 +22,7 @@
 - The normal recommended workflow is still to let Kite quicksave everything; staged-only quicksaves are an explicit override.
 - Pass `--no-verify`, so Git hooks do not run for quicksaves.
 
-### `kt land [--push] [--yes] [--allow-dirty] [--tag <tag>] [--no-verify]`
+### `kt land [--push|-p] [--yes] [--allow-dirty] [--tag <tag>] [--no-verify]`
 
 - Require an existing `HEAD` commit. If the repo has no commits yet, Kite prints a warning and exits.
 - By default, require a clean working tree. If the user still has WIP changes, they should `kt` them first or stash them.

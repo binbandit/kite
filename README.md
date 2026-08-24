@@ -150,7 +150,7 @@ Synthesizes contiguous Kite quicksaves into a polished local history.
 - Landing builds on one uniquely named temporary branch so ordinary Git hooks see a normal checkout. It records that exact ref, moves your branch with a compare-and-swap — or, if you were already detached, moves `HEAD` itself — and removes the temporary branch before returning.
 - If landing fails for any reason — a rejected pre-commit hook is the usual one — Kite undoes the attempt and leaves you exactly where you started: on your branch or your detached commit, saves intact, nothing staged, no branch to clean up. Fix the problem and run `kt land` again. Files a hook rewrote are kept as unstaged changes.
 - If landing is interrupted rather than failing — Ctrl-C, a crash, a closed terminal — the next `kt` command stops and asks you to run `kt undo`. Recovery is explicit because a worktree id alone cannot prove that a detached commit checked out later is still Kite's partial rewrite.
-- Lands locally by default. Use `kt publish` afterward, or pass `--push` to publish immediately after landing.
+- Lands locally by default. Use `kt publish` afterward, or pass `--push` (`-p`) to publish immediately after landing.
 
 ```bash
 kt land
