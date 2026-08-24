@@ -52,7 +52,7 @@ enum Commands {
     /// Group Kite saves into reviewable local commits
     Land {
         /// Publish the rewritten branch after landing
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         push: bool,
         /// Preserve local worktree changes by stashing them while landing
         #[arg(long)]
@@ -443,6 +443,26 @@ mod tests {
             git(&repo.path, &["status", "--porcelain"]).contains("tracked.txt"),
             "the pending edit was unexpectedly committed"
         );
+    }
+
+    #[test]
+    fn land_takes_push_long_or_short() {
+        for spelling in [["kt", "land", "--push"], ["kt", "land", "-p"]] {
+            let Some(Commands::Land { push, .. }) = Cli::parse_from(spelling).command else {
+                panic!("`{}` should parse as land", spelling.join(" "));
+            };
+            assert!(push, "`{}` should set push", spelling.join(" "));
+        }
+
+        // The other land flags keep their own letters.
+        let Some(Commands::Land { push, yes, tag, .. }) =
+            Cli::parse_from(["kt", "land", "-y", "-t", "PROJ-1"]).command
+        else {
+            panic!("short flags should parse as land");
+        };
+        assert!(!push);
+        assert!(yes);
+        assert_eq!(tag.as_deref(), Some("PROJ-1"));
     }
 
     #[test]
