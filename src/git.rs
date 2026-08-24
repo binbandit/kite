@@ -628,7 +628,7 @@ pub(crate) fn check_ref(ref_name: &str) -> Option<String> {
 /// every path came from a save the user already made: one force-added past an
 /// ignore rule must still be able to land.
 pub(crate) fn stage_paths(paths: &[String]) -> Result<()> {
-    let mut pathspecs = String::new();
+    let mut pathspecs = String::with_capacity(paths.iter().map(|path| path.len() + 1).sum());
     for path in paths {
         pathspecs.push_str(path);
         pathspecs.push('\0');
@@ -648,77 +648,59 @@ pub(crate) fn stage_paths(paths: &[String]) -> Result<()> {
     .map(|_| ())
 }
 
-/// The exact paths a set of saves changed. NUL-separated (`-z`) because git
-/// otherwise C-quotes any path containing a quote, a backslash, or a newline,
-/// and a quoted path no longer names the file it came from.
-pub(crate) fn changed_paths_for_base(base: &KiteBase) -> Result<Vec<String>> {
-    let listed = match base {
-        KiteBase::Commit(hash) => {
-            let range = format!("{hash}..HEAD");
-            execute_git(&[
-                "diff",
-                "--no-ext-diff",
-                "--no-renames",
-                "--name-only",
-                "-z",
-                &range,
-            ])?
-        }
-        KiteBase::Root => execute_git(&[
-            "diff-tree",
-            "--root",
-            "--no-commit-id",
-            "-r",
-            "--no-renames",
-            "--name-only",
-            "-z",
-            "HEAD",
-        ])?,
+/// Runs one diff of `base` against `HEAD`, with `format` deciding what the
+/// output looks like.
+///
+/// `--no-renames` lives here rather than at the call sites so it cannot be
+/// applied to one and not the other. With rename detection on, `--name-only`
+/// reports a rename as the new path alone, and landing would stage that
+/// addition while leaving the old file sitting in the landed tree.
+fn diff_against_base(base: &KiteBase, format: &[&str]) -> Result<String> {
+    let (command, target) = match base {
+        KiteBase::Commit(hash) => (vec!["diff"], format!("{hash}..HEAD")),
+        // A root commit has no parent, so it takes the plumbing command that
+        // can diff against the empty tree.
+        KiteBase::Root => (
+            vec!["diff-tree", "--root", "--no-commit-id", "-r"],
+            "HEAD".to_string(),
+        ),
     };
 
-    Ok(listed
+    // core.quotepath=false keeps non-ASCII paths readable in the patch; `-z`
+    // makes it moot for the path list.
+    let mut args = vec!["-c", "core.quotepath=false"];
+    args.extend(command);
+    args.extend(["--no-ext-diff", "--no-renames"]);
+    args.extend(format);
+    args.push(&target);
+
+    execute_git(&args)
+}
+
+/// What a set of saves changed: the exact paths, and the diff explaining them.
+///
+/// They are fetched together because landing stages the paths while the model
+/// only reads the diff. Two independently flagged commands could describe
+/// different changes, and the paths are the half that decides what lands.
+pub(crate) fn saved_changes(base: &KiteBase) -> Result<(Vec<String>, String)> {
+    // NUL-separated: git otherwise C-quotes any path holding a quote, a
+    // backslash, or a newline, and escapes every non-ASCII one, none of which
+    // name the file they came from.
+    let listed = diff_against_base(base, &["--name-only", "-z"])?;
+    let paths = listed
         .split('\0')
         .filter(|path| !path.is_empty())
         .map(ToOwned::to_owned)
-        .collect())
-}
+        .collect();
 
-/// The diff Kite shows the model. It is only ever displayed, never parsed for
-/// paths, so these flags are here to keep it readable and independent of the
-/// user's diff configuration. `--no-renames` does more than that: it keeps
-/// this diff aligned with `changed_paths_for_base`, reading a rename as a
-/// deletion plus an addition rather than one section spanning two paths that
-/// could not be staged as a single whole file.
-pub(crate) fn diff_for_base(base: &KiteBase) -> Result<String> {
-    match base {
-        KiteBase::Commit(hash) => {
-            let range = format!("{hash}..HEAD");
-            execute_git(&[
-                "-c",
-                "core.quotepath=false",
-                "diff",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-renames",
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-                &range,
-            ])
-        }
-        KiteBase::Root => execute_git(&[
-            "-c",
-            "core.quotepath=false",
-            "diff-tree",
-            "--root",
-            "--no-commit-id",
-            "-r",
-            "-p",
-            "--no-renames",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            "HEAD",
-        ]),
-    }
+    // Explicit prefixes and colour off keep the patch in the shape the model
+    // expects whatever the user's diff configuration says.
+    let diff = diff_against_base(
+        base,
+        &["-p", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"],
+    )?;
+
+    Ok((paths, diff))
 }
 
 /// Best-effort style examples; an unreadable log just means no examples.
@@ -932,6 +914,88 @@ mod tests {
         // Ref names cannot contain spaces, which is the whole reason this marker
         // is safe to store in the same config key as a branch name.
         assert!(DETACHED_TARGET.contains(' '));
+    }
+
+    fn base_of(repo: &std::path::Path) -> KiteBase {
+        KiteBase::Commit(git(repo, &["rev-parse", "HEAD~1"]).trim().to_string())
+    }
+
+    /// The flag the whole file-level design rests on. With rename detection
+    /// on, `--name-only` reports only the new path, landing would never stage
+    /// the deletion, and the old file would survive into the landed tree.
+    #[test]
+    fn saved_changes_lists_both_paths_of_a_rename() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "old.txt", "one\ntwo\nthree\nfour\nfive\n");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "chore: add old"]);
+
+        git(&repo.path, &["mv", "old.txt", "new.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let (paths, diff) =
+            with_repo_cwd(&repo.path, || saved_changes(&base_of(&repo.path))).expect("diff");
+
+        assert_eq!(paths, ["new.txt", "old.txt"]);
+        assert!(!diff.contains("rename from"), "{diff}");
+    }
+
+    #[test]
+    fn saved_changes_reads_a_root_commit() {
+        let _lock = acquire_cwd_lock();
+        let repo = crate::test_support::init_root_kite_repo();
+
+        let (paths, diff) =
+            with_repo_cwd(&repo.path, || saved_changes(&KiteBase::Root)).expect("diff");
+
+        assert_eq!(paths, ["tracked.txt"]);
+        assert!(diff.contains("diff --git a/tracked.txt b/tracked.txt"));
+    }
+
+    #[test]
+    fn saved_changes_omits_a_file_added_and_deleted_across_saves() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let base = KiteBase::Commit(git(&repo.path, &["rev-parse", "HEAD"]).trim().to_string());
+
+        write_file(&repo.path, "scratch.txt", "temporary\n");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        std::fs::remove_file(repo.path.join("scratch.txt")).expect("file should be removed");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:01"]);
+
+        let (paths, diff) = with_repo_cwd(&repo.path, || saved_changes(&base)).expect("diff");
+
+        assert!(paths.is_empty(), "{paths:?}");
+        assert!(diff.is_empty(), "{diff}");
+    }
+
+    /// Users of difftastic and friends have `diff.external` set globally.
+    /// Without `--no-ext-diff` the model would be handed that tool's output
+    /// instead of a diff.
+    #[test]
+    fn saved_changes_ignores_a_configured_external_differ() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        git(&repo.path, &["config", "diff.external", "/bin/echo"]);
+
+        write_file(&repo.path, "tracked.txt", "changed\n");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let (paths, diff) =
+            with_repo_cwd(&repo.path, || saved_changes(&base_of(&repo.path))).expect("diff");
+
+        assert_eq!(paths, ["tracked.txt"]);
+        assert!(
+            diff.starts_with("diff --git a/tracked.txt b/tracked.txt"),
+            "{diff}"
+        );
+        assert!(diff.contains("+changed"), "{diff}");
     }
 
     #[test]
