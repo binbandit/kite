@@ -97,6 +97,15 @@ pub(crate) fn print_ai_unavailable(error: &anyhow::Error) {
     println!("  {}", flatten_error(&format!("{error:#}")).dimmed());
 }
 
+/// The dimmed tail line a capped list ends with, or `None` when the whole
+/// list was shown. Shared so every truncated list says the same thing.
+pub(crate) fn overflow_note(total: usize, shown: usize) -> Option<String> {
+    if total <= shown {
+        return None;
+    }
+    Some(format!("… and {} more", total - shown))
+}
+
 pub(crate) fn pluralize(count: usize, singular: &str) -> String {
     if count == 1 {
         format!("1 {singular}")
@@ -108,6 +117,13 @@ pub(crate) fn pluralize(count: usize, singular: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflow_note_appears_only_once_something_is_hidden() {
+        assert_eq!(overflow_note(3, 3), None);
+        assert_eq!(overflow_note(2, 3), None);
+        assert_eq!(overflow_note(4, 3), Some("… and 1 more".to_string()));
+    }
 
     #[test]
     fn pluralize_handles_singular_and_plural_counts() {
