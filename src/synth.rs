@@ -1,16 +1,15 @@
 //! Turns the diff introduced by Kite saves into a validated commit plan.
 //!
-//! The diff is split into labeled hunks (see `hunks`), and the model assigns
-//! every hunk id to exactly one commit — so one file's changes can land as
-//! several commits when they serve different purposes.
+//! The model assigns every changed file to exactly one commit, so each commit
+//! carries the complete change to the files it touches.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::ai::{self, extract_json_block};
+use crate::diff::ChangedFiles;
 use crate::git::{is_save_subject, recent_commit_style_examples};
-use crate::hunks::DiffUnits;
 
 const MAX_COMMIT_STYLE_EXAMPLES: usize = 6;
 const MAX_SYNTHESIS_ATTEMPTS: usize = 3;
@@ -20,8 +19,7 @@ pub(crate) const MAX_DIFF_BYTES: usize = 60_000;
 const FALLBACK_COMMIT_MESSAGE: &str = "chore: update";
 
 const SYSTEM_PROMPT: &str = "\
-You are an expert version control synthesis engine. Analyze the git diff, which is split into labeled hunks (h1, h2, ...). Some hunks represent a whole file that cannot be split.
-Group the hunks into distinct, atomic commits based on logical purpose. Hunks from the same file may go into different commits when they serve different purposes.
+You are an expert version control synthesis engine. Analyze the git diff and group the changed files into distinct, atomic commits based on logical purpose. Every file lands whole in exactly one commit.
 Write commit messages that match the repository's recent style examples when they show a clear pattern. If the examples are mixed or absent, fall back to a Conventional Commit style.
 
 Rules for commit messages:
@@ -32,22 +30,22 @@ Rules for commit messages:
 5. No trailing periods.
 6. Never emit `[kite] save` as a landed commit message.
 
-Rules for hunk assignment:
-1. Use only hunk ids that appear in the provided hunk list.
-2. Copy each hunk id exactly as provided.
-3. Assign every hunk id exactly once.
-4. Do not omit hunk ids.
-5. Do not duplicate hunk ids across groups.
+Rules for file assignment:
+1. Use only file paths that appear in the provided file list.
+2. Copy each path exactly as provided.
+3. Assign every path exactly once.
+4. Do not omit paths.
+5. Do not duplicate paths across groups.
 6. Keep interdependent changes (a definition and its call sites) in the same commit so every commit is coherent on its own.
 7. Order the groups so foundational changes come before the changes that depend on them.
 
 Return ONLY valid JSON. Absolutely no markdown or conversational text.
-Schema: { \"groups\": [ { \"message\": \"feat(auth): implement JWT validation\", \"hunks\": [\"h1\", \"h4\"] } ] }";
+Schema: { \"groups\": [ { \"message\": \"feat(auth): implement JWT validation\", \"files\": [\"src/auth.rs\", \"src/routes.rs\"] } ] }";
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGroup {
     pub(crate) message: String,
-    pub(crate) hunks: Vec<String>,
+    pub(crate) files: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -56,13 +54,12 @@ struct CommitGroupsEnvelope {
 }
 
 /// Asks the AI for a commit plan, feeding coverage problems back for another
-/// attempt. A reply that parses but leaves hunks unassigned is still accepted
+/// attempt. A reply that parses but leaves files unassigned is still accepted
 /// after the retries run out — `normalize_groups` sweeps the leftovers into a
 /// `chore: unclassified updates` commit, which beats dropping the user to a
-/// single manual commit message over one missed id.
-pub(crate) async fn synthesize_groups(units: &DiffUnits) -> Result<Vec<CommitGroup>> {
-    let unit_ids = units.unit_ids();
-    let input = build_synthesis_input(units);
+/// single manual commit message over one missed path.
+pub(crate) async fn synthesize_groups(files: &ChangedFiles) -> Result<Vec<CommitGroup>> {
+    let input = build_synthesis_input(files);
 
     let mut feedback: Option<String> = None;
     let mut last_parsed: Option<Vec<CommitGroup>> = None;
@@ -72,7 +69,7 @@ pub(crate) async fn synthesize_groups(units: &DiffUnits) -> Result<Vec<CommitGro
         let user = match &feedback {
             None => input.clone(),
             Some(problems) => format!(
-                "{input}\n\nYour previous reply was rejected: {problems}.\nReturn corrected JSON that assigns every hunk id from the list exactly once."
+                "{input}\n\nYour previous reply was rejected: {problems}.\nReturn corrected JSON that assigns every file path from the list exactly once."
             ),
         };
 
@@ -84,7 +81,7 @@ pub(crate) async fn synthesize_groups(units: &DiffUnits) -> Result<Vec<CommitGro
         };
 
         match ai::complete(&request, parse_groups).await {
-            Ok(groups) => match validate_group_coverage(&groups, &unit_ids) {
+            Ok(groups) => match validate_group_coverage(&groups, files.paths()) {
                 Ok(()) => return Ok(groups),
                 Err(error) => {
                     feedback = Some(format!("{error:#}"));
@@ -108,51 +105,39 @@ pub(crate) async fn synthesize_groups(units: &DiffUnits) -> Result<Vec<CommitGro
     last_parsed.map(Ok).unwrap_or(Err(last_error))
 }
 
-pub(crate) fn normalize_groups(groups: Vec<CommitGroup>, units: &DiffUnits) -> Vec<CommitGroup> {
-    let unit_ids = units.unit_ids();
-    let mut remaining: HashSet<String> = unit_ids.iter().cloned().collect();
+/// Keeps the plan to exactly the changed files, once each: unknown and
+/// duplicate paths are dropped, and anything the model left out lands in a
+/// visible catch-all commit rather than being silently lost.
+pub(crate) fn normalize_groups(groups: Vec<CommitGroup>, files: &ChangedFiles) -> Vec<CommitGroup> {
+    let mut remaining: HashSet<&str> = files.paths().iter().map(String::as_str).collect();
     let mut normalized = Vec::new();
 
     for group in groups {
-        let hunks: Vec<String> = group
-            .hunks
+        let assigned: Vec<String> = group
+            .files
             .into_iter()
-            .filter(|id| remaining.remove(id))
+            .filter(|path| remaining.remove(path.as_str()))
             .collect();
 
-        if !hunks.is_empty() {
+        if !assigned.is_empty() {
             normalized.push(CommitGroup {
                 message: sanitize_commit_message(&group.message),
-                hunks,
+                files: assigned,
             });
         }
     }
 
-    // A leftover hunk joins the only group already touching its file — the
-    // same commit file-level grouping would have chosen. Anything ambiguous
-    // lands in a visible catch-all commit instead of being dropped.
-    let mut unclassified = Vec::new();
-    for id in unit_ids.iter().filter(|id| remaining.contains(*id)) {
-        let path = units.path_for(id);
-        let owners: Vec<usize> = normalized
-            .iter()
-            .enumerate()
-            .filter(|(_, group)| {
-                path.is_some() && group.hunks.iter().any(|hunk| units.path_for(hunk) == path)
-            })
-            .map(|(index, _)| index)
-            .collect();
-
-        match owners[..] {
-            [owner] => normalized[owner].hunks.push(id.clone()),
-            _ => unclassified.push(id.clone()),
-        }
-    }
+    let unclassified: Vec<String> = files
+        .paths()
+        .iter()
+        .filter(|path| remaining.contains(path.as_str()))
+        .cloned()
+        .collect();
 
     if !unclassified.is_empty() {
         normalized.push(CommitGroup {
             message: "chore: unclassified updates".to_string(),
-            hunks: unclassified,
+            files: unclassified,
         });
     }
 
@@ -191,10 +176,10 @@ fn groups_schema() -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["message", "hunks"],
+                    "required": ["message", "files"],
                     "properties": {
                         "message": { "type": "string" },
-                        "hunks": {
+                        "files": {
                             "type": "array",
                             "items": { "type": "string" }
                         }
@@ -205,7 +190,7 @@ fn groups_schema() -> serde_json::Value {
     })
 }
 
-fn build_synthesis_input(units: &DiffUnits) -> String {
+fn build_synthesis_input(files: &ChangedFiles) -> String {
     let mut prompt = String::new();
     let examples = recent_commit_style_examples(MAX_COMMIT_STYLE_EXAMPLES);
 
@@ -219,38 +204,40 @@ fn build_synthesis_input(units: &DiffUnits) -> String {
         prompt.push('\n');
     }
 
-    prompt.push_str("Hunks (assign each id exactly once and copy ids verbatim):\n");
-    prompt.push_str(&units.render_unit_index());
+    prompt.push_str("Files (assign each path exactly once and copy paths verbatim):\n");
+    prompt.push_str(&files.render_index());
     prompt.push('\n');
 
-    prompt.push_str("Hunk contents (may be trimmed; rely on the hunk list for full coverage):\n");
-    let bodies = units.render_unit_bodies(MAX_DIFF_BYTES);
-    prompt.push_str(truncate_for_prompt(&bodies, MAX_DIFF_BYTES));
+    prompt.push_str("Diff (may be trimmed; rely on the file list for full coverage):\n");
+    prompt.push_str(truncate_for_prompt(
+        &files.render_diff(MAX_DIFF_BYTES),
+        MAX_DIFF_BYTES,
+    ));
     prompt
 }
 
-fn validate_group_coverage(groups: &[CommitGroup], unit_ids: &[String]) -> Result<()> {
-    let known: HashSet<&String> = unit_ids.iter().collect();
+fn validate_group_coverage(groups: &[CommitGroup], paths: &[String]) -> Result<()> {
+    let known: HashSet<&String> = paths.iter().collect();
     let mut seen = HashSet::new();
     let mut duplicates = Vec::new();
     let mut unknown = Vec::new();
 
     for group in groups {
-        for id in &group.hunks {
-            if !known.contains(id) {
-                unknown.push(id.clone());
+        for path in &group.files {
+            if !known.contains(path) {
+                unknown.push(path.clone());
                 continue;
             }
 
-            if !seen.insert(id.clone()) {
-                duplicates.push(id.clone());
+            if !seen.insert(path.clone()) {
+                duplicates.push(path.clone());
             }
         }
     }
 
-    let missing: Vec<String> = unit_ids
+    let missing: Vec<String> = paths
         .iter()
-        .filter(|id| !seen.contains(*id))
+        .filter(|path| !seen.contains(*path))
         .cloned()
         .collect();
 
@@ -261,23 +248,23 @@ fn validate_group_coverage(groups: &[CommitGroup], unit_ids: &[String]) -> Resul
     let mut problems = Vec::new();
 
     if !missing.is_empty() {
-        problems.push(format!("missing hunks: {}", missing.join(", ")));
+        problems.push(format!("missing files: {}", missing.join(", ")));
     }
 
     if !duplicates.is_empty() {
         duplicates.sort();
         duplicates.dedup();
-        problems.push(format!("duplicate hunks: {}", duplicates.join(", ")));
+        problems.push(format!("duplicate files: {}", duplicates.join(", ")));
     }
 
     if !unknown.is_empty() {
         unknown.sort();
         unknown.dedup();
-        problems.push(format!("unknown hunks: {}", unknown.join(", ")));
+        problems.push(format!("unknown files: {}", unknown.join(", ")));
     }
 
     anyhow::bail!(
-        "Synthesis output did not cover the diff hunks correctly ({})",
+        "Synthesis output did not cover the changed files correctly ({})",
         problems.join("; ")
     );
 }
@@ -323,7 +310,7 @@ pub(crate) fn truncate_for_prompt(text: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hunks::parse_diff;
+    use crate::diff::ChangedFiles;
     use crate::test_support::{acquire_cwd_lock, git, init_repo, with_repo_cwd, write_file};
 
     const SAMPLE_DIFF: &str = "\
@@ -350,122 +337,125 @@ index 3333333..4444444 100644
 +More docs
 ";
 
-    fn unit_ids(ids: &[&str]) -> Vec<String> {
-        ids.iter().map(|id| id.to_string()).collect()
+    fn paths(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|path| path.to_string()).collect()
     }
 
-    fn assert_single_group(groups: Vec<CommitGroup>, message: &str, hunk: &str) {
+    fn sample_files() -> ChangedFiles {
+        ChangedFiles::new(
+            paths(&["src/main.rs", "README.md"]),
+            SAMPLE_DIFF.to_string(),
+        )
+    }
+
+    fn assert_single_group(groups: Vec<CommitGroup>, message: &str, file: &str) {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].message, message);
-        assert_eq!(groups[0].hunks, vec![hunk.to_string()]);
+        assert_eq!(groups[0].files, vec![file.to_string()]);
     }
 
     #[test]
     fn parse_groups_accepts_bare_arrays() {
-        let raw = r#"[{"message":"feat: add parser","hunks":["h1"]}]"#;
+        let raw = r#"[{"message":"feat: add parser","files":["src/main.rs"]}]"#;
         let parsed = parse_groups(raw).expect("bare array should parse");
 
-        assert_single_group(parsed, "feat: add parser", "h1");
+        assert_single_group(parsed, "feat: add parser", "src/main.rs");
     }
 
     #[test]
     fn parse_groups_accepts_groups_envelope_shape() {
-        let raw = r#"{"groups":[{"message":"fix: tighten parsing","hunks":["h2"]}]}"#;
+        let raw = r#"{"groups":[{"message":"fix: tighten parsing","files":["README.md"]}]}"#;
         let parsed = parse_groups(raw).expect("groups envelope should parse");
 
-        assert_single_group(parsed, "fix: tighten parsing", "h2");
+        assert_single_group(parsed, "fix: tighten parsing", "README.md");
     }
 
     #[test]
     fn parse_groups_extracts_array_from_mixed_text() {
-        let raw =
-            "Result:\n```json\n[{\"message\":\"chore: update deps\",\"hunks\":[\"h1\"]}]\n```";
+        let raw = "Result:\n```json\n[{\"message\":\"chore: update deps\",\"files\":[\"Cargo.toml\"]}]\n```";
         let parsed = parse_groups(raw).expect("embedded json array should parse");
 
-        assert_single_group(parsed, "chore: update deps", "h1");
+        assert_single_group(parsed, "chore: update deps", "Cargo.toml");
     }
 
     #[test]
     fn validate_group_coverage_requires_full_exact_assignment() {
-        let ids = unit_ids(&["h1", "h2"]);
+        let changed = paths(&["src/main.rs", "README.md"]);
 
         validate_group_coverage(
             &[
                 CommitGroup {
                     message: "feat(cli): improve landing".to_string(),
-                    hunks: vec!["h1".to_string()],
+                    files: vec!["src/main.rs".to_string()],
                 },
                 CommitGroup {
                     message: "docs: refresh readme".to_string(),
-                    hunks: vec!["h2".to_string()],
+                    files: vec!["README.md".to_string()],
                 },
             ],
-            &ids,
+            &changed,
         )
         .expect("full coverage should validate");
 
         let err = validate_group_coverage(
             &[CommitGroup {
                 message: "feat(cli): improve landing".to_string(),
-                hunks: vec!["h1".to_string()],
+                files: vec!["src/main.rs".to_string()],
             }],
-            &ids,
+            &changed,
         )
-        .expect_err("missing hunks should fail validation");
-        assert!(format!("{err:#}").contains("missing hunks: h2"));
+        .expect_err("a missing file should fail validation");
+        assert!(format!("{err:#}").contains("missing files: README.md"));
     }
 
     #[test]
-    fn validate_group_coverage_rejects_duplicate_and_unknown_hunks() {
-        let ids = unit_ids(&["h1", "h2"]);
+    fn validate_group_coverage_rejects_duplicate_and_unknown_files() {
+        let changed = paths(&["src/main.rs", "README.md"]);
 
         let err = validate_group_coverage(
             &[
                 CommitGroup {
                     message: "feat(cli): improve landing".to_string(),
-                    hunks: vec!["h1".to_string(), "h1".to_string()],
+                    files: vec!["src/main.rs".to_string(), "src/main.rs".to_string()],
                 },
                 CommitGroup {
                     message: "docs: refresh readme".to_string(),
-                    hunks: vec!["h99".to_string()],
+                    files: vec!["src/imagined.rs".to_string()],
                 },
             ],
-            &ids,
+            &changed,
         )
-        .expect_err("duplicate and unknown hunks should fail validation");
+        .expect_err("duplicate and unknown files should fail validation");
 
         let rendered = format!("{err:#}");
-        assert!(rendered.contains("missing hunks: h2"));
-        assert!(rendered.contains("duplicate hunks: h1"));
-        assert!(rendered.contains("unknown hunks: h99"));
+        assert!(rendered.contains("missing files: README.md"));
+        assert!(rendered.contains("duplicate files: src/main.rs"));
+        assert!(rendered.contains("unknown files: src/imagined.rs"));
     }
 
     #[test]
-    fn build_synthesis_input_lists_every_hunk_id() {
+    fn build_synthesis_input_lists_every_changed_file() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
-        let units = parse_diff(SAMPLE_DIFF);
+        let files = sample_files();
 
-        let prompt = with_repo_cwd(&repo.path, || build_synthesis_input(&units));
+        let prompt = with_repo_cwd(&repo.path, || build_synthesis_input(&files));
 
-        assert!(prompt.contains("Hunks (assign each id exactly once and copy ids verbatim):"));
-        assert!(prompt.contains("- h1 src/main.rs @@ -1,3 +1,4 @@"));
-        assert!(prompt.contains("- h2 src/main.rs @@ -10,3 +11,4 @@"));
-        assert!(prompt.contains("- h3 README.md @@ -1,1 +1,2 @@"));
-        assert!(
-            prompt.contains(
-                "Hunk contents (may be trimmed; rely on the hunk list for full coverage):"
-            )
-        );
-        assert!(prompt.contains("[h1] src/main.rs"));
+        assert!(prompt.contains("Files (assign each path exactly once and copy paths verbatim):"));
+        assert!(prompt.contains("- src/main.rs\n"));
+        assert!(prompt.contains("- README.md\n"));
+        assert!(prompt.contains("Diff (may be trimmed; rely on the file list for full coverage):"));
+        assert!(prompt.contains("diff --git a/src/main.rs b/src/main.rs"));
         assert!(prompt.contains("+    init();"));
+        // One file, one entry: both of src/main.rs's hunks stay together.
+        assert_eq!(prompt.matches("- src/main.rs\n").count(), 1);
     }
 
     #[test]
     fn build_synthesis_input_includes_commit_style_examples() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
-        let units = parse_diff(SAMPLE_DIFF);
+        let files = sample_files();
 
         write_file(&repo.path, "tracked.txt", "first\n");
         git(&repo.path, &["add", "tracked.txt"]);
@@ -475,7 +465,7 @@ index 3333333..4444444 100644
         git(&repo.path, &["add", "tracked.txt"]);
         git(&repo.path, &["commit", "-m", "docs: refresh usage"]);
 
-        let prompt = with_repo_cwd(&repo.path, || build_synthesis_input(&units));
+        let prompt = with_repo_cwd(&repo.path, || build_synthesis_input(&files));
 
         assert!(prompt.contains("Recent non-Kite commit message examples from this repository:"));
         assert!(prompt.contains("- docs: refresh usage"));
@@ -509,14 +499,14 @@ index 3333333..4444444 100644
 
     #[test]
     fn normalize_groups_rewrites_save_shaped_messages() {
-        let units = parse_diff(SAMPLE_DIFF);
+        let files = sample_files();
 
         let normalized = normalize_groups(
             vec![CommitGroup {
                 message: "[kite] save 12:00:00".to_string(),
-                hunks: vec!["h1".to_string(), "h2".to_string(), "h3".to_string()],
+                files: vec!["src/main.rs".to_string(), "README.md".to_string()],
             }],
-            &units,
+            &files,
         );
 
         assert_eq!(normalized.len(), 1);
@@ -531,25 +521,26 @@ index 3333333..4444444 100644
     }
 
     #[test]
-    fn normalize_groups_joins_leftovers_to_their_files_group_or_a_chore_commit() {
-        // SAMPLE_DIFF: h1 and h2 in src/main.rs, h3 in README.md.
-        let units = parse_diff(SAMPLE_DIFF);
+    fn normalize_groups_drops_noise_and_sweeps_forgotten_files_into_a_chore_commit() {
+        let files = sample_files();
 
         let normalized = normalize_groups(
             vec![CommitGroup {
                 message: "feat(cli): tighten landing".to_string(),
-                hunks: vec!["h2".to_string(), "h2".to_string(), "h99".to_string()],
+                files: vec![
+                    "src/main.rs".to_string(),
+                    "src/main.rs".to_string(),
+                    "src/imagined.rs".to_string(),
+                ],
             }],
-            &units,
+            &files,
         );
 
-        // h1 joins the group that already owns src/main.rs; h3 has no owner.
+        // The repeat and the invented path are dropped; the file the model
+        // forgot still lands, in a visible catch-all commit.
         assert_eq!(normalized.len(), 2);
-        assert_eq!(
-            normalized[0].hunks,
-            vec!["h2".to_string(), "h1".to_string()]
-        );
+        assert_eq!(normalized[0].files, vec!["src/main.rs".to_string()]);
         assert_eq!(normalized[1].message, "chore: unclassified updates");
-        assert_eq!(normalized[1].hunks, vec!["h3".to_string()]);
+        assert_eq!(normalized[1].files, vec!["README.md".to_string()]);
     }
 }

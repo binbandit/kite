@@ -2,20 +2,17 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use colored::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 use crate::ai::flatten_error;
+use crate::diff::ChangedFiles;
 use crate::git::{
-    DETACHED_TARGET, Head, Hooks, KiteBase, active_git_operation, apply_cached_patch,
-    branch_to_publish, check_ref, commit_git, config_get, config_unset, current_worktree_key,
+    DETACHED_TARGET, Head, Hooks, KiteBase, active_git_operation, branch_to_publish,
+    changed_paths_for_base, check_ref, commit_git, config_get, config_unset, current_worktree_key,
     diff_for_base, execute_git, execute_git_with, has_head_commit, has_remote, has_unmerged_paths,
     head_branch_hint, head_position, head_symbolic_ref, is_ancestor, is_save_subject,
-    kite_save_stack, short_sha, subjects_missing_from_head,
+    kite_save_stack, short_sha, stage_paths, subjects_missing_from_head,
 };
-use crate::hunks::{DiffUnits, FileStat, parse_diff};
-use crate::synth::{
-    CommitGroup, MAX_DIFF_BYTES, normalize_groups, sanitize_commit_message, synthesize_groups,
-};
+use crate::synth::{CommitGroup, normalize_groups, sanitize_commit_message, synthesize_groups};
 use crate::ui::{Spinner, confirm, pluralize, print_ai_unavailable, prompt_line};
 
 /// Where the pre-land `HEAD` is parked so `kt undo` can restore it, plus the
@@ -248,26 +245,16 @@ fn valid_atomic_phase(phase: &AtomicLandPhase) -> bool {
 /// How many about-to-be-discarded remote commits to list before summarizing.
 const MAX_DROPPED_COMMITS_SHOWN: usize = 10;
 
+/// How many files to list under a planned commit before summarizing. The plan
+/// is the last thing shown before history is rewritten, and one that scrolls
+/// for thousands of lines is one nobody actually reads.
+const MAX_PLAN_FILES_SHOWN: usize = 12;
+
 #[derive(Clone, Debug)]
 struct LandScope {
     base: KiteBase,
     save_count: usize,
-    units: DiffUnits,
-}
-
-/// One planned commit and how its content gets staged: an exact patch of the
-/// assigned hunks, or whole files when hunk-level staging is unavailable.
-#[derive(Clone, Debug)]
-struct LandCommit {
-    message: String,
-    files: Vec<FileStat>,
-    stage: StageOp,
-}
-
-#[derive(Clone, Debug)]
-enum StageOp {
-    Patch(String),
-    WholeFiles(Vec<String>),
+    files: ChangedFiles,
 }
 
 pub(crate) struct LandOptions {
@@ -305,16 +292,16 @@ pub(crate) async fn land(options: LandOptions) -> Result<()> {
         };
 
         let spinner = Spinner::start("Synthesizing");
-        let synthesized = synthesize_groups(&scope.units).await;
+        let synthesized = synthesize_groups(&scope.files).await;
         spinner.stop();
 
         let mut commits = match synthesized {
             Ok(raw_groups) => {
-                let groups = normalize_groups(raw_groups, &scope.units);
+                let groups = normalize_groups(raw_groups, &scope.files);
                 if groups.is_empty() {
                     anyhow::bail!("No changes were assigned to landed commit groups.");
                 }
-                plan_commits(&scope.base, &scope.units, &groups)
+                groups
             }
             Err(error) => {
                 print_ai_unavailable(&error);
@@ -327,10 +314,10 @@ pub(crate) async fn land(options: LandOptions) -> Result<()> {
                     println!("{} Aborted — no history changed", "·".red());
                     return Ok(());
                 };
-                vec![whole_files_commit(
-                    sanitize_commit_message(&message),
-                    scope.units.all_files(),
-                )]
+                vec![CommitGroup {
+                    message: sanitize_commit_message(&message),
+                    files: scope.files.paths().to_vec(),
+                }]
             }
         };
 
@@ -1185,26 +1172,11 @@ fn collect_land_scope(allow_dirty: bool, status: Option<&str>) -> Result<Option<
         return Ok(None);
     };
 
-    let diff = diff_for_base(&stack.base)?;
-    let mut units = parse_diff(&diff);
-
-    // Only when the hunks are too many *and* too large to show: the model
-    // would otherwise be assigning ids whose contents it never saw. Hundreds
-    // of small hunks still fit whole and keep their hunk-level split.
-    if units.exceeds_prompt_budget(MAX_DIFF_BYTES) {
-        println!(
-            "{} {}",
-            "·".yellow(),
-            format!(
-                "{} in these saves — grouping by file instead of by hunk",
-                pluralize(units.unit_count(), "hunk")
-            )
-            .dimmed()
-        );
-        units = units.coarsened_to_files();
-    }
-
-    if units.is_empty() {
+    // The path list is authoritative; the diff is only ever shown to the
+    // model, so a path is never recovered from it. Asking for the list first
+    // also means saves that cancel out cost nothing to rule out.
+    let paths = changed_paths_for_base(&stack.base)?;
+    if paths.is_empty() {
         println!(
             "{} {}",
             "·".dimmed(),
@@ -1213,10 +1185,12 @@ fn collect_land_scope(allow_dirty: bool, status: Option<&str>) -> Result<Option<
         return Ok(None);
     }
 
+    let files = ChangedFiles::new(paths, diff_for_base(&stack.base)?);
+
     Ok(Some(LandScope {
         base: stack.base,
         save_count: stack.count,
-        units,
+        files,
     }))
 }
 
@@ -1241,122 +1215,6 @@ fn restore_dirty_worktree_for_land() -> Result<()> {
     Ok(())
 }
 
-/// Builds patch-staged commits from the hunk groups, then dry-runs the whole
-/// sequence against a temporary index. If the replayed commits would not
-/// reproduce the saved tree exactly, falls back to whole-file staging so a
-/// landing can never change what the branch ultimately contains.
-fn plan_commits(base: &KiteBase, units: &DiffUnits, groups: &[CommitGroup]) -> Vec<LandCommit> {
-    let commits: Vec<LandCommit> = groups
-        .iter()
-        .map(|group| {
-            let ids: HashSet<String> = group.hunks.iter().cloned().collect();
-            LandCommit {
-                message: group.message.clone(),
-                files: units.file_stats(&ids),
-                stage: StageOp::Patch(units.assemble_patch(&ids)),
-            }
-        })
-        .collect();
-
-    match verify_patch_plan(base, &commits) {
-        Ok(()) => commits,
-        Err(error) => {
-            println!(
-                "{} Hunk-level plan failed verification — landing whole files instead ({})",
-                "·".yellow(),
-                flatten_error(&format!("{error:#}"))
-            );
-            collapse_to_whole_files(units, groups)
-        }
-    }
-}
-
-/// Replays the patch sequence against a temporary index and requires the
-/// resulting tree to be identical to `HEAD`'s tree, so a hunk-level rewrite
-/// is proven exact before any history changes.
-fn verify_patch_plan(base: &KiteBase, commits: &[LandCommit]) -> Result<()> {
-    let index_path = std::env::temp_dir().join(format!(
-        "kite-verify-index-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0)
-    ));
-    let index_path_string = index_path.to_string_lossy().into_owned();
-    let envs = [("GIT_INDEX_FILE", index_path_string.as_str())];
-
-    let result = (|| {
-        match base {
-            KiteBase::Commit(sha) => {
-                let tree = format!("{sha}^{{tree}}");
-                execute_git_with(&["read-tree", &tree], &envs, None)?;
-            }
-            KiteBase::Root => {
-                execute_git_with(&["read-tree", "--empty"], &envs, None)?;
-            }
-        }
-
-        for commit in commits {
-            let StageOp::Patch(patch) = &commit.stage else {
-                continue;
-            };
-            execute_git_with(
-                &["apply", "--cached", "--whitespace=nowarn"],
-                &envs,
-                Some(patch),
-            )
-            .with_context(|| format!("`{}` did not apply cleanly", commit.message))?;
-        }
-
-        let landed_tree = execute_git_with(&["write-tree"], &envs, None)?;
-        let expected_tree = execute_git(&["rev-parse", "HEAD^{tree}"])?;
-        if landed_tree.trim() != expected_tree.trim() {
-            anyhow::bail!("replayed commits do not reproduce the saved tree");
-        }
-        Ok(())
-    })();
-
-    let _ = std::fs::remove_file(&index_path);
-    result
-}
-
-/// File-level fallback: each file goes whole into the first group that
-/// touches it, so coverage stays exactly-once without hunk staging.
-fn collapse_to_whole_files(units: &DiffUnits, groups: &[CommitGroup]) -> Vec<LandCommit> {
-    let mut assigned = HashSet::new();
-    let mut commits = Vec::new();
-
-    for group in groups {
-        let ids: HashSet<String> = group.hunks.iter().cloned().collect();
-        let files: Vec<String> = units
-            .files_for(&ids)
-            .into_iter()
-            .filter(|file| assigned.insert(file.clone()))
-            .collect();
-        if files.is_empty() {
-            continue;
-        }
-
-        commits.push(whole_files_commit(group.message.clone(), files));
-    }
-
-    commits
-}
-
-/// One commit staged as whole files; used by the verification fallback and
-/// the manual path.
-fn whole_files_commit(message: String, files: Vec<String>) -> LandCommit {
-    LandCommit {
-        message,
-        files: files.iter().cloned().map(FileStat::whole).collect(),
-        stage: StageOp::WholeFiles(files),
-    }
-}
-
-/// Renders the proposed history as a numbered list of commits, each with a
-/// small file tree underneath. Files split across commits show how many of
-/// their hunks each commit takes and which parts they are.
 fn append_tag_to_message(message: &str, tag: &str) -> String {
     let tag_token = tag.trim();
     if tag_token.is_empty() {
@@ -1390,7 +1248,9 @@ fn append_tag_to_message(message: &str, tag: &str) -> String {
     format!("{new_first}\n{}", rest_lines.join("\n"))
 }
 
-fn render_land_plan(commits: &[LandCommit], save_count: usize) -> String {
+/// Renders the proposed history as a numbered list of commits, each with the
+/// files it lands underneath.
+fn render_land_plan(commits: &[CommitGroup], save_count: usize) -> String {
     let mut plan = format!(
         "{} Plan: {} {} {}\n\n",
         "·".cyan(),
@@ -1415,24 +1275,19 @@ fn render_land_plan(commits: &[LandCommit], save_count: usize) -> String {
             ));
         }
 
-        for (position, file) in commit.files.iter().enumerate() {
+        for (position, file) in commit.files.iter().take(MAX_PLAN_FILES_SHOWN).enumerate() {
             let last = position + 1 == commit.files.len();
             let glyph = if last { "└─" } else { "├─" };
-            let mut line = file.path.clone();
-            if file.selected < file.total {
-                line.push_str(&format!(" ({}/{} hunks)", file.selected, file.total));
-            }
-            plan.push_str(&format!("     {} {}\n", glyph.dimmed(), line));
+            plan.push_str(&format!("     {} {}\n", glyph.dimmed(), file));
+        }
 
-            let continuation = if last { " " } else { "│" };
-            for heading in &file.headings {
-                let clipped: String = heading.chars().take(72).collect();
-                plan.push_str(&format!(
-                    "     {}    {}\n",
-                    continuation.dimmed(),
-                    format!("· {clipped}").dimmed()
-                ));
-            }
+        if let Some(hidden) = commit.files.len().checked_sub(MAX_PLAN_FILES_SHOWN)
+            && hidden > 0
+        {
+            plan.push_str(&format!(
+                "     {}\n",
+                format!("… and {hidden} more").dimmed()
+            ));
         }
     }
 
@@ -1440,7 +1295,7 @@ fn render_land_plan(commits: &[LandCommit], save_count: usize) -> String {
     plan
 }
 
-fn execute_land(base: &KiteBase, commits: &[LandCommit], hooks: Hooks) -> Result<()> {
+fn execute_land(base: &KiteBase, commits: &[CommitGroup], hooks: Hooks) -> Result<()> {
     if commits.is_empty() {
         anyhow::bail!("Refusing to land an empty plan — that would discard the saves.");
     }
@@ -2023,16 +1878,11 @@ fn prepare_landing_head(base: &KiteBase, pre_land_sha: &str, transaction_ref: &s
     Ok(())
 }
 
-fn create_commits(commits: &[LandCommit], hooks: Hooks) -> Result<()> {
+/// Stages each commit's files whole, straight from the worktree, so hooks and
+/// formatters always see complete files.
+fn create_commits(commits: &[CommitGroup], hooks: Hooks) -> Result<()> {
     for commit in commits {
-        match &commit.stage {
-            StageOp::Patch(patch) => apply_cached_patch(patch)?,
-            StageOp::WholeFiles(files) => {
-                for file in files {
-                    execute_git(&["add", "--", file])?;
-                }
-            }
-        }
+        stage_paths(&commit.files)?;
         commit_git(&commit.message, hooks)?;
     }
 
@@ -2102,7 +1952,7 @@ mod tests {
     fn execute_land_in_repo(
         repo: &std::path::Path,
         base: &KiteBase,
-        commits: &[LandCommit],
+        commits: &[CommitGroup],
     ) -> Result<()> {
         with_repo_cwd(repo, || execute_land(base, commits, Hooks::Run))
     }
@@ -2136,17 +1986,10 @@ mod tests {
         })
     }
 
-    fn files_commit(message: &str, files: &[&str]) -> LandCommit {
-        whole_files_commit(
-            message.to_string(),
-            files.iter().map(|file| file.to_string()).collect(),
-        )
-    }
-
-    fn group(message: &str, hunks: &[&str]) -> CommitGroup {
+    fn files_commit(message: &str, files: &[&str]) -> CommitGroup {
         CommitGroup {
             message: message.to_string(),
-            hunks: hunks.iter().map(|id| id.to_string()).collect(),
+            files: files.iter().map(|file| file.to_string()).collect(),
         }
     }
 
@@ -2163,22 +2006,16 @@ mod tests {
         }
     }
 
-    /// Two edits far enough apart to produce two hunks in one file.
-    fn save_two_hunk_change(repo: &std::path::Path) {
-        write_file(
-            repo,
-            "code.txt",
-            "alpha\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nomega\n",
-        );
-        git(repo, &["add", "code.txt"]);
+    /// One save touching two files, so a plan can spread them over two commits.
+    fn save_two_file_change(repo: &std::path::Path) {
+        write_file(repo, "code.txt", "alpha\n");
+        write_file(repo, "docs.txt", "notes\n");
+        git(repo, &["add", "code.txt", "docs.txt"]);
         git(repo, &["commit", "-m", "chore: add code"]);
 
-        write_file(
-            repo,
-            "code.txt",
-            "ALPHA\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nOMEGA\n",
-        );
-        git(repo, &["add", "code.txt"]);
+        write_file(repo, "code.txt", "ALPHA\n");
+        write_file(repo, "docs.txt", "NOTES\n");
+        git(repo, &["add", "code.txt", "docs.txt"]);
         git(repo, &["commit", "-m", "[kite] save 12:00:00"]);
     }
 
@@ -2207,38 +2044,21 @@ mod tests {
     }
 
     #[test]
-    fn render_land_plan_numbers_commits_and_marks_split_files() {
+    fn render_land_plan_numbers_commits_and_lists_their_files() {
         // Pin colors off so we assert the structural layout, not ANSI codes.
         colored::control::set_override(false);
 
         let plan = render_land_plan(
             &[
-                LandCommit {
-                    message: "feat(api): add webhooks".to_string(),
-                    files: vec![
-                        FileStat {
-                            path: "src/api.rs".to_string(),
-                            selected: 1,
-                            total: 2,
-                            headings: vec!["fn register_webhook()".to_string()],
-                        },
-                        FileStat::whole("src/hooks.rs".to_string()),
-                    ],
-                    stage: StageOp::Patch(String::new()),
-                },
-                LandCommit {
-                    message: "docs: refresh readme".to_string(),
-                    files: vec![FileStat::whole("README.md".to_string())],
-                    stage: StageOp::Patch(String::new()),
-                },
+                files_commit("feat(api): add webhooks", &["src/api.rs", "src/hooks.rs"]),
+                files_commit("docs: refresh readme", &["README.md"]),
             ],
             3,
         );
 
         assert!(plan.contains("Plan: 3 saves → 2 commits"));
         assert!(plan.contains("  1. feat(api): add webhooks\n"));
-        assert!(plan.contains("     ├─ src/api.rs (1/2 hunks)\n"));
-        assert!(plan.contains("     │    · fn register_webhook()\n"));
+        assert!(plan.contains("     ├─ src/api.rs\n"));
         assert!(plan.contains("     └─ src/hooks.rs\n"));
         assert!(plan.contains("  2. docs: refresh readme\n"));
         assert!(plan.contains("     └─ README.md\n"));
@@ -2272,45 +2092,40 @@ mod tests {
             .expect("kite saves should be landable");
         assert!(matches!(scope.base, KiteBase::Commit(_)));
         assert_eq!(scope.save_count, 1);
-        assert!(scope.units.all_files().contains(&"tracked.txt".to_string()));
+        assert!(scope.files.paths().contains(&"tracked.txt".to_string()));
     }
 
     #[test]
-    fn land_splits_one_file_across_commits_and_preserves_the_tree() {
+    fn land_groups_whole_files_into_separate_commits_and_preserves_the_tree() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
-        save_two_hunk_change(&repo.path);
+        save_two_file_change(&repo.path);
 
         let pre_land_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
 
         let scope = collect_land_scope_in_repo(&repo.path, false)
             .expect("land scope should collect")
             .expect("kite saves should be landable");
-        assert_eq!(scope.units.unit_ids(), vec!["h1", "h2"]);
+        assert_eq!(scope.files.paths(), vec!["code.txt", "docs.txt"]);
 
-        // Deliberately out of file order: the bottom hunk lands first.
-        let groups = [
-            group("feat: bottom change", &["h2"]),
-            group("feat: top change", &["h1"]),
+        // Deliberately out of diff order: the second file lands first.
+        let commits = [
+            files_commit("docs: update notes", &["docs.txt"]),
+            files_commit("feat: upcase code", &["code.txt"]),
         ];
-        let commits = with_repo_cwd(&repo.path, || {
-            plan_commits(&scope.base, &scope.units, &groups)
-        });
-        assert!(matches!(commits[0].stage, StageOp::Patch(_)));
-
         execute_land_in_repo(&repo.path, &scope.base, &commits).expect("land should succeed");
 
         let messages = git(&repo.path, &["log", "--pretty=%s", "-n", "2"]);
         assert_eq!(
             messages.lines().collect::<Vec<_>>(),
-            vec!["feat: top change", "feat: bottom change"]
+            vec!["feat: upcase code", "docs: update notes"]
         );
 
-        // The intermediate commit holds only the bottom hunk.
-        let intermediate = git(&repo.path, &["show", "HEAD^:code.txt"]);
-        assert!(intermediate.contains("OMEGA"));
-        assert!(intermediate.contains("alpha\n"));
-        assert!(!intermediate.contains("ALPHA"));
+        // The intermediate commit carries docs.txt whole and leaves code.txt
+        // exactly as the base had it: no half-applied file for a hook to trip
+        // over.
+        assert_eq!(git(&repo.path, &["show", "HEAD^:docs.txt"]), "NOTES\n");
+        assert_eq!(git(&repo.path, &["show", "HEAD^:code.txt"]), "alpha\n");
 
         // The landed branch reproduces the saved tree exactly.
         let landed_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
@@ -2321,76 +2136,180 @@ mod tests {
     }
 
     #[test]
-    fn land_splits_edits_only_a_few_lines_apart() {
+    fn landing_stages_a_deleted_file_whole() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
 
-        write_file(
-            &repo.path,
-            "code.txt",
-            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
-        );
-        git(&repo.path, &["add", "code.txt"]);
-        git(&repo.path, &["commit", "-m", "chore: add code"]);
-
-        // Lines 2 and 6 — close enough to merge into one hunk at the default
-        // context width, but separate hunks with -U1.
-        write_file(
-            &repo.path,
-            "code.txt",
-            "one\nTWO\nthree\nfour\nfive\nSIX\nseven\neight\nnine\nten\n",
-        );
-        git(&repo.path, &["add", "code.txt"]);
+        std::fs::remove_file(repo.path.join("other.txt")).expect("file should be removed");
+        git(&repo.path, &["add", "-A"]);
         git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
 
         let pre_land_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
         let scope = collect_land_scope_in_repo(&repo.path, false)
             .expect("land scope should collect")
             .expect("kite saves should be landable");
-        assert_eq!(scope.units.unit_ids(), vec!["h1", "h2"]);
+        assert_eq!(scope.files.paths(), vec!["other.txt"]);
 
-        let groups = [
-            group("feat: upcase two", &["h1"]),
-            group("feat: upcase six", &["h2"]),
-        ];
-        let commits = with_repo_cwd(&repo.path, || {
-            plan_commits(&scope.base, &scope.units, &groups)
-        });
-        assert!(matches!(commits[0].stage, StageOp::Patch(_)));
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("chore: drop other", &["other.txt"])],
+        )
+        .expect("a deletion should land");
 
-        execute_land_in_repo(&repo.path, &scope.base, &commits).expect("land should succeed");
-
-        let intermediate = git(&repo.path, &["show", "HEAD^:code.txt"]);
-        assert!(intermediate.contains("TWO") && intermediate.contains("six\n"));
-
-        let landed_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
-        assert_eq!(landed_tree, pre_land_tree);
+        assert_eq!(
+            git(&repo.path, &["rev-parse", "HEAD^{tree}"]),
+            pre_land_tree
+        );
+        let listed = git(&repo.path, &["ls-tree", "--name-only", "HEAD"]);
+        assert!(
+            !listed.lines().any(|line| line == "other.txt"),
+            "the deleted file survived landing: {listed}"
+        );
     }
 
     #[test]
-    fn land_splits_hunks_inside_a_crlf_file() {
+    fn landing_stages_a_file_force_added_past_an_ignore_rule() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
-        // Keep git from normalizing line endings, so the blobs really hold
-        // CRLF the way they do in a Windows-authored repository.
-        git(&repo.path, &["config", "core.autocrlf", "false"]);
-        write_file(&repo.path, ".gitattributes", "* -text\n");
+
+        write_file(&repo.path, ".gitignore", "secret.txt\n");
+        git(&repo.path, &["add", ".gitignore"]);
+        git(&repo.path, &["commit", "-m", "chore: ignore secrets"]);
+
+        // Deliberately saved past the ignore rule; landing must be able to
+        // stage it back, or the save would be impossible to land.
+        write_file(&repo.path, "secret.txt", "saved anyway\n");
+        git(&repo.path, &["add", "-f", "secret.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: add secret", &["secret.txt"])],
+        )
+        .expect("an ignored but saved file should still land");
+
+        assert_eq!(
+            git(&repo.path, &["show", "HEAD:secret.txt"]),
+            "saved anyway\n"
+        );
+    }
+
+    /// `core.quotepath` is on by default, so a non-ASCII path git prints
+    /// without `-z` comes back C-escaped and names no file at all.
+    #[test]
+    fn landing_stages_non_ascii_paths_unescaped() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "café/résumé.md", "base\n");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "chore: add notes"]);
+
+        write_file(&repo.path, "café/résumé.md", "updated\n");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let pre_land_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        assert_eq!(scope.files.paths(), ["café/résumé.md"]);
+
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("docs: update notes", &["café/résumé.md"])],
+        )
+        .expect("a non-ASCII path should land");
+
+        assert_eq!(
+            git(&repo.path, &["rev-parse", "HEAD^{tree}"]),
+            pre_land_tree
+        );
+    }
+
+    /// Names git would otherwise read as a pattern rather than a path: a
+    /// glob, a pathspec-magic prefix, and one git has to quote in the diff
+    /// header. Each used to either fail the land outright or drag an
+    /// unassigned file into the wrong commit.
+    #[cfg(unix)]
+    #[test]
+    fn landing_stages_awkward_paths_literally() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "axxb.txt", "the file a*b.txt would match\n");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "chore: add the decoy"]);
+
+        write_file(&repo.path, "a*b.txt", "glob-shaped name\n");
+        write_file(&repo.path, ":colon.txt", "pathspec-magic-shaped name\n");
+        write_file(&repo.path, "quote\".txt", "quoted in the diff header\n");
+        write_file(
+            &repo.path,
+            "axxb.txt",
+            "changed too, and assigned elsewhere\n",
+        );
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let pre_land_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        assert_eq!(
+            scope.files.paths(),
+            [":colon.txt", "a*b.txt", "axxb.txt", "quote\".txt"]
+        );
+
+        let commits = [
+            files_commit(
+                "feat: awkward names",
+                &["a*b.txt", ":colon.txt", "quote\".txt"],
+            ),
+            files_commit("chore: update the decoy", &["axxb.txt"]),
+        ];
+        execute_land_in_repo(&repo.path, &scope.base, &commits).expect("land should succeed");
+
+        // The glob-shaped name must not have swallowed the file it matches.
+        let first = git(
+            &repo.path,
+            &["show", "--name-only", "--pretty=format:", "HEAD^"],
+        );
+        assert!(!first.lines().any(|line| line == "axxb.txt"), "{first}");
+        assert_eq!(
+            git(&repo.path, &["show", "HEAD:axxb.txt"]),
+            "changed too, and assigned elsewhere\n"
+        );
+        assert_eq!(
+            git(&repo.path, &["rev-parse", "HEAD^{tree}"]),
+            pre_land_tree
+        );
+    }
+
+    /// `git add` re-runs the repository's clean filters, so a landed file has
+    /// to hash back to the blob its save recorded.
+    #[test]
+    fn landing_a_normalized_file_reproduces_the_saved_tree() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        // `text=auto` makes `git add` normalize CRLF to LF on the way into the
+        // index, while the worktree keeps its carriage returns.
+        write_file(&repo.path, ".gitattributes", "* text=auto\n");
         git(&repo.path, &["add", ".gitattributes"]);
-        git(&repo.path, &["commit", "-m", "chore: pin line endings"]);
-
-        write_file(
+        git(
             &repo.path,
-            "code.txt",
-            "alpha\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\ni\r\nj\r\nk\r\nomega\r\n",
+            &["commit", "-m", "chore: normalize line endings"],
         );
-        git(&repo.path, &["add", "code.txt"]);
-        git(&repo.path, &["commit", "-m", "chore: add code"]);
 
-        write_file(
-            &repo.path,
-            "code.txt",
-            "ALPHA\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\ni\r\nj\r\nk\r\nOMEGA\r\n",
-        );
+        write_file(&repo.path, "code.txt", "alpha\r\nbeta\r\n");
         git(&repo.path, &["add", "code.txt"]);
         git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
 
@@ -2398,29 +2317,13 @@ mod tests {
         let scope = collect_land_scope_in_repo(&repo.path, false)
             .expect("land scope should collect")
             .expect("kite saves should be landable");
-        assert_eq!(scope.units.unit_ids(), vec!["h1", "h2"]);
 
-        let groups = [
-            group("feat: upcase alpha", &["h1"]),
-            group("feat: upcase omega", &["h2"]),
-        ];
-        let commits = with_repo_cwd(&repo.path, || {
-            plan_commits(&scope.base, &scope.units, &groups)
-        });
-
-        // The whole point: CRLF content must still stage hunk by hunk rather
-        // than silently degrading to whole-file commits.
-        assert!(
-            matches!(commits[0].stage, StageOp::Patch(_)),
-            "CRLF file fell back to whole-file staging: {:?}",
-            commits[0].stage
-        );
-
-        execute_land_in_repo(&repo.path, &scope.base, &commits).expect("land should succeed");
-
-        let intermediate = git(&repo.path, &["show", "HEAD^:code.txt"]);
-        assert!(intermediate.contains("ALPHA\r\n"));
-        assert!(intermediate.contains("omega\r\n"));
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("feat: add code", &["code.txt"])],
+        )
+        .expect("land should succeed");
 
         assert_eq!(
             git(&repo.path, &["rev-parse", "HEAD^{tree}"]),
@@ -2429,16 +2332,28 @@ mod tests {
     }
 
     #[test]
+    fn render_land_plan_summarizes_a_commit_with_too_many_files() {
+        colored::control::set_override(false);
+
+        let many: Vec<String> = (0..30).map(|index| format!("src/f{index}.rs")).collect();
+        let listed: Vec<&str> = many.iter().map(String::as_str).collect();
+        let plan = render_land_plan(&[files_commit("chore: sweep", &listed)], 1);
+
+        assert!(plan.contains("     ├─ src/f0.rs\n"));
+        assert!(plan.contains("     ├─ src/f11.rs\n"));
+        assert!(!plan.contains("src/f12.rs"));
+        assert!(plan.contains("… and 18 more"));
+    }
+
+    #[test]
     fn render_land_plan_keeps_multi_line_messages_out_of_the_file_tree() {
         colored::control::set_override(false);
 
         let plan = render_land_plan(
-            &[LandCommit {
-                message: "feat(api): add webhooks\n\nExplains the change\nover several lines."
-                    .to_string(),
-                files: vec![FileStat::whole("src/api.rs".to_string())],
-                stage: StageOp::Patch(String::new()),
-            }],
+            &[files_commit(
+                "feat(api): add webhooks\n\nExplains the change\nover several lines.",
+                &["src/api.rs"],
+            )],
             1,
         );
 
@@ -2446,33 +2361,6 @@ mod tests {
         assert!(plan.contains("+ 2 body lines"));
         assert!(!plan.contains("\nExplains the change"));
         assert!(plan.contains("     └─ src/api.rs\n"));
-    }
-
-    #[test]
-    fn plan_commits_falls_back_to_whole_files_when_hunks_are_missing() {
-        let _lock = acquire_cwd_lock();
-        let repo = init_repo();
-        save_two_hunk_change(&repo.path);
-
-        let scope = collect_land_scope_in_repo(&repo.path, false)
-            .expect("land scope should collect")
-            .expect("kite saves should be landable");
-
-        // A plan that drops h2 cannot reproduce the saved tree, so planning
-        // must degrade to whole-file staging instead of losing the change.
-        let groups = [group("feat: partial", &["h1"])];
-        let commits = with_repo_cwd(&repo.path, || {
-            plan_commits(&scope.base, &scope.units, &groups)
-        });
-
-        assert_eq!(commits.len(), 1);
-        assert!(
-            matches!(&commits[0].stage, StageOp::WholeFiles(files) if files == &vec!["code.txt".to_string()])
-        );
-
-        execute_land_in_repo(&repo.path, &scope.base, &commits).expect("land should succeed");
-        let content = git(&repo.path, &["show", "HEAD:code.txt"]);
-        assert!(content.contains("ALPHA") && content.contains("OMEGA"));
     }
 
     #[test]
@@ -2914,10 +2802,7 @@ mod tests {
             .expect("root kite save should be landable");
         assert!(matches!(scope.base, KiteBase::Root));
 
-        let groups = [group("feat: bootstrap project", &["h1"])];
-        let commits = with_repo_cwd(&repo.path, || {
-            plan_commits(&scope.base, &scope.units, &groups)
-        });
+        let commits = [files_commit("feat: bootstrap project", &["tracked.txt"])];
         execute_land_in_repo(&repo.path, &scope.base, &commits)
             .expect("a detached root land should succeed");
 
@@ -3438,12 +3323,7 @@ mod tests {
             .expect("root kite save should be landable");
         assert!(matches!(scope.base, KiteBase::Root));
 
-        let groups = [group("feat: bootstrap project", &["h1"])];
-        let commits = with_repo_cwd(&repo.path, || {
-            plan_commits(&scope.base, &scope.units, &groups)
-        });
-        assert!(matches!(commits[0].stage, StageOp::Patch(_)));
-
+        let commits = [files_commit("feat: bootstrap project", &["tracked.txt"])];
         execute_land_in_repo(&repo.path, &scope.base, &commits).expect("root land should succeed");
 
         let head_message = git(&repo.path, &["log", "-1", "--pretty=%s"]);
@@ -3570,7 +3450,7 @@ mod tests {
     fn landing_removes_its_exact_temporary_branch() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
-        save_two_hunk_change(&repo.path);
+        save_two_file_change(&repo.path);
 
         let scope = collect_land_scope_in_repo(&repo.path, false)
             .expect("scope")
@@ -3582,10 +3462,10 @@ mod tests {
             "#!/bin/sh\ngit branch --format='%(refname:short)' >> .git/seen\n",
         );
 
-        let groups = [group("feat: top", &["h1"]), group("feat: bottom", &["h2"])];
-        let commits = with_repo_cwd(&repo.path, || {
-            plan_commits(&scope.base, &scope.units, &groups)
-        });
+        let commits = [
+            files_commit("feat: upcase code", &["code.txt"]),
+            files_commit("docs: update notes", &["docs.txt"]),
+        ];
         execute_land_in_repo(&repo.path, &scope.base, &commits).expect("land should succeed");
 
         let seen = std::fs::read_to_string(repo.path.join(".git/seen")).unwrap_or_default();

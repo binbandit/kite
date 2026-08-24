@@ -138,7 +138,8 @@ pub(crate) fn execute_git(args: &[&str]) -> Result<String> {
 }
 
 /// Like `execute_git`, but with extra environment variables and optional
-/// stdin — used for `git apply --cached` and temporary-index dry runs.
+/// stdin, for the ref transactions and pathspec lists that are too large or
+/// too literal to pass as arguments.
 pub(crate) fn execute_git_with(
     args: &[&str],
     envs: &[(&str, &str)],
@@ -197,16 +198,6 @@ pub(crate) fn execute_git_with(
     }
 
     Ok(into_string(output.stdout))
-}
-
-/// Stages a patch into the index without touching the worktree.
-pub(crate) fn apply_cached_patch(patch: &str) -> Result<()> {
-    execute_git_with(
-        &["apply", "--cached", "--whitespace=nowarn"],
-        &[],
-        Some(patch),
-    )
-    .map(|_| ())
 }
 
 pub(crate) fn execute_git_quiet(args: &[&str]) -> Result<()> {
@@ -627,12 +618,77 @@ pub(crate) fn check_ref(ref_name: &str) -> Option<String> {
     }
 }
 
-/// Explicit prefixes, context width, and binary payloads keep the diff
-/// parseable into hunks and replayable with `git apply` regardless of the
-/// user's diff configuration. One line of context (`-U1`) keeps nearby edits
-/// in separate hunks so they can land in different commits; `git apply`
-/// still anchors reliably because it matches the removed lines as well, and
-/// the pre-land tree verification catches any misapplication.
+/// Stages exactly these paths, whole, from the worktree.
+///
+/// The list travels over stdin because an argument list has a size limit a
+/// diff touching tens of thousands of files would exceed, and
+/// `--literal-pathspecs` stops a path like `a*b.txt` or `:colon.txt` from
+/// being read as a glob or as pathspec magic, which would either stage a file
+/// the plan never assigned or fail outright. `--force` is safe here because
+/// every path came from a save the user already made: one force-added past an
+/// ignore rule must still be able to land.
+pub(crate) fn stage_paths(paths: &[String]) -> Result<()> {
+    let mut pathspecs = String::new();
+    for path in paths {
+        pathspecs.push_str(path);
+        pathspecs.push('\0');
+    }
+
+    execute_git_with(
+        &[
+            "--literal-pathspecs",
+            "add",
+            "--force",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ],
+        &[],
+        Some(&pathspecs),
+    )
+    .map(|_| ())
+}
+
+/// The exact paths a set of saves changed. NUL-separated (`-z`) because git
+/// otherwise C-quotes any path containing a quote, a backslash, or a newline,
+/// and a quoted path no longer names the file it came from.
+pub(crate) fn changed_paths_for_base(base: &KiteBase) -> Result<Vec<String>> {
+    let listed = match base {
+        KiteBase::Commit(hash) => {
+            let range = format!("{hash}..HEAD");
+            execute_git(&[
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                &range,
+            ])?
+        }
+        KiteBase::Root => execute_git(&[
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "-r",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "HEAD",
+        ])?,
+    };
+
+    Ok(listed
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+/// The diff Kite shows the model. It is only ever displayed, never parsed for
+/// paths, so these flags are here to keep it readable and independent of the
+/// user's diff configuration. `--no-renames` does more than that: it keeps
+/// this diff aligned with `changed_paths_for_base`, reading a rename as a
+/// deletion plus an addition rather than one section spanning two paths that
+/// could not be staged as a single whole file.
 pub(crate) fn diff_for_base(base: &KiteBase) -> Result<String> {
     match base {
         KiteBase::Commit(hash) => {
@@ -644,10 +700,8 @@ pub(crate) fn diff_for_base(base: &KiteBase) -> Result<String> {
                 "--no-color",
                 "--no-ext-diff",
                 "--no-renames",
-                "--binary",
                 "--src-prefix=a/",
                 "--dst-prefix=b/",
-                "-U1",
                 &range,
             ])
         }
@@ -660,10 +714,8 @@ pub(crate) fn diff_for_base(base: &KiteBase) -> Result<String> {
             "-r",
             "-p",
             "--no-renames",
-            "--binary",
             "--src-prefix=a/",
             "--dst-prefix=b/",
-            "-U1",
             "HEAD",
         ]),
     }

@@ -1,6 +1,6 @@
 mod ai;
+mod diff;
 mod git;
-mod hunks;
 mod land;
 mod pr;
 mod synth;
@@ -49,7 +49,7 @@ struct Cli {
 enum Commands {
     /// Create or checkout a flow branch
     Go { name: String },
-    /// Intelligently chunk Kite saves into local commits
+    /// Group Kite saves into reviewable local commits
     Land {
         /// Publish the rewritten branch after landing
         #[arg(long)]
