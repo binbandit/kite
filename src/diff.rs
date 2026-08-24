@@ -21,19 +21,11 @@ const MIN_FILE_BODY_BYTES: usize = 400;
 pub(crate) struct ChangedFiles {
     paths: Vec<String>,
     diff: String,
-    /// One `diff --git` section per entry, held as ranges into `diff` so a
-    /// large diff is never copied a second time.
-    sections: Vec<Range<usize>>,
 }
 
 impl ChangedFiles {
     pub(crate) fn new(paths: Vec<String>, diff: String) -> Self {
-        let sections = section_ranges(&diff);
-        Self {
-            paths,
-            diff,
-            sections,
-        }
+        Self { paths, diff }
     }
 
     /// Every changed path, in diff order.
@@ -44,10 +36,15 @@ impl ChangedFiles {
     /// Compact `- <path>` list. Always included whole in the prompt, so the
     /// model sees every path even when the diff below it gets trimmed.
     pub(crate) fn render_index(&self) -> String {
-        self.paths
-            .iter()
-            .map(|path| format!("- {path}\n"))
-            .collect()
+        // Never trimmed, so on a branch touching thousands of files this is
+        // the biggest string the module builds. Size it once up front.
+        let mut index = String::with_capacity(self.paths.iter().map(|path| path.len() + 3).sum());
+        for path in &self.paths {
+            index.push_str("- ");
+            index.push_str(path);
+            index.push('\n');
+        }
+        index
     }
 
     /// The diff itself. When it does not fit `budget`, every file gets a fair
@@ -58,10 +55,14 @@ impl ChangedFiles {
             return Cow::Borrowed(&self.diff);
         }
 
-        let cap = (budget / self.sections.len().max(1)).max(MIN_FILE_BODY_BYTES);
+        // Only the trimming path needs section boundaries, and a diff that
+        // fits is handed back untouched, so this scan stays off the common
+        // path.
+        let sections = section_ranges(&self.diff);
+        let cap = (budget / sections.len().max(1)).max(MIN_FILE_BODY_BYTES);
         let mut rendered = String::with_capacity(budget.min(self.diff.len()));
-        for section in &self.sections {
-            push_capped(&mut rendered, &self.diff[section.clone()], cap);
+        for section in sections {
+            push_capped(&mut rendered, &self.diff[section], cap);
         }
         Cow::Owned(rendered)
     }
@@ -148,22 +149,16 @@ index 3333333..4444444 100644
 
     #[test]
     fn sections_cover_the_diff_exactly_once() {
-        let files = sample();
+        let sections = section_ranges(SAMPLE);
 
-        assert_eq!(files.sections.len(), 2);
-        let stitched: String = files
-            .sections
+        assert_eq!(sections.len(), 2);
+        let stitched: String = sections
             .iter()
-            .map(|section| &files.diff[section.clone()])
+            .map(|section| &SAMPLE[section.clone()])
             .collect();
         assert_eq!(stitched, SAMPLE);
         // Both of src/a.rs's hunks belong to its one section.
-        assert_eq!(
-            files.diff[files.sections[0].clone()]
-                .matches("@@ -")
-                .count(),
-            2
-        );
+        assert_eq!(SAMPLE[sections[0].clone()].matches("@@ -").count(), 2);
     }
 
     #[test]
@@ -199,6 +194,78 @@ index 3333333..4444444 100644
         assert!(trimmed.contains("+two"));
     }
 
+    /// The parser's one real assumption: content lines always carry a ' ',
+    /// '+', '-', or '\\' prefix, so only a header sits at column zero.
+    #[test]
+    fn a_content_line_that_looks_like_a_header_does_not_split_a_section() {
+        let diff = "\
+diff --git a/notes.txt b/notes.txt
+index 1111111..2222222 100644
+--- a/notes.txt
++++ b/notes.txt
+@@ -1 +1,3 @@
+ keep
++diff --git a/fake b/fake
++ diff --git a/also-fake b/also-fake
+";
+        let sections = section_ranges(diff);
+
+        assert_eq!(sections.len(), 1);
+        assert_eq!(&diff[sections[0].clone()], diff);
+    }
+
+    #[test]
+    fn crlf_sections_keep_their_bytes() {
+        let diff = "diff --git a/win.txt b/win.txt\r\nindex 1111111..2222222 100644\r\n--- a/win.txt\r\n+++ b/win.txt\r\n@@ -1,2 +1,2 @@\r\n-one\r\n+ONE\r\n two\r\n";
+        let files = ChangedFiles::new(vec!["win.txt".to_string()], diff.to_string());
+
+        assert_eq!(section_ranges(diff).len(), 1);
+        assert_eq!(files.render_diff(usize::MAX), diff);
+        assert_eq!(files.render_diff(8), diff);
+    }
+
+    /// A mode change produces a section with no hunks at all.
+    #[test]
+    fn a_section_without_hunks_still_renders_whole() {
+        let diff = "\
+diff --git a/run.sh b/run.sh
+old mode 100644
+new mode 100755
+";
+        let files = ChangedFiles::new(vec!["run.sh".to_string()], diff.to_string());
+
+        assert_eq!(section_ranges(diff).len(), 1);
+        assert_eq!(files.render_diff(usize::MAX), diff);
+        assert_eq!(files.render_index(), "- run.sh\n");
+    }
+
+    #[test]
+    fn render_diff_gives_every_file_a_floor_under_a_tiny_budget() {
+        // Two files far past a budget that would divide into nothing: the
+        // floor is what keeps the second one from being rendered blind.
+        let body: String = (0..40)
+            .map(|line| format!("+padding line {line} with a good deal of text\n"))
+            .collect();
+        let diff = format!(
+            "diff --git a/one.txt b/one.txt\n@@ -0,0 +1,40 @@\n{body}\
+             diff --git a/two.txt b/two.txt\n@@ -0,0 +1,40 @@\n{body}"
+        );
+        let files = ChangedFiles::new(
+            vec!["one.txt".to_string(), "two.txt".to_string()],
+            diff.clone(),
+        );
+
+        let rendered = files.render_diff(10);
+
+        assert!(rendered.contains("diff --git a/one.txt b/one.txt"));
+        assert!(rendered.contains("diff --git a/two.txt b/two.txt"));
+        assert_eq!(rendered.matches("(trimmed)").count(), 2);
+        // Without the floor, a ten-byte budget across two files is five bytes
+        // each: not one whole line. Both still open with real content.
+        assert_eq!(rendered.matches("+padding line 0 ").count(), 2);
+        assert!(rendered.len() < diff.len());
+    }
+
     #[test]
     fn quoted_and_binary_headers_need_no_path_parsing() {
         // git C-quotes these paths in the header; the path list carries the
@@ -222,7 +289,7 @@ Binary files a/logo.png and b/logo.png differ
 
         assert_eq!(files.paths(), ["new\nline.txt", "logo.png"]);
         assert_eq!(files.render_index(), "- new\nline.txt\n- logo.png\n");
-        assert_eq!(files.sections.len(), 2);
+        assert_eq!(section_ranges(diff).len(), 2);
     }
 
     #[test]
