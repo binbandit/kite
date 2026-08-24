@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 use crate::ai::flatten_error;
 use crate::diff::ChangedFiles;
 use crate::git::{
-    DETACHED_TARGET, Head, Hooks, KiteBase, active_git_operation, branch_to_publish,
-    changed_paths_for_base, check_ref, commit_git, config_get, config_unset, current_worktree_key,
-    diff_for_base, execute_git, execute_git_with, has_head_commit, has_remote, has_unmerged_paths,
-    head_branch_hint, head_position, head_symbolic_ref, is_ancestor, is_save_subject,
-    kite_save_stack, short_sha, stage_paths, subjects_missing_from_head,
+    DETACHED_TARGET, Head, Hooks, KiteBase, active_git_operation, branch_to_publish, check_ref,
+    commit_git, config_get, config_unset, current_worktree_key, execute_git, execute_git_with,
+    has_head_commit, has_remote, has_unmerged_paths, head_branch_hint, head_position,
+    head_symbolic_ref, is_ancestor, is_save_subject, kite_save_stack, saved_changes, short_sha,
+    stage_paths, subjects_missing_from_head,
 };
 use crate::synth::{CommitGroup, normalize_groups, sanitize_commit_message, synthesize_groups};
-use crate::ui::{Spinner, confirm, pluralize, print_ai_unavailable, prompt_line};
+use crate::ui::{Spinner, confirm, overflow_note, pluralize, print_ai_unavailable, prompt_line};
 
 /// Where the pre-land `HEAD` is parked so `kt undo` can restore it, plus the
 /// local config keys recording which branch that land belongs to — or
@@ -469,11 +469,8 @@ fn confirm_discarding_remote_commits(branch: &str, remote_sha: &str) -> Result<(
     for subject in dropped.iter().take(MAX_DROPPED_COMMITS_SHOWN) {
         println!("     {} {}", "-".dimmed(), subject);
     }
-    if dropped.len() > MAX_DROPPED_COMMITS_SHOWN {
-        println!(
-            "     {}",
-            format!("… and {} more", dropped.len() - MAX_DROPPED_COMMITS_SHOWN).dimmed()
-        );
+    if let Some(note) = overflow_note(dropped.len(), MAX_DROPPED_COMMITS_SHOWN) {
+        println!("     {}", note.dimmed());
     }
 
     if confirm("Publishing will discard them from the remote. Continue?")? {
@@ -1173,9 +1170,8 @@ fn collect_land_scope(allow_dirty: bool, status: Option<&str>) -> Result<Option<
     };
 
     // The path list is authoritative; the diff is only ever shown to the
-    // model, so a path is never recovered from it. Asking for the list first
-    // also means saves that cancel out cost nothing to rule out.
-    let paths = changed_paths_for_base(&stack.base)?;
+    // model, so a path is never recovered from it.
+    let (paths, diff) = saved_changes(&stack.base)?;
     if paths.is_empty() {
         println!(
             "{} {}",
@@ -1185,12 +1181,10 @@ fn collect_land_scope(allow_dirty: bool, status: Option<&str>) -> Result<Option<
         return Ok(None);
     }
 
-    let files = ChangedFiles::new(paths, diff_for_base(&stack.base)?);
-
     Ok(Some(LandScope {
         base: stack.base,
         save_count: stack.count,
-        files,
+        files: ChangedFiles::new(paths, diff),
     }))
 }
 
@@ -1281,13 +1275,8 @@ fn render_land_plan(commits: &[CommitGroup], save_count: usize) -> String {
             plan.push_str(&format!("     {} {}\n", glyph.dimmed(), file));
         }
 
-        if let Some(hidden) = commit.files.len().checked_sub(MAX_PLAN_FILES_SHOWN)
-            && hidden > 0
-        {
-            plan.push_str(&format!(
-                "     {}\n",
-                format!("… and {hidden} more").dimmed()
-            ));
+        if let Some(note) = overflow_note(commit.files.len(), MAX_PLAN_FILES_SHOWN) {
+            plan.push_str(&format!("     {}\n", note.dimmed()));
         }
     }
 
@@ -2200,6 +2189,112 @@ mod tests {
         );
     }
 
+    /// A rename reaches landing as a deletion plus an addition. Both halves
+    /// have to be staged, or the old file survives into the landed tree.
+    #[test]
+    fn landing_a_rename_drops_the_old_path_and_preserves_the_tree() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "old.txt", "one\ntwo\nthree\nfour\nfive\n");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "chore: add old"]);
+
+        git(&repo.path, &["mv", "old.txt", "new.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let pre_land_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        assert_eq!(scope.files.paths(), ["new.txt", "old.txt"]);
+
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit(
+                "refactor: rename old to new",
+                &["new.txt", "old.txt"],
+            )],
+        )
+        .expect("a rename should land");
+
+        assert_eq!(
+            git(&repo.path, &["rev-parse", "HEAD^{tree}"]),
+            pre_land_tree
+        );
+        let listed = git(&repo.path, &["ls-tree", "--name-only", "HEAD"]);
+        assert!(listed.lines().any(|line| line == "new.txt"), "{listed}");
+        assert!(!listed.lines().any(|line| line == "old.txt"), "{listed}");
+    }
+
+    /// A mode change carries no hunks at all, so there is nothing but the
+    /// path to go on.
+    #[cfg(unix)]
+    #[test]
+    fn landing_a_mode_only_change_stages_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "run.sh", "echo hi\n");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "chore: add script"]);
+
+        std::fs::set_permissions(
+            repo.path.join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("script should become executable");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let pre_land_tree = git(&repo.path, &["rev-parse", "HEAD^{tree}"]);
+        let scope = collect_land_scope_in_repo(&repo.path, false)
+            .expect("land scope should collect")
+            .expect("kite saves should be landable");
+        assert_eq!(scope.files.paths(), ["run.sh"]);
+
+        execute_land_in_repo(
+            &repo.path,
+            &scope.base,
+            &[files_commit("chore: make run.sh executable", &["run.sh"])],
+        )
+        .expect("a mode change should land");
+
+        assert_eq!(
+            git(&repo.path, &["rev-parse", "HEAD^{tree}"]),
+            pre_land_tree
+        );
+        assert_eq!(
+            git(&repo.path, &["ls-tree", "HEAD", "run.sh"])
+                .split_whitespace()
+                .next(),
+            Some("100755")
+        );
+    }
+
+    #[test]
+    fn collect_land_scope_reports_nothing_when_the_saves_cancel_out() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        write_file(&repo.path, "scratch.txt", "temporary\n");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        std::fs::remove_file(repo.path.join("scratch.txt")).expect("file should be removed");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:01"]);
+
+        // Two real saves sit on top of the base, but between them they changed
+        // nothing. Landing must decline rather than plan an empty commit.
+        let scope =
+            collect_land_scope_in_repo(&repo.path, false).expect("land scope should resolve");
+        assert!(scope.is_none());
+    }
+
     /// `core.quotepath` is on by default, so a non-ASCII path git prints
     /// without `-z` comes back C-escaped and names no file at all.
     #[test]
@@ -2329,6 +2424,20 @@ mod tests {
             git(&repo.path, &["rev-parse", "HEAD^{tree}"]),
             pre_land_tree
         );
+    }
+
+    #[test]
+    fn render_land_plan_lists_every_file_at_exactly_the_cap() {
+        colored::control::set_override(false);
+
+        let many: Vec<String> = (0..MAX_PLAN_FILES_SHOWN)
+            .map(|index| format!("src/f{index}.rs"))
+            .collect();
+        let listed: Vec<&str> = many.iter().map(String::as_str).collect();
+        let plan = render_land_plan(&[files_commit("chore: sweep", &listed)], 1);
+
+        assert!(plan.contains(&format!("└─ src/f{}.rs\n", MAX_PLAN_FILES_SHOWN - 1)));
+        assert!(!plan.contains("… and"));
     }
 
     #[test]
