@@ -28,7 +28,7 @@ const WORKFLOW_HELP: &str = "\
 Everyday flow:
   kt              quicksave everything on the current branch
   kt land         rewrite your saves into reviewable commits
-  kt publish      push the branch (force-with-lease)
+  kt publish      push the branch (force-with-lease), or `kt push`
   kt pr           open a GitHub pull request with gh
 
 Run `kt <command> --help` for details.";
@@ -68,6 +68,7 @@ enum Commands {
         no_verify: bool,
     },
     /// Publish the current branch after reviewing local history
+    #[command(visible_alias = "push")]
     Publish,
     /// Open a GitHub pull request for the current branch (requires gh)
     Pr {
@@ -442,6 +443,20 @@ mod tests {
             git(&repo.path, &["status", "--porcelain"]).contains("tracked.txt"),
             "the pending edit was unexpectedly committed"
         );
+    }
+
+    #[test]
+    fn push_is_a_visible_alias_for_publish() {
+        assert!(matches!(
+            Cli::parse_from(["kt", "push"]).command,
+            Some(Commands::Publish)
+        ));
+        assert!(matches!(
+            Cli::parse_from(["kt", "publish"]).command,
+            Some(Commands::Publish)
+        ));
+        // Visible, so it shows up for someone reading `kt --help`.
+        assert!(render_help().contains("[aliases: push]"));
     }
 
     #[test]
