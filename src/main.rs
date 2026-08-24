@@ -103,8 +103,11 @@ fn run(cli: Cli) -> Result<()> {
     } else {
         None
     };
-    let interrupted_land = inside_repo && recovery_blocks_commands()?;
-    if interrupted_land && !matches!(&cli.command, Some(Commands::Undo)) {
+    // `kt undo` is the recovery command, so it is never blocked by the state
+    // it exists to clear: it inspects that state itself and reports what it
+    // finds. Checking here first would make the advice every other command
+    // gives ("run `kt undo`") impossible to follow.
+    if inside_repo && !matches!(&cli.command, Some(Commands::Undo)) && recovery_blocks_commands()? {
         anyhow::bail!(
             "A `kt land` was interrupted in this worktree. Run `kt undo` to recover its saves before doing anything else."
         );
@@ -477,6 +480,39 @@ mod tests {
         ));
         // Visible, so it shows up for someone reading `kt --help`.
         assert!(render_help().contains("[aliases: push]"));
+    }
+
+    /// Every other command points at `kt undo` when recovery state is
+    /// unreadable, so dispatch must let `kt undo` through to say what it
+    /// found rather than repeating the same advice back.
+    #[test]
+    fn undo_stays_reachable_when_the_marker_cannot_be_classified() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let head = git(&repo.path, &["rev-parse", "HEAD"]);
+        let branch = git(&repo.path, &["branch", "--show-current"]);
+
+        // A half-written legacy marker: a pointer and a branch, but no owner
+        // or landed HEAD, so nothing can be restored from it.
+        git(
+            &repo.path,
+            &["update-ref", "refs/kite/pre_land", head.trim()],
+        );
+        git(
+            &repo.path,
+            &["config", "--local", "kite.preland.branch", branch.trim()],
+        );
+
+        let error = crate::test_support::with_repo_cwd(&repo.path, || {
+            run(Cli {
+                command: Some(Commands::Undo),
+            })
+        })
+        .expect_err("an unclassifiable marker cannot be undone");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("cannot be undone safely"), "{rendered}");
+        assert!(rendered.contains("refs/kite/land_state"), "{rendered}");
     }
 
     #[test]
