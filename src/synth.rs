@@ -378,6 +378,67 @@ index 3333333..4444444 100644
         assert_single_group(parsed, "chore: update deps", "Cargo.toml");
     }
 
+    /// The reply shape changed when hunk grouping was removed. A model or a
+    /// cached prompt still answering in the old shape must fail loudly and be
+    /// retried, not parse into groups that assign nothing.
+    #[test]
+    fn parse_groups_rejects_a_reply_that_assigns_no_files() {
+        let old_shape = r#"[{"message":"feat: add parser","hunks":["h1"]}]"#;
+        parse_groups(old_shape).expect_err("a reply without `files` should not parse");
+
+        parse_groups("[]").expect_err("an empty array carries no plan");
+        parse_groups("not json at all").expect_err("prose alone carries no plan");
+    }
+
+    #[test]
+    fn validate_group_coverage_reports_every_file_when_nothing_came_back() {
+        let err = validate_group_coverage(&[], &paths(&["src/main.rs", "README.md"]))
+            .expect_err("an empty plan covers nothing");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("missing files: src/main.rs, README.md"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn normalize_groups_keeps_the_order_the_model_chose() {
+        let files = ChangedFiles::new(
+            paths(&["src/main.rs", "README.md", "Cargo.toml"]),
+            SAMPLE_DIFF.to_string(),
+        );
+
+        let normalized = normalize_groups(
+            vec![
+                CommitGroup {
+                    message: "chore: deps".to_string(),
+                    files: vec!["Cargo.toml".to_string()],
+                },
+                // Every path here is a repeat, so this group empties out and
+                // must not become a commit with nothing in it.
+                CommitGroup {
+                    message: "chore: nothing left".to_string(),
+                    files: vec!["Cargo.toml".to_string()],
+                },
+                CommitGroup {
+                    message: "feat: the rest".to_string(),
+                    files: vec!["README.md".to_string(), "src/main.rs".to_string()],
+                },
+            ],
+            &files,
+        );
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].message, "chore: deps");
+        assert_eq!(normalized[1].message, "feat: the rest");
+        // Order within a group is the model's too: foundational first.
+        assert_eq!(
+            normalized[1].files,
+            vec!["README.md".to_string(), "src/main.rs".to_string()]
+        );
+    }
+
     #[test]
     fn validate_group_coverage_requires_full_exact_assignment() {
         let changed = paths(&["src/main.rs", "README.md"]);
