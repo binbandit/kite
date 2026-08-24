@@ -29,11 +29,11 @@
 - `--allow-dirty` temporarily stashes local changes before landing and restores them afterward so only contiguous `[kite] save` commits are rewritten.
 - Operate only on contiguous `[kite] save` commits at the top of history.
 - Build the synthesis prompt from:
-  - the diff introduced by those saves, split into labeled hunks the AI assigns to commits (so one file's changes can land as several commits)
+  - the diff introduced by those saves, plus the list of changed files the AI assigns to commits (every file lands whole in exactly one commit)
   - recent non-Kite commit messages from the current repo as style examples
 - Synthesize with the OpenAI Responses API using the configured base URL, model, API key, and `KITE_OPENAI_TIMEOUT_SECS` or default 120 seconds; if it is unavailable, a manual fallback asks for one commit message before rewriting history.
-- Verify a hunk-level plan against a temporary index before rewriting; if the replayed commits would not reproduce the saved tree exactly, land whole files instead.
-- Show the proposed grouped commit plan before rewriting anything (split files are annotated like `(1/2 hunks)`); `--yes` skips only the confirmation prompt.
+- Stage each landed commit as whole files, so hooks, linters, and formatters only ever see complete files.
+- Show the proposed grouped commit plan, listing the files under each commit, before rewriting anything; `--yes` skips only the confirmation prompt.
 - Record the pre-land `HEAD` at `refs/kite/pre_land`, and store the complete transaction phase, target, owner, and keepalive in one atomic compare-and-swap marker.
 - Build commits on one exact, transaction-owned temporary branch for hook compatibility, then delete only that recorded ref with its expected commit id.
 - Run the repository's commit hooks by default; `--no-verify` commits with `git commit --no-verify`, so the `pre-commit` and `commit-msg` hooks do not run. Landing never bypasses the `pre-push` hook — `--push` publishes normally.
@@ -43,7 +43,7 @@
 - Refuse history-changing Kite commands while Git has a merge, rebase, cherry-pick, revert, bisect, `git am`, or sequencer operation in progress.
 - Rewrite history locally by default.
 - If `--push` is passed, publish immediately after a successful local land.
-- If AI misses hunks, each joins the commit already touching its file when that is unambiguous; the rest land in a final `chore: unclassified updates` commit.
+- If AI misses files, they land in a final `chore: unclassified updates` commit rather than being dropped.
 
 ### `kt publish`
 

@@ -44,7 +44,7 @@ kt land
 
 Kite analyzes the diff introduced by those saves, proposes logical commit groups, and only rewrites history after you confirm the plan.
 
-Grouping is hunk-level: when one file contains changes for different purposes, its hunks can land in different commits. The plan marks split files with `(1/2 hunks)`-style annotations. Before rewriting anything, Kite replays the hunk-level plan against a temporary index and requires the result to reproduce your saved state exactly; if it cannot, it lands whole files instead.
+Grouping is file-level: every file lands whole, in exactly one commit. That keeps each commit something your tooling can actually run: a pre-commit hook, linter, or formatter always sees complete files, never a half-applied one.
 
 Kite also feeds recent non-Kite commit messages from the current repository into the prompt so landed messages follow the repo's existing style when possible. If the repo does not show a clear pattern, Kite falls back to Conventional Commit style.
 
@@ -66,6 +66,8 @@ kt pr
 Kite gathers everything a good pull request needs, drafts it with the same AI as `kt land`, shows you the result, and only creates it after you confirm. See [`kt pr`](#kt-pr) below for details.
 
 ## Installation
+
+Kite drives the `git` binary on your PATH and needs version 2.25 or newer.
 
 Ensure you have Rust installed, then build and install the binary globally:
 
@@ -141,10 +143,8 @@ Synthesizes contiguous Kite quicksaves into a polished local history.
 - Works on a detached `HEAD`: the landed commits are left under `HEAD` itself and no branch is moved. `--push` still needs a branch, and says so before anything is rewritten.
 - Refuses to start during an active merge, rebase, cherry-pick, revert, bisect, `git am`, or sequencer operation; their temporary detached checkouts are not standalone worktrees.
 - Only rewrites contiguous `[kite] save` commits at the top of history, following first-parent history so a merge cannot move the starting point.
-- Splits changes by hunk, so one file can contribute to multiple commits. Binary files, mode changes, and renames stay whole.
-- Very large sets of saves group by file instead of by hunk, and say so. Past a few hundred hunks the model cannot be shown enough of each one to tell them apart, and grouping whole files it can actually read beats guessing at hunks it never saw.
-- Verifies the hunk-level plan against a temporary index first; if the replayed commits would not reproduce your saved state bit-for-bit, Kite falls back to whole-file grouping.
-- Shows the proposed commit plan before rewriting anything.
+- Groups whole files: every changed file lands in exactly one commit, so hooks and linters never see a partially applied file.
+- Shows the proposed commit plan, with the files under each commit, before rewriting anything.
 - Stores the pre-land `HEAD` in `refs/kite/pre_land` and updates the full rollback transaction atomically, so `kt undo` can restore it later without linked worktrees observing a half-written marker.
 - Creates normal `git commit`s, so hooks do run during landing. Pass `--no-verify` to skip them.
 - Landing builds on one uniquely named temporary branch so ordinary Git hooks see a normal checkout. It records that exact ref, moves your branch with a compare-and-swap — or, if you were already detached, moves `HEAD` itself — and removes the temporary branch before returning.
@@ -301,8 +301,7 @@ Kite keeps the risky parts explicit:
 - **No clobbering other people:** `kt go` adopts a branch that already exists on the remote instead of forking over it, and `kt publish` refuses to silently discard remote commits that are not the saves you just landed.
 - **Failure leaves no mess:** landing deletes its exact temporary branch and never overwrites your working files, so a normal failure puts you back where you were — branch or detached commit — with nothing staged and nothing to clean up. If the process itself is interrupted, the originating worktree is blocked until `kt undo` performs the same recovery explicitly.
 - **Concurrent-command guard:** one Kite command at a time may mutate a worktree, and branch moves use expected old commit ids. A branch advanced or checked out elsewhere is left untouched.
-- **No dropped changes:** If the AI misses hunks, each one joins the commit already touching its file, or lands in a `chore: unclassified updates` commit — never silently omitted.
-- **Exact-tree verification:** A hunk-level plan is replayed in a temporary index before any rewrite and must reproduce the pre-land tree exactly, otherwise Kite lands whole files instead.
+- **No dropped changes:** If the AI misses a file, it still lands, in a `chore: unclassified updates` commit, rather than being silently omitted.
 - **Explicit publish:** Landing is local by default. Publishing remains a separate step unless you opt into `--push`.
 - **Preview before PR:** `kt pr` shows the full title and body and asks for confirmation before anything reaches GitHub.
 
