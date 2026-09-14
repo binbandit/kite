@@ -21,15 +21,15 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 - Use `kt` to quicksave tracked and untracked changes without hooks.
 - Use `kt land` to preview and rewrite contiguous Kite saves into grouped local commits.
 - Use `kt publish` to push a landed branch after review.
-- Use `kt pr` to open a GitHub pull request for a landed branch. It requires the `gh` CLI, refuses to run with unlanded saves, and previews the drafted title and body before creating anything. If the branch's pull request is already open, it pushes new commits and offers a refreshed body when the existing one has gone stale.
-- Use `kt undo` only when the user explicitly wants to reverse a previous land.
+- Use `kt pr` to open a GitHub pull request for a landed branch. It requires `gh` and publishes the branch before previewing the title and body. Declining the preview prevents PR creation or editing, but does not undo the push. An existing PR can receive new commits and a refreshed body.
+- Use `kt undo` when the user explicitly wants to reverse a quicksave or the last land.
 
 3. Treat history-rewriting commands as high-impact.
 
 - `kt land` rewrites recent Kite save history.
 - `kt publish` and `kt undo` may force-push.
 - `kt pr` publishes the branch when needed and creates a pull request on GitHub after user confirmation (or immediately with `--yes`).
-- `kt undo` performs a hard reset and may force-push.
+- Undoing a save preserves working files and clears staging. Undoing a completed land requires a clean tree and may restore its saves remotely, only if the remote still points to the exact landed commit.
 - If the user asked you to "use Kite" but did not explicitly ask for history rewriting, explain the effect before running `kt land` or `kt undo`.
 
 ## Operating Rules
@@ -41,7 +41,9 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 - A detached `HEAD` is fine for `kt`, `kt land`, and `kt undo` — they move `HEAD` itself. Only `kt publish`, `kt pr`, and `kt land --push` need a branch, so create one with `git switch -c <name>` when the user actually wants to push.
 - Kite refuses history-changing commands during an active rebase, merge, cherry-pick, revert, bisect, `git am`, or sequencer operation; finish or abort Git's operation first.
 - If landing falls back to manual mode, provide a commit message that matches the repo's existing style when possible.
-- If a landed commit is blocked by hooks, leave the staged changes intact and help fix the hook failure. Only reach for `kt land --no-verify` when the user asks to bypass the hooks.
+- If a landed commit is blocked by hooks, Kite restores the saves and preserves hook edits as unstaged changes. Help fix and save those changes before retrying. Only reach for `kt land --no-verify` when the user asks to bypass the hooks.
+- If a land is interrupted, use `kt undo` in the originating worktree to recover it. This also restores work stashed by `--allow-dirty`, even if interruption happened during AI planning. Do not delete the worktree or its recovery state to bypass this check.
+- Saves that cancel each other out can still be landed without AI. Do not add artificial changes just to make them landable.
 - After running any Kite command, summarize what changed in the worktree, branch, and remote state.
 
 ## Reference
