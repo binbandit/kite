@@ -1,20 +1,13 @@
-//! Pairs the paths a set of saves changed with the diff explaining them, so
-//! synthesis can group whole files into commits.
+//! Changed paths and their diff, used to group whole files into commits.
 //!
-//! Grouping is file-level on purpose: a commit always carries a file's
-//! complete change, so linters, formatters, and pre-commit hooks only ever
-//! see whole, coherent files.
-//!
-//! Paths come from git already separated, never read back out of the diff
-//! text: git C-quotes any path containing a quote, a backslash, or a newline
-//! in its `diff --git` header, and a path recovered from there would no
-//! longer name the file it came from.
+//! Paths come from Git's separate, unambiguous path list. Parsing paths from
+//! diff headers would mishandle Git's quoting of unusual filenames.
 
-use std::borrow::Cow;
 use std::ops::Range;
 
-/// Floor for each file's share of the prompt body budget.
-const MIN_FILE_BODY_BYTES: usize = 400;
+pub(crate) const MAX_DIFF_BYTES: usize = 60_000;
+
+const TRIMMED: &str = "(trimmed)\n";
 
 /// The files a set of saves changed, and the diff describing them.
 #[derive(Clone, Debug)]
@@ -33,38 +26,24 @@ impl ChangedFiles {
         &self.paths
     }
 
-    /// Compact `- <path>` list. Always included whole in the prompt, so the
-    /// model sees every path even when the diff below it gets trimmed.
-    pub(crate) fn render_index(&self) -> String {
-        // Never trimmed, so on a branch touching thousands of files this is
-        // the biggest string the module builds. Size it once up front.
-        let mut index = String::with_capacity(self.paths.iter().map(|path| path.len() + 3).sum());
-        for path in &self.paths {
-            index.push_str("- ");
-            index.push_str(path);
-            index.push('\n');
-        }
-        index
-    }
-
-    /// The diff itself. When it does not fit `budget`, every file gets a fair
-    /// share of it rather than the tail files losing their content entirely:
-    /// a file the model never saw is a file it groups blind.
-    pub(crate) fn render_diff(&self, budget: usize) -> Cow<'_, str> {
+    /// Shares the byte budget across files so later changes get context too.
+    pub(crate) fn render_diff(&self, budget: usize) -> String {
         if self.diff.len() <= budget {
-            return Cow::Borrowed(&self.diff);
+            return self.diff.clone();
         }
 
-        // Only the trimming path needs section boundaries, and a diff that
-        // fits is handed back untouched, so this scan stays off the common
-        // path.
         let sections = section_ranges(&self.diff);
-        let cap = (budget / sections.len().max(1)).max(MIN_FILE_BODY_BYTES);
-        let mut rendered = String::with_capacity(budget.min(self.diff.len()));
+        let mut rendered = String::with_capacity(budget);
+        if sections.is_empty() {
+            push_capped(&mut rendered, &self.diff, budget);
+            return rendered;
+        }
+
+        let cap = budget / sections.len();
         for section in sections {
             push_capped(&mut rendered, &self.diff[section], cap);
         }
-        Cow::Owned(rendered)
+        rendered
     }
 }
 
@@ -94,15 +73,18 @@ fn push_capped(out: &mut String, text: &str, cap: usize) {
         out.push_str(text);
         return;
     }
+    let Some(body_cap) = cap.checked_sub(TRIMMED.len()) else {
+        return;
+    };
     let mut used = 0;
     for line in text.split_inclusive('\n') {
-        if used + line.len() > cap {
+        if used + line.len() > body_cap {
             break;
         }
         out.push_str(line);
         used += line.len();
     }
-    out.push_str("(trimmed)\n");
+    out.push_str(TRIMMED);
 }
 
 #[cfg(test)]
@@ -143,7 +125,6 @@ index 3333333..4444444 100644
         let files = sample();
 
         assert_eq!(files.paths(), ["src/a.rs", "docs/b.md"]);
-        assert_eq!(files.render_index(), "- src/a.rs\n- docs/b.md\n");
         assert_eq!(files.render_diff(usize::MAX), SAMPLE);
     }
 
@@ -183,10 +164,8 @@ index 3333333..4444444 100644
             diff.clone(),
         );
 
-        // A diff that fits is handed over without being copied.
-        assert!(matches!(files.render_diff(usize::MAX), Cow::Borrowed(_)));
-
         let trimmed = files.render_diff(1_000);
+        assert!(trimmed.len() <= 1_000);
         assert!(trimmed.contains("diff --git a/big.txt b/big.txt"));
         assert!(trimmed.contains("(trimmed)"));
         // The tail file keeps its content rather than being cut off entirely.
@@ -221,7 +200,7 @@ index 1111111..2222222 100644
 
         assert_eq!(section_ranges(diff).len(), 1);
         assert_eq!(files.render_diff(usize::MAX), diff);
-        assert_eq!(files.render_diff(8), diff);
+        assert!(files.render_diff(8).len() <= 8);
     }
 
     /// A mode change produces a section with no hunks at all.
@@ -236,13 +215,10 @@ new mode 100755
 
         assert_eq!(section_ranges(diff).len(), 1);
         assert_eq!(files.render_diff(usize::MAX), diff);
-        assert_eq!(files.render_index(), "- run.sh\n");
     }
 
     #[test]
-    fn render_diff_gives_every_file_a_floor_under_a_tiny_budget() {
-        // Two files far past a budget that would divide into nothing: the
-        // floor is what keeps the second one from being rendered blind.
+    fn render_diff_respects_even_tiny_budgets() {
         let body: String = (0..40)
             .map(|line| format!("+padding line {line} with a good deal of text\n"))
             .collect();
@@ -255,15 +231,9 @@ new mode 100755
             diff.clone(),
         );
 
-        let rendered = files.render_diff(10);
-
-        assert!(rendered.contains("diff --git a/one.txt b/one.txt"));
-        assert!(rendered.contains("diff --git a/two.txt b/two.txt"));
-        assert_eq!(rendered.matches("(trimmed)").count(), 2);
-        // Without the floor, a ten-byte budget across two files is five bytes
-        // each: not one whole line. Both still open with real content.
-        assert_eq!(rendered.matches("+padding line 0 ").count(), 2);
-        assert!(rendered.len() < diff.len());
+        for budget in [0, 1, 8, 10, 100, 400, 1_000] {
+            assert!(files.render_diff(budget).len() <= budget);
+        }
     }
 
     #[test]
@@ -288,7 +258,6 @@ Binary files a/logo.png and b/logo.png differ
         );
 
         assert_eq!(files.paths(), ["new\nline.txt", "logo.png"]);
-        assert_eq!(files.render_index(), "- new\nline.txt\n- logo.png\n");
         assert_eq!(section_ranges(diff).len(), 2);
     }
 
@@ -297,7 +266,6 @@ Binary files a/logo.png and b/logo.png differ
         let files = ChangedFiles::new(Vec::new(), String::new());
 
         assert!(files.paths().is_empty());
-        assert_eq!(files.render_index(), "");
         assert_eq!(files.render_diff(usize::MAX), "");
     }
 }

@@ -1,8 +1,4 @@
-//! AI layer shared by every AI-assisted command.
-//!
-//! `complete` sends the request to the model and hands the raw reply to the
-//! caller's `parse` closure. A reply that fails to parse counts as a failure,
-//! so callers fall back to their manual flow instead of aborting.
+//! Sends AI requests and returns reply text. Commands parse and validate it.
 
 use anyhow::{Context, Result};
 use std::env;
@@ -19,29 +15,20 @@ const MAX_ERROR_BODY_CHARS: usize = 400;
 
 /// One structured request: a system prompt, a user prompt, and the JSON schema
 /// the reply must satisfy (enforced natively by the Responses API).
-pub(crate) struct Request<'a> {
-    pub(crate) system: &'a str,
-    pub(crate) user: &'a str,
-    pub(crate) schema_name: &'a str,
+pub(crate) struct Request {
+    pub(crate) system: String,
+    pub(crate) user: String,
+    pub(crate) schema_name: String,
     pub(crate) schema: serde_json::Value,
 }
 
-/// An AI call that failed, and whether trying the same request again could
-/// plausibly succeed. Retrying a rejected key, an unknown model, or a schema
-/// the endpoint will not accept just spends the user's time three times over.
+/// Provider failure with enough detail to choose whether to retry.
 #[derive(Debug)]
-pub(crate) struct AiError {
+struct AiError {
     message: String,
     retryable: bool,
-    /// The provider refused the native strict-schema `format` field, so the
-    /// same request stands a chance if retried as a plain JSON-object reply.
+    /// Retry without native schema enforcement when a gateway rejects it.
     native_schema_rejected: bool,
-}
-
-impl AiError {
-    fn rejects_native_schema(&self) -> bool {
-        self.native_schema_rejected
-    }
 }
 
 impl std::fmt::Display for AiError {
@@ -52,28 +39,11 @@ impl std::fmt::Display for AiError {
 
 impl std::error::Error for AiError {}
 
-/// Parse and coverage problems carry no `AiError` and are always worth
-/// another attempt — that retry loop is what makes synthesis reliable.
+/// Transport failures follow provider retry rules; invalid model output can retry.
 pub(crate) fn is_retryable(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<AiError>()
         .is_none_or(|failure| failure.retryable)
-}
-
-pub(crate) async fn complete<T>(
-    request: &Request<'_>,
-    parse: impl Fn(&str) -> Result<T>,
-) -> Result<T> {
-    ask_openai(request).await.and_then(|raw| parse(&raw))
-}
-
-pub(crate) fn flatten_error(error: &str) -> String {
-    error
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" | ")
 }
 
 /// One client for the process; timeouts vary per request, connections pool.
@@ -87,7 +57,7 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
-async fn ask_openai(request: &Request<'_>) -> Result<String> {
+pub(crate) async fn complete(request: &Request) -> Result<String> {
     let (base_url, model, api_key) = openai_env_config()?;
     let timeout = env_duration_secs("KITE_OPENAI_TIMEOUT_SECS", DEFAULT_OPENAI_TIMEOUT_SECS)?;
     let responses_url = format!("{}/responses", base_url.trim_end_matches('/'));
@@ -101,16 +71,13 @@ async fn ask_openai(request: &Request<'_>) -> Result<String> {
     )
     .await
     {
-        Err(failure) if failure.rejects_native_schema() => {
-            // Some gateway providers (notably Bedrock-hosted Anthropic) reject
-            // the `format` field outright. Fall back to a schema-less JSON reply
-            // and describe the shape in the prompt instead; `extract_json_block`
-            // tolerates the fenced or prose-wrapped output that results.
+        Err(failure) if failure.native_schema_rejected => {
+            // Some gateways reject `format`; describe the schema in the prompt instead.
             send_responses(
                 &responses_url,
                 &api_key,
                 timeout,
-                json_object_body(&model, request),
+                prompt_schema_body(&model, request),
             )
             .await
             .map_err(Into::into)
@@ -120,7 +87,7 @@ async fn ask_openai(request: &Request<'_>) -> Result<String> {
 }
 
 /// The strict, server-enforced schema request — correct wherever it is honored.
-fn strict_schema_body(model: &str, request: &Request<'_>) -> serde_json::Value {
+fn strict_schema_body(model: &str, request: &Request) -> serde_json::Value {
     serde_json::json!({
         "model": model,
         "instructions": request.system,
@@ -136,9 +103,8 @@ fn strict_schema_body(model: &str, request: &Request<'_>) -> serde_json::Value {
     })
 }
 
-/// The portable request: ask for any JSON object and carry the schema in the
-/// prompt, so providers that refuse a `format` field still return usable JSON.
-fn json_object_body(model: &str, request: &Request<'_>) -> serde_json::Value {
+/// Providers that reject `format` need it omitted entirely, including JSON mode.
+fn prompt_schema_body(model: &str, request: &Request) -> serde_json::Value {
     let instructions = format!(
         "{}\n\nRespond with a single JSON object and nothing else. It must satisfy this JSON Schema:\n{}",
         request.system, request.schema
@@ -146,8 +112,7 @@ fn json_object_body(model: &str, request: &Request<'_>) -> serde_json::Value {
     serde_json::json!({
         "model": model,
         "instructions": instructions,
-        "input": request.user,
-        "text": { "format": { "type": "json_object" } }
+        "input": request.user
     })
 }
 
@@ -177,10 +142,7 @@ async fn send_responses(
 
     let status = response.status();
     if !status.is_success() {
-        // The body is where the endpoint says what was actually wrong —
-        // an unknown model, a rejected schema, an expired key. Dropping it,
-        // as `error_for_status` does, leaves the user with a bare status code
-        // and an AI that appears to never work for no stated reason.
+        // Preserve the provider's explanation, not just its HTTP status.
         let body = response.text().await.unwrap_or_default();
         return Err(AiError {
             message: describe_api_failure(status, &body),
@@ -205,14 +167,15 @@ async fn send_responses(
         native_schema_rejected: false,
     })?;
 
-    Ok(extract_openai_output_text(&json))
+    extract_openai_output_text(&json)
 }
 
 /// A gateway rejecting the `format` field looks like a 400 complaining that the
 /// output format / extra inputs are not permitted.
 fn mentions_format_rejection(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
-    body.contains("extra inputs are not permitted") || body.contains("output_config.format")
+    body.contains("output_config.format")
+        || (body.contains("format") && body.contains("extra inputs are not permitted"))
 }
 
 /// 4xx means the request itself is wrong and will stay wrong; the throttling
@@ -235,12 +198,13 @@ fn describe_api_failure(status: reqwest::StatusCode, body: &str) -> String {
                         .map(ToOwned::to_owned)
                 })
         })
-        .unwrap_or_else(|| elide(body.trim(), MAX_ERROR_BODY_CHARS));
+        .unwrap_or_else(|| body.trim().to_string());
+    let detail = elide(&detail, MAX_ERROR_BODY_CHARS);
 
     let hint = match status.as_u16() {
-        401 | 403 => " — check the API key in KITE_OPENAI_API_KEY or OPENAI_API_KEY",
-        404 => " — check the model in KITE_OPENAI_MODEL and the base URL",
-        429 => " — rate limited or out of quota",
+        401 | 403 => " - check the API key in KITE_OPENAI_API_KEY or OPENAI_API_KEY",
+        404 => " - check the model in KITE_OPENAI_MODEL and the base URL",
+        429 => " - rate limited or out of quota",
         _ => "",
     };
 
@@ -260,7 +224,10 @@ fn elide(text: &str, max_chars: usize) -> String {
 }
 
 fn url_uses_portkey(url: &str) -> bool {
-    url.to_ascii_lowercase().contains("portkey")
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.host_str()
+            .is_some_and(|host| host == "portkey.ai" || host.ends_with(".portkey.ai"))
+    })
 }
 
 fn openai_env_config() -> Result<(String, String, String)> {
@@ -283,7 +250,7 @@ fn openai_env_config() -> Result<(String, String, String)> {
         "AI_GATEWAY_API_KEY",
     ])
     .context(
-        "No OpenAI API key found in KITE_OPENAI_API_KEY, OPENAI_API_KEY, KITE_API_KEY, or OPENAI_KEY",
+        "No OpenAI API key found in KITE_OPENAI_API_KEY, OPENAI_API_KEY, KITE_API_KEY, OPENAI_KEY, or AI_GATEWAY_API_KEY",
     )?;
 
     Ok((normalize_openai_base_url(&base_url), model, api_key))
@@ -304,11 +271,48 @@ fn normalize_openai_base_url(base_url: &str) -> String {
 
 /// Pulls the reply text out of a Responses API payload, tolerating structured
 /// output items, plain text items, and chat-completions-shaped proxies.
-fn extract_openai_output_text(json: &serde_json::Value) -> String {
+fn extract_openai_output_text(json: &serde_json::Value) -> std::result::Result<String, AiError> {
+    let failure = |message: String, retryable| AiError {
+        message,
+        retryable,
+        native_schema_rejected: false,
+    };
+    if let Some(error) = json.get("error").filter(|error| !error.is_null()) {
+        let detail = error.get("message").and_then(|value| value.as_str());
+        return Err(failure(
+            format!(
+                "AI response failed: {}",
+                elide(
+                    detail.unwrap_or("unknown provider error"),
+                    MAX_ERROR_BODY_CHARS
+                )
+            ),
+            matches!(
+                error.get("code").and_then(|value| value.as_str()),
+                Some("server_error" | "rate_limit_exceeded")
+            ),
+        ));
+    }
+    if let Some(status) = json.get("status").and_then(|value| value.as_str())
+        && status != "completed"
+    {
+        let reason = json
+            .pointer("/incomplete_details/reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or(status);
+        return Err(failure(
+            format!(
+                "AI response did not complete: {}",
+                elide(reason, MAX_ERROR_BODY_CHARS)
+            ),
+            false,
+        ));
+    }
     if let Some(text) = json.get("output_text").and_then(|v| v.as_str()) {
-        return text.to_string();
+        return Ok(text.to_string());
     }
 
+    let mut text = String::new();
     for item in json
         .get("output")
         .and_then(|v| v.as_array())
@@ -322,18 +326,37 @@ fn extract_openai_output_text(json: &serde_json::Value) -> String {
             .flatten()
         {
             if let Some(structured) = content.get("json") {
-                return structured.to_string();
+                return Ok(structured.to_string());
             }
-            if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
-                return text.to_string();
+            if let Some(refusal) = content.get("refusal").and_then(|v| v.as_str()) {
+                return Err(failure(
+                    format!(
+                        "AI refused the request: {}",
+                        elide(refusal, MAX_ERROR_BODY_CHARS)
+                    ),
+                    false,
+                ));
+            }
+            if let Some(part) = content.get("text").and_then(|v| v.as_str()) {
+                text.push_str(part);
             }
         }
     }
 
-    json.pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+    if text.is_empty()
+        && let Some(content) = json
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+    {
+        text.push_str(content);
+    }
+    if text.is_empty() {
+        return Err(failure(
+            "AI response contained no output text".to_string(),
+            true,
+        ));
+    }
+    Ok(text)
 }
 
 fn first_non_empty_env(keys: &[&str]) -> Option<String> {
@@ -404,10 +427,127 @@ pub(crate) fn extract_json_block(raw: &str, open: char, close: char) -> Option<&
     None
 }
 
+pub(crate) fn truncate_for_prompt(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+
+    let mut cutoff = max_bytes;
+    while cutoff > 0 && !text.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+
+    &text[..cutoff]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn truncate_for_prompt_respects_char_boundaries() {
+        assert_eq!(truncate_for_prompt("abcdefgh", 8), "abcdefgh");
+        assert_eq!(truncate_for_prompt("abcdefghij", 8), "abcdefgh");
+        assert_eq!(truncate_for_prompt("héllo", 2), "h"); // no mid-codepoint cuts
+    }
+
+    fn local_response(payload: serde_json::Value) -> std::result::Result<String, AiError> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let length = String::from_utf8(request)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            socket.read_exact(&mut vec![0; length]).unwrap();
+            let body = payload.to_string();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(send_responses(
+                &url,
+                "test-key",
+                Duration::from_secs(5),
+                json!({}),
+            ));
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn response_text_in_multiple_parts_is_not_dropped() {
+        let reply = local_response(json!({
+            "status": "completed",
+            "output": [{ "content": [
+                { "type": "output_text", "text": "{\"groups\":" },
+                { "type": "output_text", "text": "[]}" }
+            ] }]
+        }))
+        .unwrap();
+
+        assert_eq!(reply, r#"{"groups":[]}"#);
+    }
+
+    #[test]
+    fn failed_response_reports_the_provider_error() {
+        let error = local_response(json!({
+            "status": "failed",
+            "error": { "code": "server_error", "message": "The provider could not complete this request" }
+        }))
+        .expect_err("a failed response is not model output");
+
+        assert!(
+            error
+                .to_string()
+                .contains("The provider could not complete this request")
+        );
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn incomplete_and_refused_responses_are_not_usable_output() {
+        let incomplete = local_response(json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output_text": "{\"groups\":[]}"
+        }))
+        .expect_err("even valid JSON must not conceal an incomplete response");
+        assert!(incomplete.to_string().contains("max_output_tokens"));
+        assert!(!incomplete.retryable);
+
+        let refused = local_response(json!({
+            "status": "completed",
+            "output": [{ "content": [{ "type": "refusal", "refusal": "Cannot process this request" }] }]
+        }))
+        .expect_err("a refusal is not an empty model reply");
+        assert!(refused.to_string().contains("Cannot process this request"));
+        assert!(!refused.retryable);
+    }
 
     #[test]
     fn extract_json_block_ignores_brackets_inside_strings() {
@@ -439,16 +579,19 @@ mod tests {
             ]
         });
 
-        assert_eq!(extract_openai_output_text(&payload), r#"{"groups":[]}"#);
+        assert_eq!(
+            extract_openai_output_text(&payload).unwrap(),
+            r#"{"groups":[]}"#
+        );
     }
 
     #[test]
     fn extract_openai_output_text_falls_back_to_output_text_and_chat_shapes() {
         let output_text = json!({ "output_text": "hello" });
-        assert_eq!(extract_openai_output_text(&output_text), "hello");
+        assert_eq!(extract_openai_output_text(&output_text).unwrap(), "hello");
 
         let chat = json!({ "choices": [ { "message": { "content": "from proxy" } } ] });
-        assert_eq!(extract_openai_output_text(&chat), "from proxy");
+        assert_eq!(extract_openai_output_text(&chat).unwrap(), "from proxy");
     }
 
     #[test]
@@ -557,6 +700,10 @@ mod tests {
     fn url_uses_portkey_detects_portkey_hosts_case_insensitively() {
         assert!(url_uses_portkey("https://example.PortKey.ai/v1/responses"));
         assert!(!url_uses_portkey("https://api.openai.com/v1/responses"));
+        assert!(!url_uses_portkey("https://example.com/portkey/responses"));
+        assert!(!url_uses_portkey(
+            "https://portkey.ai.example.com/v1/responses"
+        ));
     }
 
     #[test]
@@ -569,19 +716,22 @@ mod tests {
         let unrelated =
             r#"{"error":{"message":"Invalid schema for response_format 'commit_groups'."}}"#;
         assert!(!mentions_format_rejection(unrelated));
+        assert!(!mentions_format_rejection(
+            "reasoning: Extra inputs are not permitted"
+        ));
     }
 
     #[test]
-    fn json_object_body_embeds_the_schema_and_drops_strict_format() {
+    fn prompt_schema_body_omits_the_rejected_format_field_entirely() {
         let request = Request {
-            system: "You are terse.",
-            user: "Group the files.",
-            schema_name: "commit_groups",
+            system: "You are terse.".to_string(),
+            user: "Group the files.".to_string(),
+            schema_name: "commit_groups".to_string(),
             schema: json!({ "type": "object" }),
         };
-        let body = json_object_body("@bedrock-au/au.anthropic.claude-opus-4-8", &request);
+        let body = prompt_schema_body("@bedrock-au/au.anthropic.claude-opus-4-8", &request);
 
-        assert_eq!(body["text"]["format"]["type"], "json_object");
+        assert!(body.get("text").is_none());
         let instructions = body["instructions"].as_str().expect("instructions string");
         assert!(instructions.contains("You are terse."));
         assert!(instructions.contains("JSON Schema"));

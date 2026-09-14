@@ -5,18 +5,11 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::ai::flatten_error;
-
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_TICK: Duration = Duration::from_millis(80);
 
-/// Transient activity indicator for slow steps (AI calls, pushes). It animates
-/// `message` on the current line and erases itself when it goes away, so the
-/// lines printed afterwards are the only record of what happened. When stdout
-/// is not a terminal it prints nothing at all.
-///
-/// Cleanup lives in `Drop`, not only in `stop`, so an early return through `?`
-/// cannot leave a thread scribbling over the error message that follows it.
+/// Terminal-only activity indicator. Dropping it stops the animation and
+/// clears its line, including on early returns through `?`.
 pub(crate) struct Spinner {
     animation: Option<(Sender<()>, JoinHandle<()>)>,
 }
@@ -28,8 +21,7 @@ impl Spinner {
         }
 
         let message = message.into();
-        // A channel rather than a polled flag: dropping the sender wakes the
-        // thread at once instead of up to one tick later.
+        // Dropping the sender wakes the animation thread immediately.
         let (stop, stopped) = mpsc::channel();
         let animation = std::thread::spawn(move || {
             for frame in SPINNER_FRAMES.iter().cycle() {
@@ -92,13 +84,21 @@ pub(crate) fn prompt_line(question: &str) -> Result<Option<String>> {
     Ok((!answer.is_empty()).then(|| answer.to_string()))
 }
 
+pub(crate) fn flatten_error(error: &str) -> String {
+    error
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 pub(crate) fn print_ai_unavailable(error: &anyhow::Error) {
     println!("{} AI unavailable", "·".yellow());
     println!("  {}", flatten_error(&format!("{error:#}")).dimmed());
 }
 
-/// The dimmed tail line a capped list ends with, or `None` when the whole
-/// list was shown. Shared so every truncated list says the same thing.
+/// Shared wording for the hidden entries in a truncated list.
 pub(crate) fn overflow_note(total: usize, shown: usize) -> Option<String> {
     if total <= shown {
         return None;

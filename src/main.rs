@@ -9,7 +9,7 @@ mod ui;
 #[cfg(test)]
 mod test_support;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Local;
 use clap::{CommandFactory, Parser, Subcommand};
 use colored::*;
@@ -17,8 +17,8 @@ use std::process::ExitCode;
 
 use crate::git::{
     Hooks, SAVE_PREFIX, active_git_operation, check_ref, commit_git, execute_git,
-    execute_git_quiet, get_default_branch, has_remote, has_staged_changes, has_unmerged_paths,
-    is_inside_git_repository, is_staged_status_line, kite_save_stack, lock_current_worktree,
+    get_default_branch, has_remote, has_staged_changes, has_unmerged_paths,
+    is_inside_git_repository, kite_save_stack, lock_current_worktree,
 };
 use crate::land::{LandOptions, land, publish_current_branch, recovery_blocks_commands, undo};
 use crate::pr::{PrOptions, create_pull_request};
@@ -159,7 +159,7 @@ fn save() -> Result<()> {
     }
 
     // -uall lists files inside untracked directories, so the count is honest.
-    let status = execute_git(&["status", "--porcelain", "-uall"])?;
+    let status = execute_git(&["status", "--porcelain", "--ignore-submodules=none", "-uall"])?;
 
     // Committing here would either fail with a wall of git hints or record the
     // conflict markers as if they were real content.
@@ -181,13 +181,24 @@ fn save() -> Result<()> {
         return Ok(());
     }
 
-    let has_staged = has_staged_changes(&status);
-    let saved_files = if has_staged {
-        status.lines().filter(|l| is_staged_status_line(l)).count()
-    } else {
-        execute_git_quiet(&["add", "-A"])?;
-        status.lines().filter(|l| !l.trim().is_empty()).count()
-    };
+    if !has_staged_changes(&status) {
+        execute_git(&["add", "-A"])?;
+    }
+    // Dirty submodule contents cannot be staged in the parent repository.
+    let staged = execute_git(&[
+        "diff",
+        "--cached",
+        "--name-only",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "-z",
+    ])?;
+    let saved_files = staged.split('\0').filter(|path| !path.is_empty()).count();
+    if saved_files == 0 {
+        anyhow::bail!(
+            "Nothing could be staged in this repository. Save changes inside modified submodules from their own directories."
+        );
+    }
 
     let msg = format!("{SAVE_PREFIX} {}", Local::now().format("%H:%M:%S"));
     commit_git(&msg, Hooks::Skip)?;
@@ -208,8 +219,13 @@ fn go(name: &str) -> Result<()> {
     }
 
     let local_ref = format!("refs/heads/{name}");
+    if name.starts_with('-') {
+        anyhow::bail!("Branch names cannot start with '-'.");
+    }
+    execute_git(&["check-ref-format", &local_ref])
+        .with_context(|| format!("Invalid branch name `{name}`"))?;
     if check_ref(&local_ref).is_some() {
-        execute_git(&["checkout", name])?;
+        execute_git(&["switch", "--", name])?;
         println!("{} Switched to {}", "✓".green(), name.bold());
         return Ok(());
     }
@@ -217,14 +233,11 @@ fn go(name: &str) -> Result<()> {
     let remote_ref = format!("refs/remotes/origin/{name}");
     let has_remote = has_remote();
 
-    // One fetch, covering both questions this command has to answer: does the
-    // branch already exist on the remote, and where is the default branch. It
-    // replaces the single-branch fetch the create path did anyway, so looking
-    // for an existing remote branch costs no extra round trip.
-    if has_remote && check_ref(&remote_ref).is_none() {
+    if has_remote {
         let spinner = Spinner::start("Checking origin");
-        let _ = execute_git(&["fetch", "origin"]);
+        let fetched = execute_git(&["fetch", "origin"]);
         spinner.stop();
+        fetched.context("Could not check origin for existing work. No branch was created.")?;
     }
 
     // A branch that exists only on the remote is someone's work in progress —
@@ -232,7 +245,7 @@ fn go(name: &str) -> Result<()> {
     // instead would silently create a divergent branch with the same name, and
     // the next `kt publish` would overwrite theirs.
     if has_remote && check_ref(&remote_ref).is_some() {
-        execute_git(&["checkout", "--track", &format!("origin/{name}")])?;
+        execute_git(&["switch", "-c", name, "--track", &remote_ref])?;
         println!(
             "{} Switched to {} {}",
             "✓".green(),
@@ -243,26 +256,23 @@ fn go(name: &str) -> Result<()> {
     }
 
     let default_branch = get_default_branch()?;
-    let remote_base = format!("origin/{default_branch}");
-
-    let base = if has_remote {
-        match execute_git(&["checkout", "-b", name, &remote_base]) {
-            Ok(_) => remote_base,
-            Err(_) => {
-                execute_git(&["checkout", "-b", name, &default_branch])?;
-                default_branch
-            }
-        }
+    let remote_base = format!("refs/remotes/origin/{default_branch}");
+    let base = if has_remote && check_ref(&remote_base).is_some() {
+        remote_base
     } else {
-        execute_git(&["checkout", "-b", name, &default_branch])?;
-        default_branch
+        format!("refs/heads/{default_branch}")
     };
+    execute_git(&["switch", "--no-track", "-c", name, &base])?;
+    let base_name = base
+        .strip_prefix("refs/remotes/")
+        .or_else(|| base.strip_prefix("refs/heads/"))
+        .unwrap_or(&base);
 
     println!(
         "{} Created {} {}",
         "✓".green(),
         name.bold(),
-        format!("from {base}").dimmed()
+        format!("from {base_name}").dimmed()
     );
     Ok(())
 }
@@ -349,6 +359,85 @@ mod tests {
     }
 
     #[test]
+    fn save_explains_unstageable_submodule_changes_and_preserves_them() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let nested = init_repo();
+        git(
+            &repo.path,
+            &["clone", "-q", nested.path.to_str().unwrap(), "nested"],
+        );
+        git(&repo.path, &["add", "nested"]);
+        git(
+            &repo.path,
+            &["commit", "-m", "chore: add nested repository"],
+        );
+        let before = git(&repo.path, &["rev-parse", "HEAD"]);
+        write_file(&repo.path, "nested/tracked.txt", "inner work\n");
+
+        let error =
+            run_save_in_repo(&repo.path).expect_err("submodule contents need their own save");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Save changes inside modified submodules")
+        );
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), before);
+
+        write_file(&repo.path, "tracked.txt", "outer work\n");
+        run_save_in_repo(&repo.path).expect("parent work can still be saved");
+        assert_eq!(
+            git(&repo.path, &["diff", "--name-only", "HEAD~", "HEAD"]).trim(),
+            "tracked.txt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("nested/tracked.txt")).unwrap(),
+            "inner work\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn quicksave_skips_prepare_message_and_post_commit_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        for (hook, script) in [
+            ("prepare-commit-msg", "#!/bin/sh\nexit 1\n"),
+            ("post-commit", "#!/bin/sh\ntouch post-commit-ran\n"),
+        ] {
+            let path = format!(".git/hooks/{hook}");
+            write_file(&repo.path, &path, script);
+            std::fs::set_permissions(repo.path.join(path), std::fs::Permissions::from_mode(0o755))
+                .expect("hook should be executable");
+        }
+        write_file(&repo.path, "tracked.txt", "saved work\n");
+
+        run_save_in_repo(&repo.path).expect("quicksaves must bypass all commit hooks");
+
+        assert!(git(&repo.path, &["log", "-1", "--format=%s"]).starts_with(SAVE_PREFIX));
+        assert!(!repo.path.join("post-commit-ran").exists());
+    }
+
+    #[test]
+    fn quicksave_supports_repository_names_with_trailing_spaces() {
+        let _lock = acquire_cwd_lock();
+        let directory = TempDir::new("kite-test-whitespace");
+        let repo = directory.path.join("repository ");
+        std::fs::create_dir(&repo).expect("repository should be created");
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Kite Test"]);
+        git(&repo, &["config", "user.email", "kite@example.com"]);
+        write_file(&repo, "saved.txt", "work\n");
+
+        run_save_in_repo(&repo).expect("the repository path must retain its trailing space");
+
+        assert!(git(&repo, &["log", "-1", "--format=%s"]).starts_with(SAVE_PREFIX));
+    }
+
+    #[test]
     fn go_switches_to_existing_branch_without_recreating_it() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
@@ -394,6 +483,64 @@ mod tests {
             &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
         );
         assert_eq!(upstream.trim(), "origin/teammate-work");
+    }
+
+    #[test]
+    fn go_preserves_slashes_in_the_remote_default_branch() {
+        let _lock = acquire_cwd_lock();
+        let (repo, _remote) = crate::test_support::init_repo_with_remote_branch("release/stable");
+        git(&repo.path, &["fetch", "origin"]);
+        git(
+            &repo.path,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/release/stable",
+            ],
+        );
+
+        run_go_in_repo(&repo.path, "new-work")
+            .expect("the complete default branch name must resolve");
+
+        assert_eq!(
+            git(&repo.path, &["rev-parse", "HEAD"]),
+            git(
+                &repo.path,
+                &["rev-parse", "refs/remotes/origin/release/stable"]
+            )
+        );
+        assert_eq!(
+            git(&repo.path, &["branch", "--show-current"]).trim(),
+            "new-work"
+        );
+        assert!(
+            crate::test_support::with_repo_cwd(&repo.path, || crate::git::config_get(
+                "branch.new-work.remote"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn go_does_not_create_a_branch_after_a_failed_fetch() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let before = git(&repo.path, &["symbolic-ref", "HEAD"]);
+        let missing = repo.path.join("missing-remote");
+        git(
+            &repo.path,
+            &["remote", "add", "origin", missing.to_str().unwrap()],
+        );
+
+        let error =
+            run_go_in_repo(&repo.path, "new-work").expect_err("failed fetch must stop branching");
+
+        assert!(error.to_string().contains("Could not check origin"));
+        assert_eq!(git(&repo.path, &["symbolic-ref", "HEAD"]), before);
+        assert!(
+            crate::test_support::with_repo_cwd(&repo.path, || check_ref("refs/heads/new-work"))
+                .is_none()
+        );
     }
 
     #[test]

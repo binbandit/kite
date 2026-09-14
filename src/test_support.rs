@@ -1,18 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) fn cwd_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 pub(crate) fn acquire_cwd_lock() -> std::sync::MutexGuard<'static, ()> {
-    cwd_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub(crate) struct TempDir {
@@ -21,13 +16,15 @@ pub(crate) struct TempDir {
 
 impl TempDir {
     pub(crate) fn new(prefix: &str) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let unique = format!(
-            "{prefix}-{}-{}",
+            "{prefix}-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time should be after unix epoch")
-                .as_nanos()
+                .as_nanos(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
         );
         let path = std::env::temp_dir().join(unique);
         fs::create_dir_all(&path).expect("temp directory should be created");
@@ -67,11 +64,16 @@ pub(crate) fn write_file(root: &Path, path: &str, contents: &str) {
 }
 
 pub(crate) fn with_repo_cwd<T>(repo: &Path, f: impl FnOnce() -> T) -> T {
-    let original_dir = std::env::current_dir().expect("current dir should resolve");
+    struct RestoreCwd(PathBuf);
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("should restore original cwd");
+        }
+    }
+
+    let _restore = RestoreCwd(std::env::current_dir().expect("current dir should resolve"));
     std::env::set_current_dir(repo).expect("should enter temp repo");
-    let result = f();
-    std::env::set_current_dir(&original_dir).expect("should restore original cwd");
-    result
+    f()
 }
 
 pub(crate) fn init_repo() -> TempDir {

@@ -56,7 +56,9 @@ fn find_repo_root() -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let output =
+        String::from_utf8(output.stdout).context("The repository path must be valid UTF-8")?;
+    let root = PathBuf::from(output.strip_suffix('\n').unwrap_or(&output));
 
     let mut guard = cache
         .lock()
@@ -200,32 +202,10 @@ pub(crate) fn execute_git_with(
     Ok(into_string(output.stdout))
 }
 
-pub(crate) fn execute_git_quiet(args: &[&str]) -> Result<()> {
-    let output = git_command()?
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("Failed 'git {}'", args.join(" ")))?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "Git error: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    Ok(())
-}
-
 pub(crate) fn has_staged_changes(status: &str) -> bool {
-    status.lines().any(is_staged_status_line)
-}
-
-pub(crate) fn is_staged_status_line(line: &str) -> bool {
-    line.chars()
-        .next()
-        .is_some_and(|status_code| status_code != ' ' && status_code != '?')
+    status
+        .lines()
+        .any(|line| line.starts_with(|code: char| code != ' ' && code != '?'))
 }
 
 /// Whether a commit runs the repository's Git hooks.
@@ -236,22 +216,18 @@ pub(crate) enum Hooks {
 }
 
 pub(crate) fn commit_git(message: &str, hooks: Hooks) -> Result<()> {
-    let mut args = vec!["commit", "-m", message];
+    let mut args = Vec::new();
     if hooks == Hooks::Skip {
-        args.push("--no-verify");
+        // --no-verify still runs prepare-commit-msg and post-commit.
+        args.extend(["-c", "core.hooksPath=/dev/null"]);
     }
+    args.extend(["commit", "-m", message]);
 
     let output = git_command()?
         .args(&args)
         .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .output()
         .with_context(|| format!("Failed 'git commit -m {}'", message))?;
-
-    let output = output
-        .wait_with_output()
-        .with_context(|| format!("Failed while waiting on 'git commit -m {}'", message))?;
 
     if !output.status.success() {
         let rendered_output = compact_command_output(
@@ -265,32 +241,19 @@ pub(crate) fn commit_git(message: &str, hooks: Hooks) -> Result<()> {
 }
 
 fn compact_command_output(stdout: &str, stderr: &str) -> String {
-    let lines: Vec<String> = stderr
+    let lines: Vec<_> = stderr
         .lines()
         .chain(stdout.lines())
         .map(str::trim_end)
         .filter(|line| !line.trim().is_empty())
-        .map(ToOwned::to_owned)
         .collect();
-
-    if lines.is_empty() {
-        return String::new();
-    }
-
-    let visible_lines = if lines.len() > MAX_COMMIT_FAILURE_LINES {
-        let omitted = lines.len() - MAX_COMMIT_FAILURE_LINES;
-        let mut trimmed = vec![format!("... {} earlier line(s) omitted", omitted)];
-        trimmed.extend(
-            lines[lines.len() - MAX_COMMIT_FAILURE_LINES..]
-                .iter()
-                .cloned(),
-        );
-        trimmed
+    let omitted = lines.len().saturating_sub(MAX_COMMIT_FAILURE_LINES);
+    let visible = lines[omitted..].join("\n");
+    if omitted > 0 {
+        format!("... {omitted} earlier line(s) omitted\n{visible}")
     } else {
-        lines
-    };
-
-    visible_lines.join("\n")
+        visible
+    }
 }
 
 fn render_commit_failure(message: &str, details: &str) -> String {
@@ -327,24 +290,17 @@ fn indent_block(text: &str) -> String {
 
 pub(crate) fn get_default_branch() -> Result<String> {
     if has_remote()
-        && let Ok(output) = execute_git(&[
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ])
-        && let Some(branch) = output.trim().rsplit('/').next()
+        && let Ok(output) = execute_git(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+        && let Some(branch) = output.trim().strip_prefix("refs/remotes/origin/")
         && !branch.is_empty()
     {
         return Ok(branch.to_string());
     }
 
-    let output = execute_git(&["branch", "--list", "main", "master"])?;
-    if output.contains("main") {
-        return Ok("main".to_string());
-    }
-    if output.contains("master") {
-        return Ok("master".to_string());
+    for branch in ["main", "master"] {
+        if check_ref(&format!("refs/heads/{branch}")).is_some() {
+            return Ok(branch.to_string());
+        }
     }
 
     let current = execute_git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
@@ -362,15 +318,8 @@ pub(crate) fn has_head_commit() -> bool {
     check_ref("HEAD").is_some()
 }
 
-/// Where `HEAD` points.
-///
-/// Deliberately the only way to ask. `rev-parse --abbrev-ref HEAD` answers
-/// "HEAD" when detached, and callers that took that for a branch name went on
-/// to rewrite history and fail at `git branch -f HEAD`, or push a remote
-/// branch literally called HEAD. Making the two cases distinct types means a
-/// caller has to say which one it can handle: `kt land` and `kt undo` move
-/// `HEAD` itself and work either way, while the commands that push ask for a
-/// branch with `branch_to_publish`.
+/// A named branch or a detached commit. Publishing requires the former;
+/// saving, landing, and undo support both.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Head {
     Branch(String),
@@ -487,35 +436,6 @@ pub(crate) fn active_git_operation() -> Result<Option<&'static str>> {
         .find_map(|(path, operation)| git_dir.join(path).exists().then_some(operation)))
 }
 
-/// The checked-out branch read straight from `.git/HEAD`, with no subprocess.
-///
-/// `kt` runs constantly, so a spawn on its path is a cost users feel on every
-/// save. Returns `None` for a detached HEAD or any layout this cannot read —
-/// callers must treat that as "don't know", never as a branch name. Anything
-/// that rewrites or publishes history uses `head_position` instead.
-pub(crate) fn head_branch_hint() -> Option<String> {
-    let root = find_repo_root().ok()??;
-
-    let dot_git = root.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        dot_git
-    } else {
-        // Linked worktrees and submodules keep `.git` as a file holding
-        // `gitdir: <path>`.
-        let pointer = std::fs::read_to_string(&dot_git).ok()?;
-        let target = PathBuf::from(pointer.strip_prefix("gitdir:")?.trim());
-        if target.is_absolute() {
-            target
-        } else {
-            root.join(target)
-        }
-    };
-
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let branch = head.trim().strip_prefix("ref: refs/heads/")?;
-    (!branch.is_empty()).then(|| branch.to_string())
-}
-
 /// True when the repository is mid-merge, mid-rebase, or otherwise holding
 /// unmerged index entries. Git's own message for this is a wall of hints.
 pub(crate) fn has_unmerged_paths(status: &str) -> bool {
@@ -532,90 +452,57 @@ pub(crate) fn has_unmerged_paths(status: &str) -> bool {
 }
 
 pub(crate) fn is_save_subject(subject: &str) -> bool {
-    subject.trim_start().starts_with(SAVE_PREFIX)
+    subject
+        .trim_start()
+        .strip_prefix(SAVE_PREFIX)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 /// Reads legacy local marker config written by Kite versions before rollback
 /// state moved into one atomic ref-backed object.
 pub(crate) fn config_get(key: &str) -> Option<String> {
-    let output = git_command()
-        .ok()?
-        .args(["config", "--local", "--get", key])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    execute_git(&["config", "--local", "--get", key])
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn config_unset(key: &str) -> Result<()> {
     if config_get(key).is_none() {
         return Ok(());
     }
-    execute_git_quiet(&["config", "--local", "--unset", key])
+    execute_git(&["config", "--local", "--unset", key]).map(|_| ())
 }
 
 /// True when `ancestor` is reachable from `descendant`, i.e. pushing
 /// `descendant` would fast-forward past `ancestor` rather than discard it.
 pub(crate) fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
-    git_command()
-        .and_then(|mut command| {
-            command
-                .args(["merge-base", "--is-ancestor", ancestor, descendant])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .context("Failed 'git merge-base'")
-        })
-        .map(|status| status.success())
-        .unwrap_or(false)
+    execute_git(&["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
 }
 
 /// Subjects of the commits `reference` has that `HEAD` does not — exactly
 /// what a force-push would drop.
-pub(crate) fn subjects_missing_from_head(reference: &str) -> Vec<String> {
-    let Ok(output) = execute_git(&["log", "--format=%s", &format!("HEAD..{reference}")]) else {
-        return Vec::new();
-    };
+pub(crate) fn subjects_missing_from_head(reference: &str) -> Result<Vec<String>> {
+    let output = execute_git(&["log", "--format=%s", &format!("HEAD..{reference}")])?;
 
-    output
+    Ok(output
         .lines()
-        .map(str::trim)
-        .filter(|subject| !subject.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+        .map(|subject| match subject.trim() {
+            "" => "(no commit message)".to_string(),
+            subject => subject.to_string(),
+        })
+        .collect())
 }
 
+/// Kite publishes to origin, regardless of other remotes in the repository.
 pub(crate) fn has_remote() -> bool {
-    git_command()
-        .and_then(|mut command| {
-            command
-                .args(["remote"])
-                .output()
-                .context("Failed 'git remote'")
-        })
-        .map(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
-        .unwrap_or(false)
+    execute_git(&["remote", "get-url", "origin"]).is_ok()
 }
 
 pub(crate) fn check_ref(ref_name: &str) -> Option<String> {
-    let output = git_command()
-        .ok()?
-        .args(["rev-parse", "--verify", ref_name])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
+    execute_git(&["rev-parse", "--verify", ref_name])
+        .ok()
+        .map(|output| output.trim().to_string())
 }
 
 /// Stages exactly these paths, whole, from the worktree.
@@ -656,23 +543,32 @@ pub(crate) fn stage_paths(paths: &[String]) -> Result<()> {
 /// reports a rename as the new path alone, and landing would stage that
 /// addition while leaving the old file sitting in the landed tree.
 fn diff_against_base(base: &KiteBase, format: &[&str]) -> Result<String> {
-    let (command, target) = match base {
-        KiteBase::Commit(hash) => (vec!["diff"], format!("{hash}..HEAD")),
-        // A root commit has no parent, so it takes the plumbing command that
-        // can diff against the empty tree.
-        KiteBase::Root => (
-            vec!["diff-tree", "--root", "--no-commit-id", "-r"],
-            "HEAD".to_string(),
-        ),
+    let base = match base {
+        KiteBase::Commit(hash) => hash.clone(),
+        // The stack can contain several saves. diff-tree --root HEAD would
+        // compare only its final save with its parent, omitting earlier files.
+        KiteBase::Root => execute_git_with(
+            &["hash-object", "-w", "-t", "tree", "--stdin"],
+            &[],
+            Some(""),
+        )?
+        .trim()
+        .to_string(),
     };
 
     // core.quotepath=false keeps non-ASCII paths readable in the patch; `-z`
     // makes it moot for the path list.
-    let mut args = vec!["-c", "core.quotepath=false"];
-    args.extend(command);
-    args.extend(["--no-ext-diff", "--no-renames"]);
+    let mut args = vec![
+        "-c",
+        "core.quotepath=false",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+        "--no-renames",
+    ];
     args.extend(format);
-    args.push(&target);
+    args.extend([&base, "HEAD", "--"]);
 
     execute_git(&args)
 }
@@ -714,7 +610,7 @@ pub(crate) fn recent_commit_style_examples(limit: usize) -> Vec<String> {
 
     for line in output.lines() {
         let message = line.trim();
-        if message.is_empty() || message.starts_with(SAVE_PREFIX) || message.starts_with("Merge ") {
+        if message.is_empty() || is_save_subject(message) || message.starts_with("Merge ") {
             continue;
         }
 
@@ -763,7 +659,7 @@ pub(crate) fn kite_save_stack() -> Result<Option<SaveStack>> {
                 continue;
             };
 
-            if subject.starts_with(SAVE_PREFIX) {
+            if is_save_subject(subject) {
                 count += 1;
             } else if count == 0 {
                 return Ok(None);
@@ -955,6 +851,74 @@ mod tests {
     }
 
     #[test]
+    fn saved_changes_includes_every_file_across_an_initial_save_stack() {
+        let _lock = acquire_cwd_lock();
+        let repo = crate::test_support::init_root_kite_repo();
+        write_file(&repo.path, "second.txt", "second save\n");
+        git(&repo.path, &["add", "second.txt"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:01"]);
+
+        let stack = with_repo_cwd(&repo.path, kite_save_stack).unwrap().unwrap();
+        assert_eq!(stack.base, KiteBase::Root);
+        let (paths, diff) = with_repo_cwd(&repo.path, || saved_changes(&stack.base)).unwrap();
+
+        assert_eq!(paths, ["second.txt", "tracked.txt"]);
+        assert!(
+            diff.contains("+base"),
+            "the first save must be included: {diff}"
+        );
+        assert!(diff.contains("+second save"));
+    }
+
+    #[test]
+    fn a_similar_human_subject_is_not_a_kite_save() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        git(
+            &repo.path,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "[kite] saver: preserve my commit",
+            ],
+        );
+
+        assert!(
+            with_repo_cwd(&repo.path, kite_save_stack)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!is_save_subject("[kite] saver: preserve my commit"));
+        assert!(is_save_subject("[kite] save 12:00:00"));
+    }
+
+    #[test]
+    fn missing_remote_history_is_an_error_instead_of_permission_to_discard_it() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        assert!(with_repo_cwd(&repo.path, || subjects_missing_from_head("missing-ref")).is_err());
+    }
+
+    #[test]
+    fn remote_commits_without_messages_still_require_review() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        git(
+            &repo.path,
+            &["commit", "--allow-empty", "--allow-empty-message", "-m", ""],
+        );
+        let remote = git(&repo.path, &["rev-parse", "HEAD"]);
+        git(&repo.path, &["reset", "--hard", "HEAD~"]);
+
+        let missing =
+            with_repo_cwd(&repo.path, || subjects_missing_from_head(remote.trim())).unwrap();
+
+        assert_eq!(missing, ["(no commit message)"]);
+    }
+
+    #[test]
     fn saved_changes_omits_a_file_added_and_deleted_across_saves() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
@@ -996,6 +960,64 @@ mod tests {
             "{diff}"
         );
         assert!(diff.contains("+changed"), "{diff}");
+    }
+
+    #[test]
+    fn saved_changes_includes_submodules_hidden_by_diff_configuration() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let first = git(&repo.path, &["rev-parse", "HEAD"]);
+        git(
+            &repo.path,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                first.trim(),
+                "submodule",
+            ],
+        );
+        git(&repo.path, &["commit", "-m", "chore: add submodule"]);
+        let base = git(&repo.path, &["rev-parse", "HEAD"]);
+        git(
+            &repo.path,
+            &[
+                "update-index",
+                "--cacheinfo",
+                "160000",
+                base.trim(),
+                "submodule",
+            ],
+        );
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+        git(&repo.path, &["config", "diff.ignoreSubmodules", "all"]);
+
+        let (paths, diff) = with_repo_cwd(&repo.path, || {
+            saved_changes(&KiteBase::Commit(base.trim().to_string()))
+        })
+        .unwrap();
+
+        assert_eq!(paths, ["submodule"]);
+        assert!(diff.contains("Subproject commit"));
+    }
+
+    #[test]
+    fn saved_changes_does_not_run_text_conversion_filters() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        git(&repo.path, &["config", "diff.test.textconv", "/bin/echo"]);
+        write_file(&repo.path, ".gitattributes", "*.txt diff=test\n");
+        write_file(&repo.path, "tracked.txt", "saved text\n");
+        git(&repo.path, &["add", "-A"]);
+        git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+
+        let (_, diff) = with_repo_cwd(&repo.path, || saved_changes(&base_of(&repo.path))).unwrap();
+
+        assert!(
+            diff.contains("+saved text"),
+            "the model must see the actual saved contents: {diff}"
+        );
     }
 
     #[test]
