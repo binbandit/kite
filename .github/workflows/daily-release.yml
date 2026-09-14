@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: daily-release
@@ -20,258 +20,31 @@ jobs:
     outputs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       cargo_version: ${{ steps.meta.outputs.cargo_version }}
-      release_commit_message: ${{ steps.meta.outputs.release_commit_message }}
-      previous_tag: ${{ steps.meta.outputs.previous_tag }}
       source_sha: ${{ steps.meta.outputs.source_sha }}
-      range: ${{ steps.meta.outputs.range }}
-      valid_count: ${{ steps.meta.outputs.valid_count }}
-      should_prepare: ${{ steps.meta.outputs.should_prepare }}
+      should_release: ${{ steps.meta.outputs.should_release }}
       tag_exists: ${{ steps.meta.outputs.tag_exists }}
-      release_exists: ${{ steps.meta.outputs.release_exists }}
-      release_commit_sha: ${{ steps.meta.outputs.release_commit_sha }}
-      metadata_artifact: ${{ steps.meta.outputs.metadata_artifact }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Compute release metadata
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Prepare release files
         id: meta
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
+        run: python3 .github/scripts/prepare_release.py
 
-          release_tag="$(date -u +'%Y.%m.%d')"
-          cargo_version="$(date -u +'%Y.%-m.%-d')"
-          release_commit_message="chore(release): $release_tag [skip-ci]"
-          metadata_artifact="release-metadata-$release_tag"
-
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
-          echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
-          echo "release_commit_message=$release_commit_message" >> "$GITHUB_OUTPUT"
-          echo "metadata_artifact=$metadata_artifact" >> "$GITHUB_OUTPUT"
-
-          previous_tag="$(git tag --list '[0-9][0-9][0-9][0-9].[0-1][0-9].[0-3][0-9]' --sort=-version:refname | grep -Fxv "$release_tag" | head -n 1 || true)"
-          echo "previous_tag=$previous_tag" >> "$GITHUB_OUTPUT"
-
-          if git rev-parse --verify --quiet "refs/tags/$release_tag" >/dev/null; then
-            tag_exists=true
-            source_sha="$(git rev-list -n 1 "$release_tag")"
-          else
-            tag_exists=false
-            source_sha="$(git rev-parse HEAD)"
-          fi
-
-          if gh release view "$release_tag" >/dev/null 2>&1; then
-            release_exists=true
-          else
-            release_exists=false
-          fi
-
-          if [ -z "$previous_tag" ]; then
-            range="$source_sha"
-          else
-            range="$previous_tag..$source_sha"
-          fi
-
-          valid_count="$(
-            git log "$range" --pretty=format:'%an%x09%ae%x09%s' \
-              | awk -F'\t' '$1 != "github-actions[bot]" && $2 != "41898282+github-actions[bot]@users.noreply.github.com" && $3 !~ /^chore\(release\): / && $3 !~ /\[skip-ci\]/ {count++} END {print count+0}'
-          )"
-
-          release_commit_sha="$(
-            git log --format='%H%x09%an%x09%ae%x09%s' \
-              | awk -F'\t' -v message="$release_commit_message" '$2 == "github-actions[bot]" && $3 == "41898282+github-actions[bot]@users.noreply.github.com" && $4 == message {print $1; exit}'
-          )"
-
-          if [ "$valid_count" -gt 0 ]; then
-            should_prepare=true
-          else
-            should_prepare=false
-          fi
-
-          echo "tag_exists=$tag_exists" >> "$GITHUB_OUTPUT"
-          echo "release_exists=$release_exists" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-          echo "range=$range" >> "$GITHUB_OUTPUT"
-          echo "valid_count=$valid_count" >> "$GITHUB_OUTPUT"
-          echo "release_commit_sha=$release_commit_sha" >> "$GITHUB_OUTPUT"
-          echo "should_prepare=$should_prepare" >> "$GITHUB_OUTPUT"
-
-      - name: Generate release notes and update release metadata
-        if: steps.meta.outputs.should_prepare == 'true' && steps.meta.outputs.release_commit_sha == ''
-        env:
-          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
-          CARGO_VERSION: ${{ steps.meta.outputs.cargo_version }}
-          RANGE: ${{ steps.meta.outputs.range }}
-          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python - <<'PY'
-          from collections import defaultdict
-          from pathlib import Path
-          import os
-          import re
-          import subprocess
-
-          release_tag = os.environ["RELEASE_TAG"]
-          cargo_version = os.environ["CARGO_VERSION"]
-          range_spec = os.environ["RANGE"]
-          repo_url = os.environ["REPO_URL"]
-          bot_name = "github-actions[bot]"
-          bot_email = "41898282+github-actions[bot]@users.noreply.github.com"
-
-          raw_log = subprocess.check_output(
-              [
-                  "git",
-                  "log",
-                  range_spec,
-                  "--reverse",
-                  "--format=%H%x1f%an%x1f%ae%x1f%s%x1f%b%x1e",
-              ],
-              text=True,
-          )
-
-          conventional = re.compile(
-              r"^(?P<type>[a-z]+)(?:\((?P<scope>[^)]+)\))?(?P<breaking>!)?: (?P<description>.+)$"
-          )
-          version_pattern = re.compile(r"\[skip-ci\]")
-          section_titles = {
-              "breaking": "Breaking Changes",
-              "feat": "Features",
-              "fix": "Bug Fixes",
-              "perf": "Performance",
-              "refactor": "Refactors",
-              "docs": "Documentation",
-              "build": "Build System",
-              "ci": "CI",
-              "test": "Tests",
-              "style": "Style",
-              "chore": "Chores",
-              "revert": "Reverts",
-              "other": "Other Changes",
-          }
-          ordered_sections = [
-              "breaking",
-              "feat",
-              "fix",
-              "perf",
-              "refactor",
-              "docs",
-              "build",
-              "ci",
-              "test",
-              "style",
-              "chore",
-              "revert",
-              "other",
-          ]
-
-          grouped: dict[str, list[str]] = defaultdict(list)
-          included_commits = 0
-
-          for record in raw_log.strip("\x1e").split("\x1e"):
-              if not record.strip():
-                  continue
-
-              sha, author_name, author_email, subject, body = record.split("\x1f", 4)
-              body = body.strip()
-
-              if author_name == bot_name or author_email == bot_email:
-                  continue
-              if subject.startswith("chore(release): "):
-                  continue
-              if version_pattern.search(subject):
-                  continue
-
-              match = conventional.match(subject)
-              section = "other"
-              description = subject
-              if match:
-                  section = match.group("type")
-                  scope = match.group("scope")
-                  description = match.group("description")
-                  is_breaking = bool(match.group("breaking")) or "BREAKING CHANGE:" in body or "BREAKING-CHANGE:" in body
-                  if is_breaking:
-                      section = "breaking"
-                  if scope:
-                      description = f"**{scope}:** {description}"
-
-              if section not in section_titles:
-                  section = "other"
-
-              short_sha = sha[:7]
-              grouped[section].append(f"- {description} ([`{short_sha}`]({repo_url}/commit/{sha}))")
-              included_commits += 1
-
-          if included_commits == 0:
-              raise SystemExit("No releasable commits found after filtering bot and [skip-ci] commits")
-
-          body_lines = []
-          for section in ordered_sections:
-              entries = grouped.get(section)
-              if not entries:
-                  continue
-              body_lines.append(f"### {section_titles[section]}")
-              body_lines.append("")
-              body_lines.extend(entries)
-              body_lines.append("")
-
-          changelog_body = "\n".join(body_lines).strip()
-          release_notes = f"## Changes\n\n{changelog_body}\n"
-          Path("release_notes.md").write_text(release_notes)
-
-          cargo_toml = Path("Cargo.toml")
-          content = cargo_toml.read_text()
-          updated, count = re.subn(
-              r"(\[package\][\s\S]*?\nversion\s*=\s*\")([^\"]+)(\")",
-              rf"\g<1>{cargo_version}\g<3>",
-              content,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit("Failed to update [package] version in Cargo.toml")
-          cargo_toml.write_text(updated)
-
-          changelog = Path("CHANGELOG.md")
-          if changelog.exists():
-              existing = changelog.read_text()
-          else:
-              existing = "# Changelog\n"
-
-          if existing.startswith("# Changelog"):
-              remainder = existing.split("\n", 1)[1].lstrip("\n")
-          else:
-              remainder = existing
-
-          section = f"## {release_tag}\n\n{changelog_body}\n"
-          final = "# Changelog\n\n" + section
-          if remainder.strip():
-              final += "\n" + remainder.rstrip() + "\n"
-
-          changelog.write_text(final)
-          PY
-
-          cargo generate-lockfile
-
-      - name: Validate release files
-        if: steps.meta.outputs.should_prepare == 'true' && steps.meta.outputs.release_commit_sha == ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo check --locked
+      - name: Test release source
+        if: steps.meta.outputs.should_release == 'true'
+        run: cargo test --locked
 
       - name: Upload release metadata
-        if: steps.meta.outputs.should_prepare == 'true' && steps.meta.outputs.release_commit_sha == ''
+        if: steps.meta.outputs.should_release == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.meta.outputs.metadata_artifact }}
+          name: release-metadata
           path: |
             release_notes.md
             Cargo.toml
@@ -280,19 +53,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Skip release
-        if: steps.meta.outputs.should_prepare != 'true' || steps.meta.outputs.release_commit_sha != ''
-        shell: bash
-        run: |
-          if [ "${{ steps.meta.outputs.should_prepare }}" != "true" ]; then
-            echo "No valid non-bot commits found for ${{ steps.meta.outputs.release_tag }}. Skipping."
-          else
-            echo "Release bookkeeping commit already exists at ${{ steps.meta.outputs.release_commit_sha }}. Skipping."
-          fi
-
   build:
     needs: prepare
-    if: needs.prepare.outputs.should_prepare == 'true' && needs.prepare.outputs.release_commit_sha == '' && needs.prepare.outputs.release_exists == 'false'
+    if: needs.prepare.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -303,32 +66,39 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive_ext: zip
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive_ext: tar.gz
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             archive_ext: tar.gz
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.source_sha }}
-          fetch-depth: 1
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Apply tested release metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: release-metadata
+
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build release binary
+      - name: Build and verify release binary
+        env:
+          TARGET: ${{ matrix.target }}
+          CARGO_VERSION: ${{ needs.prepare.outputs.cargo_version }}
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --locked --target "${{ matrix.target }}"
+          cargo build --release --locked --target "$TARGET"
+          binary="target/$TARGET/release/kt"
+          if [[ "$TARGET" == *windows-msvc ]]; then binary="$binary.exe"; fi
+          test "$("$binary" --version)" = "kt $CARGO_VERSION"
 
       - name: Package release archive
         env:
@@ -388,19 +158,23 @@ jobs:
           retention-days: 7
 
   publish:
-    needs:
-      - prepare
-      - build
-    if: needs.prepare.outputs.should_prepare == 'true' && needs.prepare.outputs.release_commit_sha == '' && needs.prepare.outputs.release_exists == 'false'
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
+    permissions:
+      contents: write
     steps:
+      # Use the source that was built. If the default branch advanced during
+      # builds, an ordinary push rejects it without overwriting newer changes.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+
       - name: Download release metadata
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.prepare.outputs.metadata_artifact }}
-          path: release-metadata
+          name: release-metadata
 
       - name: Download packaged artifacts
         uses: actions/download-artifact@v4
@@ -409,57 +183,34 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Create GitHub release
+      - name: Commit and tag the tested source
+        if: needs.prepare.outputs.tag_exists == 'false'
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "chore(release): $RELEASE_TAG [skip-ci]"
+          git tag "$RELEASE_TAG"
+          git push --atomic origin "HEAD:refs/heads/$DEFAULT_BRANCH" "refs/tags/$RELEASE_TAG"
+
+      # A draft keeps partial uploads private. Retrying uses the existing tag
+      # and replaces its draft assets before making the release public.
+      - name: Upload release draft
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.release_tag }}
           name: Release ${{ needs.prepare.outputs.release_tag }}
-          target_commitish: ${{ needs.prepare.outputs.source_sha }}
-          body_path: release-metadata/release_notes.md
+          body_path: release_notes.md
           files: dist/*
           fail_on_unmatched_files: true
-          generate_release_notes: false
+          draft: true
 
-  finalize:
-    needs:
-      - prepare
-      - publish
-    if: needs.prepare.outputs.should_prepare == 'true' && needs.prepare.outputs.release_commit_sha == '' && (needs.prepare.outputs.release_exists == 'true' || needs.publish.result == 'success')
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0
-
-      - name: Download release metadata
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.prepare.outputs.metadata_artifact }}
-          path: release-metadata
-
-      - name: Apply release metadata files
-        shell: bash
-        run: |
-          set -euo pipefail
-          cp release-metadata/Cargo.toml Cargo.toml
-          cp release-metadata/Cargo.lock Cargo.lock
-          cp release-metadata/CHANGELOG.md CHANGELOG.md
-
-      - name: Commit and push release metadata
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git add Cargo.toml Cargo.lock CHANGELOG.md
-
-          if git diff --cached --quiet; then
-            echo "No release metadata changes detected; skipping commit."
-            exit 0
-          fi
-
-          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "${{ needs.prepare.outputs.release_commit_message }}"
-          git push origin "HEAD:${{ github.event.repository.default_branch }}"
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false
