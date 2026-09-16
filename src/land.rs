@@ -1,9 +1,11 @@
 //! Plan a local rewrite, build its commits, and recover failed attempts.
 
+mod commits;
 mod publish;
 mod recovery;
 mod stash;
 mod state;
+use commits::{create_commits, verify_saved_tree};
 pub(crate) use publish::publish_current_branch;
 #[cfg(test)]
 pub(crate) use recovery::heal_interrupted_land;
@@ -19,9 +21,8 @@ use colored::*;
 
 use crate::diff::ChangedFiles;
 use crate::git::{
-    Head, Hooks, KiteBase, branch_to_publish, check_ref, commit_git, current_worktree_key,
-    execute_git, has_head_commit, has_remote, has_unmerged_paths, head_position, kite_save_stack,
-    saved_changes, stage_paths,
+    Head, Hooks, KiteBase, branch_to_publish, check_ref, current_worktree_key, execute_git,
+    has_head_commit, has_remote, has_unmerged_paths, head_position, kite_save_stack, saved_changes,
 };
 use crate::synth::{CommitGroup, normalize_groups, sanitize_commit_message, synthesize_groups};
 use crate::ui::{Spinner, confirm, overflow_note, pluralize, print_ai_unavailable, prompt_line};
@@ -362,32 +363,32 @@ fn execute_land(base: &KiteBase, commits: &[CommitGroup], hooks: Hooks) -> Resul
 
     let rewrite = (|| -> Result<()> {
         prepare_landing_head(base, pre_land_sha.trim(), &transaction_ref)?;
-        if *base == KiteBase::Root && commits.iter().all(|commit| commit.files.is_empty()) {
-            // An unborn branch still needs one commit to represent an empty tree.
-            let mut args = Vec::new();
-            if hooks == Hooks::Skip {
-                args.extend(["-c", "core.hooksPath=/dev/null"]);
-            }
-            let message = commits
-                .first()
-                .map_or(EMPTY_INITIAL_MESSAGE, |commit| commit.message.as_str());
-            args.extend(["commit", "--allow-empty", "-m", message]);
-            execute_git(&args)?;
+        // An unborn branch still needs one commit to represent an empty tree.
+        let empty_root = [CommitGroup {
+            message: EMPTY_INITIAL_MESSAGE.to_string(),
+            files: Vec::new(),
+        }];
+        let groups = if *base == KiteBase::Root && commits.is_empty() {
+            &empty_root
         } else {
-            create_commits(commits, hooks)?;
-        }
-        if execute_git(&["rev-parse", "HEAD^{tree}"])?
-            != execute_git(&["rev-parse", &format!("{}^{{tree}}", pre_land_sha.trim())])?
-        {
-            anyhow::bail!(
-                "The landed commits do not match the saved files. A hook may have changed their contents; save those changes before retrying."
-            );
-        }
+            commits
+        };
+        let hook_changes = create_commits(groups, hooks)?;
+        verify_saved_tree(pre_land_sha.trim(), &hook_changes)?;
+        stash::record_landed_head(execute_git(&["rev-parse", "HEAD"])?.trim())?;
         finalize_landed_head(&target, pre_land_sha.trim(), &transaction_ref)?;
         let landed_head =
             execute_git(&["rev-parse", "HEAD"]).context("Could not resolve the landed HEAD")?;
         record_landed_head(&transaction, landed_head.trim())
-            .context("Could not record the landed HEAD for `kt undo`")
+            .context("Could not record the landed HEAD for `kt undo`")?;
+        if !hook_changes.is_empty() {
+            println!(
+                "{} Included commit-hook changes to {}",
+                "✓".green(),
+                pluralize(hook_changes.len(), "file")
+            );
+        }
+        Ok(())
     })();
 
     // Commit creation and marker completion share the same rollback. A land
@@ -436,17 +437,6 @@ fn prepare_landing_head(base: &KiteBase, pre_land_sha: &str, transaction_ref: &s
             execute_git(&["read-tree", "--empty"])?;
         }
     }
-    Ok(())
-}
-
-/// Stages each commit's files whole, straight from the worktree, so hooks and
-/// formatters always see complete files.
-fn create_commits(commits: &[CommitGroup], hooks: Hooks) -> Result<()> {
-    for commit in commits {
-        stage_paths(&commit.files)?;
-        commit_git(&commit.message, hooks)?;
-    }
-
     Ok(())
 }
 

@@ -24,6 +24,7 @@ Use a disposable Git repository when trying commands that save, land, or undo. T
 | `src/main.rs` | Command arguments, dispatch, quicksave, and branch switching |
 | `src/git.rs` | Git subprocesses, refs, saved history, and exact file paths |
 | `src/land.rs` | Plan, preview, and execute a local land |
+| `src/land/commits.rs` | Build commit groups and check hook edits stay within their files |
 | `src/land/state.rs` | Persist the transaction and read older recovery markers |
 | `src/land/recovery.rs` | Undo saves and lands; recover interrupted operations |
 | `src/land/stash.rs` | Preserve and restore uncommitted work during dirty lands |
@@ -46,7 +47,7 @@ For a bug, first reproduce the user's sequence with the CLI and inspect the resu
 The important promises are concrete:
 
 - A failed hook returns users to their original branch or detached commit with every save intact. Keep hook edits so users can save and retry.
-- Landing preserves the saved file tree exactly. AI suggests messages and file groups; Git state and file coverage stay under program control.
+- Landing preserves the saved file tree except for changes committed by successful hooks to the current group's files. Check staging before and after hooks so another group's files cannot slip in. AI suggests messages and file groups; Git state and file coverage stay under program control.
 - Record recovery information before changing history or stashing work. A crash must leave enough information for `kt undo`.
 - Ref changes use the expected old commit. New work from another process or person must survive.
 

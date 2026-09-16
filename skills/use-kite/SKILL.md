@@ -42,6 +42,7 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 - Kite refuses history-changing commands during an active rebase, merge, cherry-pick, revert, bisect, `git am`, or sequencer operation; finish or abort Git's operation first.
 - If landing falls back to manual mode, provide a commit message that matches the repo's existing style when possible.
 - If a landed commit is blocked by hooks, Kite restores the saves and preserves hook edits as unstaged changes. Help fix and save those changes before retrying. Only reach for `kt land --no-verify` when the user asks to bypass the hooks.
+- Successful hooks may format and stage the current commit's files; Kite includes those changes in the same land. Do not ask the user to save and land again just because the hook's formatting differs from the editor. Hooks that stage unrelated files or leave post-commit staging still need correction.
 - If a land is interrupted, use `kt undo` in the originating worktree to recover it. This also restores work stashed by `--allow-dirty`, even if interruption happened during AI planning. Do not delete the worktree or its recovery state to bypass this check.
 - Saves that cancel each other out can still be landed without AI. Do not add artificial changes just to make them landable.
 - After running any Kite command, summarize what changed in the worktree, branch, and remote state.

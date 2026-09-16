@@ -297,6 +297,121 @@ fn landing_stages_a_deleted_file_whole() {
 }
 
 #[test]
+fn formatting_preserves_separate_commit_groups() {
+    let _lock = acquire_cwd_lock();
+    let repo = init_repo();
+    save_two_file_change(&repo.path);
+    let scope = collect_land_scope_in_repo(&repo.path, false)
+        .unwrap()
+        .unwrap();
+    install_pre_commit_hook(
+        &repo.path,
+        "#!/bin/sh\nfor file in $(git diff --cached --name-only); do\n  printf 'formatted %s\\n' \"$file\" > \"$file\"\n  git add -- \"$file\"\ndone\n",
+    );
+
+    execute_land_in_repo(
+        &repo.path,
+        &scope.base,
+        &[
+            files_commit("docs: update notes", &["docs.txt"]),
+            files_commit("feat: update code", &["code.txt"]),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        git(&repo.path, &["show", "HEAD^:docs.txt"]),
+        "formatted docs.txt\n"
+    );
+    assert_eq!(git(&repo.path, &["show", "HEAD^:code.txt"]), "alpha\n");
+    assert_eq!(
+        git(&repo.path, &["show", "HEAD:code.txt"]),
+        "formatted code.txt\n"
+    );
+    assert_eq!(git(&repo.path, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn replacing_a_file_with_a_directory_cannot_absorb_another_group() {
+    let _lock = acquire_cwd_lock();
+    let repo = init_repo();
+    write_file(&repo.path, "entry", "old file\n");
+    git(&repo.path, &["add", "entry"]);
+    git(&repo.path, &["commit", "-qm", "feat: entry"]);
+    std::fs::remove_file(repo.path.join("entry")).unwrap();
+    write_file(&repo.path, "entry/file.txt", "new nested file\n");
+    git(&repo.path, &["add", "-A"]);
+    git(&repo.path, &["commit", "-qm", "[kite] save 12:00:00"]);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    let scope = collect_land_scope_in_repo(&repo.path, false)
+        .unwrap()
+        .unwrap();
+
+    let error = execute_land_in_repo(
+        &repo.path,
+        &scope.base,
+        &[
+            files_commit("refactor: remove old entry", &["entry"]),
+            files_commit("feat: nested entry", &["entry/file.txt"]),
+        ],
+    )
+    .expect_err("a directory path must not silently absorb the next commit");
+    assert!(format!("{error:#}").contains("outside this commit's planned files"));
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+    assert_eq!(git(&repo.path, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn formatted_land_pending_work_survives_another_worktrees_land() {
+    let _lock = acquire_cwd_lock();
+    let repo = init_repo();
+    write_file(&repo.path, "tracked.txt", "saved\n");
+    git(&repo.path, &["add", "tracked.txt"]);
+    git(&repo.path, &["commit", "-qm", "[kite] save 12:00:00"]);
+    write_file(&repo.path, "other.txt", "pending\n");
+    git(&repo.path, &["add", "other.txt"]);
+    with_repo_cwd(&repo.path, stash::save).unwrap();
+    let scope = collect_land_scope_in_repo(&repo.path, false)
+        .unwrap()
+        .unwrap();
+    install_pre_commit_hook(
+        &repo.path,
+        "#!/bin/sh\nprintf 'formatted\\n' > tracked.txt\ngit add tracked.txt\n",
+    );
+    execute_land_in_repo(
+        &repo.path,
+        &scope.base,
+        &[files_commit("feat: update", &["tracked.txt"])],
+    )
+    .unwrap();
+    let landed = git(&repo.path, &["rev-parse", "HEAD"]);
+
+    // Simulate stopping after completion but before restoring pending work.
+    // A different worktree can replace the shared completion marker meanwhile.
+    std::fs::remove_file(repo.path.join(".git/hooks/pre-commit")).unwrap();
+    let (_holder, linked) = detached_worktree(&repo.path, "HEAD^");
+    write_file(&linked, "tracked.txt", "another worktree\n");
+    git(&linked, &["add", "tracked.txt"]);
+    git(&linked, &["commit", "-qm", "[kite] save 12:00:01"]);
+    let other = collect_land_scope_in_repo(&linked, false).unwrap().unwrap();
+    execute_land_in_repo(
+        &linked,
+        &other.base,
+        &[files_commit("feat: other work", &["tracked.txt"])],
+    )
+    .unwrap();
+
+    undo_in_repo(&repo.path).unwrap();
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), landed);
+    assert_eq!(git(&repo.path, &["show", ":other.txt"]), "pending\n");
+    assert_eq!(
+        std::fs::read_to_string(repo.path.join("tracked.txt")).unwrap(),
+        "formatted\n"
+    );
+    assert!(!with_repo_cwd(&repo.path, stash::is_pending).unwrap());
+}
+
+#[test]
 fn landing_stages_a_file_force_added_past_an_ignore_rule() {
     let _lock = acquire_cwd_lock();
     let repo = init_repo();

@@ -1,7 +1,7 @@
 //! Keep temporary work recoverable even if Kite stops before rewriting history.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use colored::*;
@@ -15,6 +15,17 @@ struct PendingWork {
     message: String,
     target: String,
     tree: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    landed_head: Option<String>,
+}
+
+impl PendingWork {
+    fn write(&self, path: &Path) -> Result<()> {
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, serde_json::to_vec(self)?)?;
+        fs::rename(temporary, path)?;
+        Ok(())
+    }
 }
 
 fn marker_path() -> Result<PathBuf> {
@@ -42,12 +53,11 @@ pub(super) fn save() -> Result<bool> {
         tree: execute_git(&["rev-parse", "HEAD^{tree}"])?
             .trim()
             .to_string(),
+        landed_head: None,
     };
     // Record intent before stashing. Its unique message identifies the exact
     // stash even if Kite stops before Git returns or another worktree stashes.
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, serde_json::to_vec(&pending)?)?;
-    fs::rename(&temporary, &path)?;
+    pending.write(&path)?;
     let result = execute_git(&[
         "stash",
         "push",
@@ -89,9 +99,10 @@ pub(super) fn restore() -> Result<bool> {
         fs::remove_file(path)?;
         return Ok(true);
     };
-    if head_position()?.land_key() != pending.target
-        || execute_git(&["rev-parse", "HEAD^{tree}"])?.trim() != pending.tree
-    {
+    let original_tree = execute_git(&["rev-parse", "HEAD^{tree}"])?.trim() == pending.tree;
+    let landed_head =
+        pending.landed_head.as_deref() == Some(execute_git(&["rev-parse", "HEAD"])?.trim());
+    if head_position()?.land_key() != pending.target || (!original_tree && !landed_head) {
         anyhow::bail!(
             "Your temporary work remains in stash {stash}. Return to the checkout where landing started, then run `kt undo` to restore it."
         );
@@ -107,4 +118,17 @@ pub(super) fn restore() -> Result<bool> {
         "✓".green()
     );
     Ok(true)
+}
+
+// Record the validated result before moving the original checkout. Formatting
+// may change its tree, and recovery must still work after a crash or another
+// worktree's land replacing the repository-wide completion record.
+pub(super) fn record_landed_head(head: &str) -> Result<()> {
+    let path = marker_path()?;
+    if path.try_exists()? {
+        let mut pending: PendingWork = serde_json::from_slice(&fs::read(&path)?)?;
+        pending.landed_head = Some(head.to_string());
+        pending.write(&path)?;
+    }
+    Ok(())
 }

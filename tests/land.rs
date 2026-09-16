@@ -513,11 +513,10 @@ fn interrupted_undo_preserves_edits_made_after_the_interruption() {
 
 #[cfg(unix)]
 #[test]
-fn hook_changes_cannot_silently_replace_saved_contents() {
+fn successful_formatter_lands_in_one_pass_and_remains_undoable() {
     use std::os::unix::fs::PermissionsExt;
     let repo = init_repo();
-    save(&repo.path);
-    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    write_file(&repo.path, "tracked.txt", "editor formatting\n");
     let hook = repo.path.join(".git/hooks/pre-commit");
     std::fs::write(
         &hook,
@@ -525,14 +524,197 @@ fn hook_changes_cannot_silently_replace_saved_contents() {
     )
     .unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_success(&kt(&repo.path, &[]).output().unwrap());
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    let branch = git(&repo.path, &["symbolic-ref", "HEAD"]);
     let output = land(&repo.path, false, || {});
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("do not match the saved files"));
-    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+    assert_success(&output);
+    assert_eq!(git(&repo.path, &["symbolic-ref", "HEAD"]), branch);
+    assert_eq!(
+        git(&repo.path, &["show", "HEAD:tracked.txt"]),
+        "formatted\n"
+    );
+    assert_eq!(git(&repo.path, &["status", "--porcelain"]), "");
     assert_eq!(
         std::fs::read_to_string(repo.path.join("tracked.txt")).unwrap(),
         "formatted\n"
     );
+    assert_success(&kt(&repo.path, &["undo"]).output().unwrap());
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+    assert_eq!(
+        git(&repo.path, &["show", "HEAD:tracked.txt"]),
+        "editor formatting\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_formatter_restores_dirty_work_and_staging() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = init_repo();
+    save(&repo.path);
+    let hook = repo.path.join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'formatted\\n' > tracked.txt\ngit add tracked.txt\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_file(&repo.path, "other.txt", "staged work\n");
+    git(&repo.path, &["add", "other.txt"]);
+    write_file(&repo.path, "other.txt", "unstaged work\n");
+    write_file(&repo.path, "pending.txt", "untracked work\n");
+    let status = git(&repo.path, &["status", "--porcelain"]);
+
+    assert_success(&land(&repo.path, true, || {}));
+    assert_eq!(
+        git(&repo.path, &["show", "HEAD:tracked.txt"]),
+        "formatted\n"
+    );
+    assert_eq!(git(&repo.path, &["status", "--porcelain"]), status);
+    assert_eq!(git(&repo.path, &["show", ":other.txt"]), "staged work\n");
+    assert_eq!(
+        std::fs::read_to_string(repo.path.join("other.txt")).unwrap(),
+        "unstaged work\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path.join("pending.txt")).unwrap(),
+        "untracked work\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn formatter_only_change_is_removed_in_one_land() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = init_repo();
+    let base = git(&repo.path, &["rev-parse", "HEAD"]);
+    save(&repo.path);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    let hook = repo.path.join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'base\\n' > tracked.txt\ngit add tracked.txt\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_success(&land(&repo.path, false, || {}));
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), base);
+    assert_eq!(git(&repo.path, &["status", "--porcelain"]), "");
+    assert_success(&kt(&repo.path, &["undo"]).output().unwrap());
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+}
+
+#[cfg(unix)]
+#[test]
+fn formatter_conflict_keeps_the_pending_work_backup() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = init_repo();
+    save(&repo.path);
+    let hook = repo.path.join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'formatted\\n' > tracked.txt\ngit add tracked.txt\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_file(&repo.path, "tracked.txt", "pending work\n");
+    git(&repo.path, &["add", "tracked.txt"]);
+
+    let output = land(&repo.path, true, || {});
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Your changes remain in stash"));
+    assert_eq!(
+        git(&repo.path, &["show", "HEAD:tracked.txt"]),
+        "formatted\n"
+    );
+    assert_eq!(
+        git(&repo.path, &["show", "stash@{0}:tracked.txt"]),
+        "pending work\n"
+    );
+    assert!(repo.path.join(".git/kite-pending-work.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_hook_cannot_stage_files_outside_the_plan() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = init_repo();
+    save(&repo.path);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    let hook = repo.path.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\nprintf 'formatted\\n' > tracked.txt\nprintf 'unrelated\\n' > other.txt\ngit add tracked.txt other.txt\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = land(&repo.path, false, || {});
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("outside this commit's planned files")
+    );
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+    assert_eq!(
+        std::fs::read_to_string(repo.path.join("other.txt")).unwrap(),
+        "unrelated\n"
+    );
+    assert_eq!(git(&repo.path, &["diff", "--cached", "--name-only"]), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn post_commit_staging_is_preserved_without_being_reported_as_landed() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = init_repo();
+    save(&repo.path);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    let hook = repo.path.join(".git/hooks/post-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'too late\\n' > tracked.txt\ngit add tracked.txt\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = land(&repo.path, false, || {});
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("left staged changes"));
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+    assert_eq!(
+        std::fs::read_to_string(repo.path.join("tracked.txt")).unwrap(),
+        "too late\n"
+    );
+    assert_eq!(git(&repo.path, &["diff", "--cached", "--name-only"]), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_root_land_checks_post_commit_staging() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = support::init_root_kite_repo();
+    git(&repo.path, &["rm", "tracked.txt"]);
+    assert_success(&kt(&repo.path, &[]).output().unwrap());
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    let hook = repo.path.join(".git/hooks/post-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'too late\\n' > unrelated.txt\ngit add unrelated.txt\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = kt(&repo.path, &["land", "--yes"]).output().unwrap();
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("left staged changes"));
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+    assert_eq!(
+        std::fs::read_to_string(repo.path.join("unrelated.txt")).unwrap(),
+        "too late\n"
+    );
+    assert_eq!(git(&repo.path, &["diff", "--cached", "--name-only"]), "");
 }
 
 #[cfg(unix)]

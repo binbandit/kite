@@ -152,7 +152,9 @@ Synthesizes contiguous Kite quicksaves into a polished local history.
 - Shows the proposed commit plan, with the files under each commit, before rewriting anything.
 - Stores the pre-land `HEAD` in `refs/kite/pre_land` and updates the full rollback transaction atomically, so `kt undo` can restore it later without linked worktrees observing a half-written marker.
 - Creates normal `git commit`s, so hooks do run during landing. Pass `--no-verify` to disable all commit hooks.
-- Checks that the final committed tree exactly matches the saves before moving your branch. If a hook changes saved content, landing rolls back and preserves the hook edits in your working tree so you can save them and retry.
+- Accepts changes that successful commit hooks stage to the current commit's planned files, so formatter differences between your editor and hooks land in one run. Kite reports the included hook changes and still verifies every other file against the saves.
+- If formatting cancels a group's changes completely, Kite removes the redundant empty commit. An empty initial commit is kept when the repository has no parent commit.
+- Refuses hooks that stage files outside the current group or leave staged changes after the commit was written. Failed hooks still restore your saves and preserve their edits for correction and retry.
 - Stops if your checkout, commits, or working files change while the plan is being prepared or reviewed.
 - Landing builds on one uniquely named temporary branch so ordinary Git hooks see a normal checkout. It records that exact ref, moves your branch with a compare-and-swap — or, if you were already detached, moves `HEAD` itself — and removes the temporary branch before returning.
 - If landing fails for any reason — a rejected pre-commit hook is the usual one — Kite undoes the attempt and leaves you exactly where you started: on your branch or your detached commit, saves intact, nothing staged, no branch to clean up. Fix the problem and run `kt land` again. Files a hook rewrote are kept as unstaged changes.

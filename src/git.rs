@@ -215,13 +215,16 @@ pub(crate) enum Hooks {
     Skip,
 }
 
-pub(crate) fn commit_git(message: &str, hooks: Hooks) -> Result<()> {
+pub(crate) fn commit_git(message: &str, hooks: Hooks, allow_empty: bool) -> Result<()> {
     let mut args = Vec::new();
     if hooks == Hooks::Skip {
         // --no-verify still runs prepare-commit-msg and post-commit.
         args.extend(["-c", "core.hooksPath=/dev/null"]);
     }
     args.extend(["commit", "-m", message]);
+    if allow_empty {
+        args.push("--allow-empty");
+    }
 
     let output = git_command()?
         .args(&args)

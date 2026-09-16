@@ -201,7 +201,7 @@ fn save() -> Result<()> {
     }
 
     let msg = format!("{SAVE_PREFIX} {}", Local::now().format("%H:%M:%S"));
-    commit_git(&msg, Hooks::Skip)?;
+    commit_git(&msg, Hooks::Skip, false)?;
 
     println!(
         "{} {}",

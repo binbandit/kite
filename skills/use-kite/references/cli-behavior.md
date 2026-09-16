@@ -42,7 +42,9 @@
 - Record the pre-land `HEAD` at `refs/kite/pre_land`, and store the complete transaction phase, target, owner, and keepalive in one atomic compare-and-swap marker.
 - Build commits on one exact, transaction-owned temporary branch for hook compatibility, then delete only that recorded ref with its expected commit id.
 - Run the repository's commit hooks by default; `--no-verify` disables all commit hooks. Publishing still runs pre-push hooks.
-- Verify that the final committed tree matches the saves. Hook changes cause rollback, preserving edits in the working tree for a new save and retry.
+- Accept successful hook changes committed to the current group's files and verify every other file against the saves. Report included hook changes. Reject staging outside the planned group or staged leftovers after commit; failed hooks still roll back with edits preserved.
+- Remove redundant empty commits when formatting cancels the group's changes. Keep an empty initial commit when there is no parent.
+- Persist the validated landed commit alongside pending stashed work before returning to the original checkout, so `--allow-dirty` can restore work onto the formatted result after an interruption. Real stash conflicts retain the backup and require resolution.
 - Refuse to rewrite if HEAD or working files changed while planning.
 - `--tag <tag>` appends ` [<tag>]` to every landed commit title, skipping titles that already carry it.
 - If the process is interrupted mid-land, block further commands in that worktree until an explicit `kt undo` restores the recorded target and saves. Never infer ownership from detached `HEAD` alone.
