@@ -1,6 +1,6 @@
 [package]
 name = "kite"
-version = "2026.9.16"
+version = "2026.9.17"
 edition = "2024"
 description = "Fast quicksaves and inspectable AI-assisted landing"
 

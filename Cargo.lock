@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "kite"
-version = "2026.9.16"
+version = "2026.9.17"
 dependencies = [
  "anyhow",
  "chrono",

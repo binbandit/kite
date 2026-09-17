@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.09.17
+
+### Bug Fixes
+
+- **land:** accept formatting from successful commit hooks ([`1e94053`](https://github.com/binbandit/kite/commit/1e940530dd079748ba8c4f58d8b37d34eaeee940))
+
 ## 2026.09.15
 
 ### Features
