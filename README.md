@@ -42,7 +42,7 @@ When your branch is full of contiguous Kite saves, run:
 kt land
 ```
 
-Kite analyzes the diff introduced by those saves, proposes logical commit groups, and only rewrites history after you confirm the plan.
+Kite analyzes the diff introduced by those saves, proposes logical commit groups, and only rewrites history after you confirm the plan. The preview shows each commit's subject, body, and files.
 
 Grouping is file-level: every file lands whole, in exactly one commit. That keeps each commit something your tooling can actually run: a pre-commit hook, linter, or formatter always sees complete files, never a half-applied one.
 
@@ -285,15 +285,18 @@ Both `kt land` and `kt pr` use one AI, reached through the OpenAI Responses API,
 - Base URL env precedence: `KITE_OPENAI_URL`, `KITE_OPENAI_BASE_URL`, `OPENAI_URL`, `OPENAI_BASE_URL`
 - Model env precedence: `KITE_OPENAI_MODEL`, `OPENAI_MODEL`
 - API key env precedence: `KITE_OPENAI_API_KEY`, `OPENAI_API_KEY`, `KITE_API_KEY`, `OPENAI_KEY`, `AI_GATEWAY_API_KEY`
+- Reasoning effort env: `KITE_OPENAI_REASONING_EFFORT` (the model's supported values, such as `none`, `low`, or `medium`)
 - Timeout env: `KITE_OPENAI_TIMEOUT_SECS`
 - Default base URL: `https://api.openai.com/v1`
-- Default model: `gpt-5.4-mini`
+- Default model: `gpt-5.4`
+- Default reasoning effort: `low`; a model or gateway that rejects the field is retried without it
 - Default timeout: 120 seconds
 - Kite normalizes base URLs that end in `/responses`, `/chat/completions`, or omit `/v1`
 
 ```bash
 export OPENAI_API_KEY="sk-..."
-export KITE_OPENAI_MODEL="gpt-5.4-mini"
+export KITE_OPENAI_MODEL="gpt-5.4"
+export KITE_OPENAI_REASONING_EFFORT="low"
 export KITE_OPENAI_TIMEOUT_SECS="120"
 ```
 

@@ -31,6 +31,7 @@ use crate::ui::{Spinner, confirm, overflow_note, pluralize, print_ai_unavailable
 /// is the last thing shown before history is rewritten, and one that scrolls
 /// for thousands of lines is one nobody actually reads.
 const MAX_PLAN_FILES_SHOWN: usize = 12;
+const MAX_PLAN_BODY_LINES_SHOWN: usize = 6;
 const EMPTY_INITIAL_MESSAGE: &str = "chore: empty initial snapshot";
 
 #[derive(Clone, Debug)]
@@ -294,19 +295,23 @@ fn render_land_plan(commits: &[CommitGroup], save_count: usize) -> String {
     );
 
     for (index, commit) in commits.iter().enumerate() {
-        // Only the subject goes on the numbered line: a multi-line message
-        // would otherwise print flush-left through the file tree and wreck the
-        // one screen the user has to read before history is rewritten.
+        // The subject gets the numbered line and the body sits indented under
+        // it, so a multi-line message never runs flush-left through the file
+        // tree. Bodies carry what each commit fixes; this is the one screen
+        // read before history is rewritten.
         let mut lines = commit.message.lines();
         let subject = lines.next().unwrap_or("").trim();
         plan.push_str(&format!("  {}. {}\n", index + 1, subject.bold()));
 
-        let body_lines = lines.filter(|line| !line.trim().is_empty()).count();
-        if body_lines > 0 {
-            plan.push_str(&format!(
-                "     {}\n",
-                format!("+ {}", pluralize(body_lines, "body line")).dimmed()
-            ));
+        let body: Vec<&str> = lines
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        for line in body.iter().take(MAX_PLAN_BODY_LINES_SHOWN) {
+            plan.push_str(&format!("     {}\n", line.dimmed()));
+        }
+        if let Some(note) = overflow_note(body.len(), MAX_PLAN_BODY_LINES_SHOWN) {
+            plan.push_str(&format!("     {}\n", note.dimmed()));
         }
 
         for (position, file) in commit.files.iter().take(MAX_PLAN_FILES_SHOWN).enumerate() {

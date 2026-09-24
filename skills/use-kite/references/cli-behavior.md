@@ -95,9 +95,11 @@
 - Base URL: `KITE_OPENAI_URL`, `KITE_OPENAI_BASE_URL`, `OPENAI_URL`, `OPENAI_BASE_URL`
 - Model: `KITE_OPENAI_MODEL`, `OPENAI_MODEL`
 - API key: `KITE_OPENAI_API_KEY`, `OPENAI_API_KEY`, `KITE_API_KEY`, `OPENAI_KEY`, `AI_GATEWAY_API_KEY`
+- Reasoning effort: `KITE_OPENAI_REASONING_EFFORT`
 - Timeout: `KITE_OPENAI_TIMEOUT_SECS`
 - Default base URL: `https://api.openai.com/v1`
-- Default model: `gpt-5.4-mini`
+- Default model: `gpt-5.4`
+- Default reasoning effort: `low`, dropped and retried when a model or gateway rejects it
 - Default timeout: 120 seconds
 - Kite normalizes base URLs before calling `/responses`:
   - strips a trailing `/responses`

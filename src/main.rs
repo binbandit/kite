@@ -626,7 +626,7 @@ mod tests {
             Some(Commands::Publish)
         ));
         // Visible, so it shows up for someone reading `kt --help`.
-        assert!(render_help().contains("[aliases: push]"));
+        assert!(render_help().contains("[alias: push]"));
     }
 
     /// Every other command points at `kt undo` when recovery state is

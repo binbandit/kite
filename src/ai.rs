@@ -6,7 +6,11 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4-mini";
+// Compared on a 55-file land (docs/ai-output-evaluation.md): gpt-5.4 at low
+// effort wrote the most accurate plans for about $0.14 and 20 seconds. With no
+// reasoning, gpt-5.4-mini failed file coverage in both runs.
+const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4";
+const DEFAULT_REASONING_EFFORT: &str = "low";
 const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 120;
 
 /// Enough of an error payload to identify the problem, without pasting an
@@ -27,8 +31,16 @@ pub(crate) struct Request {
 struct AiError {
     message: String,
     retryable: bool,
-    /// Retry without native schema enforcement when a gateway rejects it.
-    native_schema_rejected: bool,
+    /// An optional request field the provider refused; retry without it.
+    rejected: Option<OptionalField>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionalField {
+    /// Native schema enforcement, which some gateways reject.
+    Format,
+    /// Reasoning effort, which older models and some gateways reject.
+    Reasoning,
 }
 
 impl std::fmt::Display for AiError {
@@ -62,28 +74,49 @@ pub(crate) async fn complete(request: &Request) -> Result<String> {
     let timeout = env_duration_secs("KITE_OPENAI_TIMEOUT_SECS", DEFAULT_OPENAI_TIMEOUT_SECS)?;
     let responses_url = format!("{}/responses", base_url.trim_end_matches('/'));
 
-    // Prefer the native strict-schema format: OpenAI enforces it server-side.
-    match send_responses(
-        &responses_url,
-        &api_key,
-        timeout,
-        strict_schema_body(&model, request),
-    )
-    .await
-    {
-        Err(failure) if failure.native_schema_rejected => {
-            // Some gateways reject `format`; describe the schema in the prompt instead.
-            send_responses(
-                &responses_url,
-                &api_key,
-                timeout,
-                prompt_schema_body(&model, request),
-            )
-            .await
-            .map_err(Into::into)
+    // Start with everything that helps and drop only what the provider refuses.
+    // Each field is dropped at most once, so this ends after three requests.
+    let mut native_schema = true;
+    let mut effort = Some(reasoning_effort());
+    loop {
+        let body = request_body(&model, request, native_schema, effort.as_deref());
+        match send_responses(&responses_url, &api_key, timeout, body).await {
+            Err(failure) if failure.rejected == Some(OptionalField::Format) && native_schema => {
+                // Describe the schema in the prompt instead.
+                native_schema = false;
+            }
+            Err(failure)
+                if failure.rejected == Some(OptionalField::Reasoning) && effort.is_some() =>
+            {
+                effort = None;
+            }
+            other => return other.map_err(Into::into),
         }
-        other => other.map_err(Into::into),
     }
+}
+
+fn request_body(
+    model: &str,
+    request: &Request,
+    native_schema: bool,
+    effort: Option<&str>,
+) -> serde_json::Value {
+    let mut body = if native_schema {
+        strict_schema_body(model, request)
+    } else {
+        prompt_schema_body(model, request)
+    };
+    if let Some(effort) = effort {
+        body["reasoning"] = serde_json::json!({ "effort": effort });
+    }
+    body
+}
+
+/// Without it, reasoning models default to no reasoning at all, which on a
+/// large land skips files and copies history into messages.
+fn reasoning_effort() -> String {
+    first_non_empty_env(&["KITE_OPENAI_REASONING_EFFORT"])
+        .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string())
 }
 
 /// The strict, server-enforced schema request — correct wherever it is honored.
@@ -137,7 +170,7 @@ async fn send_responses(
         message: format!("Could not reach {responses_url}: {error}"),
         // Timeouts, connection resets and DNS blips are all worth another go.
         retryable: true,
-        native_schema_rejected: false,
+        rejected: None,
     })?;
 
     let status = response.status();
@@ -147,15 +180,14 @@ async fn send_responses(
         return Err(AiError {
             message: describe_api_failure(status, &body),
             retryable: is_retryable_status(status),
-            native_schema_rejected: status == reqwest::StatusCode::BAD_REQUEST
-                && mentions_format_rejection(&body),
+            rejected: rejected_field(status, &body),
         });
     }
 
     let body = response.text().await.map_err(|error| AiError {
         message: format!("Could not read the reply from {responses_url}: {error}"),
         retryable: true,
-        native_schema_rejected: false,
+        rejected: None,
     })?;
 
     let json: serde_json::Value = serde_json::from_str(&body).map_err(|error| AiError {
@@ -164,10 +196,42 @@ async fn send_responses(
             elide(&body, MAX_ERROR_BODY_CHARS)
         ),
         retryable: true,
-        native_schema_rejected: false,
+        rejected: None,
     })?;
 
     extract_openai_output_text(&json)
+}
+
+/// Which optional field a 400 refuses, if any. Unrelated 400s stay fatal.
+fn rejected_field(status: reqwest::StatusCode, body: &str) -> Option<OptionalField> {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return None;
+    }
+    if mentions_format_rejection(body) {
+        Some(OptionalField::Format)
+    } else if mentions_reasoning_rejection(body) {
+        Some(OptionalField::Reasoning)
+    } else {
+        None
+    }
+}
+
+/// OpenAI names the parameter (`reasoning.effort`) for models without
+/// reasoning and for effort values a model doesn't offer; gateways say the
+/// field is not permitted.
+fn mentions_reasoning_rejection(body: &str) -> bool {
+    let param = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.pointer("/error/param")?
+                .as_str()
+                .map(ToOwned::to_owned)
+        });
+    if param.is_some_and(|param| param.starts_with("reasoning")) {
+        return true;
+    }
+    let body = body.to_ascii_lowercase();
+    body.contains("reasoning") && body.contains("extra inputs are not permitted")
 }
 
 /// A gateway rejecting the `format` field looks like a 400 complaining that the
@@ -275,7 +339,7 @@ fn extract_openai_output_text(json: &serde_json::Value) -> std::result::Result<S
     let failure = |message: String, retryable| AiError {
         message,
         retryable,
-        native_schema_rejected: false,
+        rejected: None,
     };
     if let Some(error) = json.get("error").filter(|error| !error.is_null()) {
         let detail = error.get("message").and_then(|value| value.as_str());
@@ -684,7 +748,7 @@ mod tests {
         let hard_failure: anyhow::Error = AiError {
             message: "AI request failed (401 Unauthorized)".to_string(),
             retryable: false,
-            native_schema_rejected: false,
+            rejected: None,
         }
         .into();
         assert!(!is_retryable(&hard_failure));
@@ -719,6 +783,59 @@ mod tests {
         assert!(!mentions_format_rejection(
             "reasoning: Extra inputs are not permitted"
         ));
+    }
+
+    #[test]
+    fn rejected_field_names_what_to_drop_and_nothing_else() {
+        let bad_request = reqwest::StatusCode::BAD_REQUEST;
+        // Verbatim OpenAI replies: a model without reasoning, and an effort it lacks.
+        let unsupported_parameter = r#"{"error": {"message": "Unsupported parameter: 'reasoning.effort' is not supported with this model.", "type": "invalid_request_error", "param": "reasoning.effort", "code": "unsupported_parameter"}}"#;
+        let unsupported_value = r#"{"error": {"message": "Unsupported value: 'none' is not supported with the 'gpt-5-mini' model.", "type": "invalid_request_error", "param": "reasoning.effort", "code": "unsupported_value"}}"#;
+        for body in [
+            unsupported_parameter,
+            unsupported_value,
+            "reasoning: Extra inputs are not permitted",
+        ] {
+            assert_eq!(
+                rejected_field(bad_request, body),
+                Some(OptionalField::Reasoning),
+                "{body}"
+            );
+        }
+        assert_eq!(
+            rejected_field(
+                bad_request,
+                "bedrock error: output_config.format: Extra inputs are not permitted"
+            ),
+            Some(OptionalField::Format)
+        );
+
+        // Other failures, and a reasoning complaint that isn't a 400, stay fatal.
+        let unrelated =
+            r#"{"error": {"message": "Invalid schema", "param": "text.format.schema"}}"#;
+        assert_eq!(rejected_field(bad_request, unrelated), None);
+        assert_eq!(
+            rejected_field(reqwest::StatusCode::UNAUTHORIZED, unsupported_parameter),
+            None
+        );
+    }
+
+    #[test]
+    fn request_body_carries_the_effort_and_the_schema_mode() {
+        let request = Request {
+            system: "You are terse.".to_string(),
+            user: "Group the files.".to_string(),
+            schema_name: "commit_groups".to_string(),
+            schema: json!({ "type": "object" }),
+        };
+
+        let full = request_body("gpt-5.4", &request, true, Some("low"));
+        assert_eq!(full["reasoning"], json!({ "effort": "low" }));
+        assert!(full.get("text").is_some());
+
+        let stripped = request_body("gpt-4.1-mini", &request, false, None);
+        assert!(stripped.get("reasoning").is_none());
+        assert!(stripped.get("text").is_none());
     }
 
     #[test]

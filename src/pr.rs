@@ -11,8 +11,8 @@ use colored::*;
 use serde::Deserialize;
 use std::process::Command;
 
-use crate::ai::{self, extract_json_block, truncate_for_prompt};
-use crate::diff::MAX_DIFF_BYTES;
+use crate::ai::{self, extract_json_block};
+use crate::diff::{MAX_DIFF_BYTES, render_diff};
 use crate::git::{
     branch_to_publish, check_ref, execute_git, get_default_branch, has_remote, is_save_subject,
     repo_root,
@@ -47,7 +47,7 @@ Defaults:
 - Lead with the concrete problem or changed behavior, then explain the solution. Prefer one or two short paragraphs; add bullets only when distinct changes or supplied evidence need them. Do not narrate files, functions, or implementation steps unless they help a reviewer.
 - Match recent title conventions when consistent; otherwise use Conventional Commit style. Keep the title concise, specific, present tense, and without a trailing period.
 - Fill applicable template sections with real content. Drop irrelevant or unsupported sections, instructional comments, placeholders, empty headings, and N/A boilerplate. Retain required fixed notices or machine markers.
-- Use GitHub-flavored Markdown. Do not add co-author credits or claim actions Kite did not perform. If the diff is truncated, stay within the evidence provided.
+- Use GitHub-flavored Markdown. Do not add co-author credits or claim actions Kite did not perform. If the diff is truncated, its markers say what was left out; stay within the evidence provided.
 
 Refresh behavior:
 When current_pull_request is present, preserve its structure and human-written notes, including existing verification notes, and revise only what the supplied changes make stale or incomplete. Do not present historical verification as a new run. If nothing needs updating, return its title and body verbatim.";
@@ -327,7 +327,17 @@ fn collect_pr_context(branch: String, base: String, head: &str) -> Result<PrCont
         );
     }
 
-    let diff = execute_git(&["diff", &format!("{base_ref}...{head}")])?;
+    // Pinned to the patch shape `render_diff` parses, whatever the user's diff
+    // configuration says, as landing's diff is.
+    let diff = execute_git(&[
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        &format!("{base_ref}...{head}"),
+    ])?;
     let root = repo_root()?;
 
     Ok(PrContext {
@@ -445,7 +455,7 @@ fn build_pr_input(
         })),
         "recent_pr_titles": title_examples,
         "commit_subjects": context.commits,
-        "diff": truncate_for_prompt(&context.diff, MAX_DIFF_BYTES),
+        "diff": render_diff(&context.diff, MAX_DIFF_BYTES),
         "diff_truncated": context.diff.len() > MAX_DIFF_BYTES,
     })
     .to_string()

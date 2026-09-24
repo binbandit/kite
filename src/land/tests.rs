@@ -720,10 +720,24 @@ fn render_land_plan_keeps_multi_line_messages_out_of_the_file_tree() {
         1,
     );
 
-    assert!(plan.contains("  1. feat(api): add webhooks\n"));
-    assert!(plan.contains("+ 2 body lines"));
+    assert!(plan.contains(
+        "  1. feat(api): add webhooks\n     Explains the change\n     over several lines.\n"
+    ));
     assert!(!plan.contains("\nExplains the change"));
     assert!(plan.contains("     └─ src/api.rs\n"));
+}
+
+#[test]
+fn render_land_plan_caps_long_bodies() {
+    colored::control::set_override(false);
+
+    let body: Vec<String> = (0..9).map(|line| format!("- change {line}")).collect();
+    let message = format!("fix: many things\n\n{}", body.join("\n"));
+    let plan = render_land_plan(&[files_commit(&message, &["src/api.rs"])], 1);
+
+    assert!(plan.contains("     - change 5\n"));
+    assert!(!plan.contains("- change 6"));
+    assert!(plan.contains("     … and 3 more\n"));
 }
 
 #[test]
