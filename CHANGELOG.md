@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.09.25
+
+### Bug Fixes
+
+- **land:** keep AI commit plans accurate and reviewable ([`9d37158`](https://github.com/binbandit/kite/commit/9d371589c056ac6e46a55aa9c69a1e7d17a9370d))
+
 ## 2026.09.17
 
 ### Bug Fixes
