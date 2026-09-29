@@ -43,7 +43,11 @@ impl PrRepo {
 printf '%s\n' "$*" >> "$GH_CALLS"
 case "$1 $2" in
   'repo view')
-    if [ "$3" = "$EXPECTED_REPO" ]; then echo "$FETCH_REPO"; else echo "$PUSH_REPO"; fi
+    case "$3" in
+      "$EXPECTED_REPO") printf '%s\n' "$FETCH_REPO" ;;
+      "$UPSTREAM_URL") printf '%s\n' "$UPSTREAM_REPO" ;;
+      *) printf '%s\n' "$PUSH_REPO" ;;
+    esac
     exit 0 ;;
   'pr list')
     if [ "$GH_FAILURE" = 'true' ]; then echo 'API unavailable' >&2; exit 1; fi
@@ -77,12 +81,14 @@ exit 1
             .args(["pr", "--yes", "--base", base])
             .current_dir(&self.repo.path)
             .env("PATH", std::env::join_paths(paths).unwrap())
+            // Keeps the developer's own PR writing skills out of the drafts.
+            .env("HOME", &self.cli.path)
             .env("GH_CALLS", self.cli.path.join("calls"))
             .env("GH_FAILURE", failure.to_string())
             .env("GH_PRS", prs)
             .env("EXPECTED_REPO", &self.remote.path)
-            .env("FETCH_REPO", "https://example.invalid/owner/repo")
-            .env("PUSH_REPO", "https://example.invalid/owner/repo")
+            .env("FETCH_REPO", repository("owner/repo", None))
+            .env("PUSH_REPO", repository("owner/repo", None))
             .env("KITE_OPENAI_URL", "http://127.0.0.1:1")
             .env("KITE_OPENAI_TIMEOUT_SECS", "1");
         for key in [
@@ -103,10 +109,75 @@ exit 1
 
     fn assert_unpublished(&self) {
         assert!(git(&self.remote.path, &["branch", "--list", "feature"]).is_empty());
-        let calls = std::fs::read_to_string(self.cli.path.join("calls")).unwrap();
+        let calls = self.calls();
         assert!(!calls.contains("pr create"), "{calls}");
         assert!(!calls.contains("pr edit"), "{calls}");
     }
+
+    fn calls(&self) -> String {
+        std::fs::read_to_string(self.cli.path.join("calls")).unwrap()
+    }
+
+    /// Turns `origin` into a fork of a new `upstream` whose base branch has
+    /// moved on, with the feature rebuilt on the parent's newer base.
+    fn add_upstream(&self) -> TempDir {
+        let upstream = TempDir::new("kite-pr-upstream");
+        git(&upstream.path, &["init", "--bare"]);
+        let repo = &self.repo.path;
+        git(
+            repo,
+            &["remote", "add", "upstream", upstream.path.to_str().unwrap()],
+        );
+        git(repo, &["checkout", &self.base]);
+        git(
+            repo,
+            &["commit", "--allow-empty", "-m", "feat: upstream change"],
+        );
+        git(repo, &["push", "upstream", &self.base]);
+        git(repo, &["reset", "--hard", "HEAD~"]);
+        git(repo, &["fetch", "upstream"]);
+        git(
+            repo,
+            &["rebase", &format!("upstream/{}", self.base), "feature"],
+        );
+        upstream
+    }
+
+    fn fork_pr_command(&self, upstream: &TempDir, prs: &str) -> Command {
+        let mut command = self.pr_command(&self.base, prs, false);
+        command
+            .env("FETCH_REPO", repository("me/repo", Some("acme/repo")))
+            .env("UPSTREAM_URL", &upstream.path)
+            .env("UPSTREAM_REPO", repository("acme/repo", None));
+        command
+    }
+}
+
+/// `gh repo view --json url,nameWithOwner,parent` for `owner/name`.
+fn repository(name_with_owner: &str, parent: Option<&str>) -> String {
+    let parent = parent.map(|parent| {
+        let (owner, name) = parent.split_once('/').unwrap();
+        serde_json::json!({ "name": name, "owner": { "login": owner } })
+    });
+    serde_json::json!({
+        "url": format!("https://example.invalid/{name_with_owner}"),
+        "nameWithOwner": name_with_owner,
+        "parent": parent,
+    })
+    .to_string()
+}
+
+/// An open pull request as `gh pr list` reports it, from the `head` repository.
+fn open_pr(number: u32, title: &str, base: &str, head: &str) -> serde_json::Value {
+    let (owner, name) = head.split_once('/').unwrap();
+    serde_json::json!({
+        "url": format!("https://example.invalid/pull/{number}"),
+        "title": title,
+        "body": format!("{title} notes"),
+        "baseRefName": base,
+        "headRepository": { "name": name },
+        "headRepositoryOwner": { "login": owner },
+    })
 }
 
 #[test]
@@ -155,9 +226,7 @@ fn creates_pr_with_explicit_head_after_validating_base() {
 #[test]
 fn explicit_base_mismatch_does_not_silently_refresh_another_base() {
     let repo = PrRepo::new();
-    let existing = serde_json::json!([{
-        "url": "https://example.invalid/pull/1", "title": "Existing", "body": "Notes", "baseRefName": "release", "isCrossRepository": false
-    }]);
+    let existing = serde_json::json!([open_pr(1, "Existing", "release", "owner/repo")]);
     let output = repo.pr(&repo.base, &existing.to_string(), false);
     assert!(!output.status.success());
     assert!(
@@ -220,10 +289,7 @@ fn branch_or_commit_changes_during_lookup_stop_before_publishing() {
 #[test]
 fn same_name_fork_is_not_selected_for_refresh() {
     let repo = PrRepo::new();
-    let fork = serde_json::json!([{
-        "url": "https://example.invalid/pull/99", "title": "Their work", "body": "Their notes",
-        "baseRefName": repo.base, "isCrossRepository": true
-    }]);
+    let fork = serde_json::json!([open_pr(99, "Their work", &repo.base, "them/repo")]);
     let output = repo.pr(&repo.base, &fork.to_string(), false);
     assert!(
         output.status.success(),
@@ -246,10 +312,8 @@ fn same_name_fork_is_not_selected_for_refresh() {
 fn existing_origin_pr_survives_unavailable_ai_and_same_name_forks() {
     let repo = PrRepo::new();
     let prs = serde_json::json!([
-        { "url": "https://example.invalid/pull/99", "title": "Their work", "body": "Their notes",
-          "baseRefName": repo.base, "isCrossRepository": true },
-        { "url": "https://example.invalid/pull/1", "title": "Our work", "body": "Preserve these notes",
-          "baseRefName": repo.base, "isCrossRepository": false }
+        open_pr(99, "Their work", &repo.base, "them/repo"),
+        open_pr(1, "Our work", &repo.base, "owner/repo"),
     ]);
     let output = repo.pr(&repo.base, &prs.to_string(), false);
     assert!(
@@ -282,7 +346,7 @@ fn different_fetch_and_push_repositories_are_rejected() {
     );
     let output = repo
         .pr_command(&repo.base, "[]", false)
-        .env("PUSH_REPO", "https://example.invalid/elsewhere/repo")
+        .env("PUSH_REPO", repository("elsewhere/repo", None))
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -307,6 +371,141 @@ fn equivalent_fetch_and_push_urls_are_accepted() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!git(&repo.remote.path, &["branch", "--list", "feature"]).is_empty());
+}
+
+#[test]
+fn fork_pr_targets_upstream_from_the_fork_against_the_parent_base() {
+    let repo = PrRepo::new();
+    let upstream = repo.add_upstream();
+
+    let output = repo.fork_pr_command(&upstream, "[]").output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("feature → acme/repo:{}", repo.base)),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // Published to the fork, never to the parent.
+    assert_eq!(
+        git(&repo.repo.path, &["rev-parse", "HEAD"]),
+        git(&repo.remote.path, &["rev-parse", "feature"])
+    );
+    assert!(git(&upstream.path, &["branch", "--list", "feature"]).is_empty());
+
+    let calls = repo.calls();
+    assert!(calls.contains("pr create --head me:feature"), "{calls}");
+    assert!(
+        !calls.contains(&format!("--repo {}", repo.remote.path.display())),
+        "{calls}"
+    );
+    assert_eq!(
+        calls
+            .matches(&format!("--repo {}", upstream.path.display()))
+            .count(),
+        3,
+        "{calls}"
+    );
+    // Measured against the parent's base, not the fork's stale copy of it.
+    assert!(calls.contains("- feat: add feature"), "{calls}");
+    assert!(!calls.contains("upstream change"), "{calls}");
+}
+
+#[test]
+fn fork_refresh_selects_only_the_pull_request_from_origin() {
+    let repo = PrRepo::new();
+    let upstream = repo.add_upstream();
+    let prs = serde_json::json!([
+        open_pr(1, "Maintainer work", &repo.base, "acme/repo"),
+        open_pr(2, "Their work", &repo.base, "them/repo"),
+        open_pr(3, "Our work", &repo.base, "ME/repo"),
+    ]);
+
+    let output = repo
+        .fork_pr_command(&upstream, &prs.to_string())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Already open: https://example.invalid/pull/3"),
+        "{stdout}"
+    );
+    let calls = repo.calls();
+    assert!(!calls.contains("pr create"), "{calls}");
+    assert!(!calls.contains("pr edit"), "{calls}");
+}
+
+#[test]
+fn github_fork_without_a_base_remote_asks_where_the_pr_belongs() {
+    let repo = PrRepo::new();
+    let output = repo
+        .pr_command(&repo.base, "[]", false)
+        .env("FETCH_REPO", repository("me/repo", Some("acme/repo")))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fork of `acme/repo`"), "{stderr}");
+    assert!(
+        stderr.contains("git remote add upstream https://example.invalid/acme/repo"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("gh repo set-default origin"), "{stderr}");
+    repo.assert_unpublished();
+
+    // `gh repo set-default origin` keeps pull requests inside the fork.
+    git(
+        &repo.repo.path,
+        &["config", "remote.origin.gh-resolved", "base"],
+    );
+    let output = repo
+        .pr_command(&repo.base, "[]", false)
+        .env("FETCH_REPO", repository("me/repo", Some("acme/repo")))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = repo.calls();
+    assert!(calls.contains("pr create --head feature"), "{calls}");
+}
+
+#[test]
+fn gh_default_repository_overrides_the_upstream_convention() {
+    let repo = PrRepo::new();
+    let upstream = repo.add_upstream();
+    git(
+        &repo.repo.path,
+        &["config", "remote.origin.gh-resolved", "base"],
+    );
+
+    let output = repo.fork_pr_command(&upstream, "[]").output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = repo.calls();
+    assert!(calls.contains("pr create --head feature"), "{calls}");
+    assert!(
+        !calls.contains(&format!("--repo {}", upstream.path.display())),
+        "{calls}"
+    );
 }
 
 #[test]

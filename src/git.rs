@@ -292,12 +292,20 @@ fn indent_block(text: &str) -> String {
 }
 
 pub(crate) fn get_default_branch() -> Result<String> {
-    if has_remote()
-        && let Ok(output) = execute_git(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
-        && let Some(branch) = output.trim().strip_prefix("refs/remotes/origin/")
-        && !branch.is_empty()
-    {
-        return Ok(branch.to_string());
+    if has_remote() {
+        // `git remote add` only records the remote's HEAD from Git 2.48 on, so
+        // a fork's parent often has none. The fork inherited its default
+        // branch from the parent, which makes origin's the next best answer.
+        let base = base_remote();
+        for remote in [base.as_str(), "origin"] {
+            let prefix = format!("refs/remotes/{remote}/");
+            if let Ok(output) = execute_git(&["symbolic-ref", "--quiet", &format!("{prefix}HEAD")])
+                && let Some(branch) = output.trim().strip_prefix(&prefix)
+                && !branch.is_empty()
+            {
+                return Ok(branch.to_string());
+            }
+        }
     }
 
     for branch in ["main", "master"] {
@@ -312,7 +320,7 @@ pub(crate) fn get_default_branch() -> Result<String> {
         Ok(current.to_string())
     } else {
         anyhow::bail!(
-            "Could not determine a default branch. Expected origin/HEAD, `main`, or `master`."
+            "Could not determine a default branch. Expected a remote HEAD, `main`, or `master`."
         )
     }
 }
@@ -499,7 +507,35 @@ pub(crate) fn subjects_missing_from_head(reference: &str) -> Result<Vec<String>>
 
 /// Kite publishes to origin, regardless of other remotes in the repository.
 pub(crate) fn has_remote() -> bool {
-    execute_git(&["remote", "get-url", "origin"]).is_ok()
+    remote_exists("origin")
+}
+
+fn remote_exists(remote: &str) -> bool {
+    execute_git(&["remote", "get-url", remote]).is_ok()
+}
+
+/// The remote new work starts from and pull requests target. Kite still
+/// publishes to origin, so in a fork this is the parent repository.
+pub(crate) fn base_remote() -> String {
+    configured_base_remote().unwrap_or_else(|| "origin".to_string())
+}
+
+/// The base remote when the repository names one: the remote chosen with
+/// `gh repo set-default`, else one called `upstream` by fork convention.
+pub(crate) fn configured_base_remote() -> Option<String> {
+    let gh_default = execute_git(&["config", "--get-regexp", r"^remote\..+\.gh-resolved$"])
+        .ok()
+        .and_then(|output| {
+            output.lines().find_map(|line| {
+                line.strip_suffix(" base")?
+                    .strip_prefix("remote.")?
+                    .strip_suffix(".gh-resolved")
+                    .map(ToOwned::to_owned)
+            })
+        });
+    gh_default
+        .filter(|remote| remote_exists(remote))
+        .or_else(|| remote_exists("upstream").then(|| "upstream".to_string()))
 }
 
 pub(crate) fn check_ref(ref_name: &str) -> Option<String> {
@@ -894,6 +930,25 @@ mod tests {
         );
         assert!(!is_save_subject("[kite] saver: preserve my commit"));
         assert!(is_save_subject("[kite] save 12:00:00"));
+    }
+
+    #[test]
+    fn base_remote_prefers_the_gh_default_then_upstream_then_origin() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let base = || with_repo_cwd(&repo.path, || (configured_base_remote(), base_remote()));
+
+        git(&repo.path, &["remote", "add", "origin", "../fork.git"]);
+        assert_eq!(base(), (None, "origin".to_string()));
+
+        git(&repo.path, &["remote", "add", "upstream", "../parent.git"]);
+        assert_eq!(
+            base(),
+            (Some("upstream".to_string()), "upstream".to_string())
+        );
+
+        git(&repo.path, &["config", "remote.origin.gh-resolved", "base"]);
+        assert_eq!(base(), (Some("origin".to_string()), "origin".to_string()));
     }
 
     #[test]

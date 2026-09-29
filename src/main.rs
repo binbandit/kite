@@ -16,7 +16,7 @@ use colored::*;
 use std::process::ExitCode;
 
 use crate::git::{
-    Hooks, SAVE_PREFIX, active_git_operation, check_ref, commit_git, execute_git,
+    Hooks, SAVE_PREFIX, active_git_operation, base_remote, check_ref, commit_git, execute_git,
     get_default_branch, has_remote, has_staged_changes, has_unmerged_paths,
     is_inside_git_repository, kite_save_stack, lock_current_worktree,
 };
@@ -232,15 +232,22 @@ fn go(name: &str) -> Result<()> {
 
     let remote_ref = format!("refs/remotes/origin/{name}");
     let has_remote = has_remote();
+    let base_remote = base_remote();
 
     if has_remote {
-        let spinner = Spinner::start("Checking origin");
-        let fetched = execute_git(&["fetch", "origin"]);
-        spinner.stop();
-        fetched.context("Could not check origin for existing work. No branch was created.")?;
+        let mut remotes = vec!["origin"];
+        if base_remote != "origin" {
+            remotes.push(&base_remote);
+        }
+        for remote in remotes {
+            let spinner = Spinner::start(format!("Checking {remote}"));
+            let fetched = execute_git(&["fetch", remote]);
+            spinner.stop();
+            fetched.with_context(|| format!("Could not fetch {remote}. No branch was created."))?;
+        }
     }
 
-    // A branch that exists only on the remote is someone's work in progress —
+    // A branch that exists only on origin is someone's work in progress —
     // possibly your own from another machine. Branching off the default branch
     // instead would silently create a divergent branch with the same name, and
     // the next `kt publish` would overwrite theirs.
@@ -256,7 +263,7 @@ fn go(name: &str) -> Result<()> {
     }
 
     let default_branch = get_default_branch()?;
-    let remote_base = format!("refs/remotes/origin/{default_branch}");
+    let remote_base = format!("refs/remotes/{base_remote}/{default_branch}");
     let base = if has_remote && check_ref(&remote_base).is_some() {
         remote_base
     } else {
@@ -522,6 +529,37 @@ mod tests {
     }
 
     #[test]
+    fn go_in_a_fork_starts_from_the_parents_default_branch() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let base = git(&repo.path, &["branch", "--show-current"]);
+        let base = base.trim();
+        let origin = TempDir::new("kite-test-fork");
+        let upstream = TempDir::new("kite-test-parent");
+        for (name, remote) in [("origin", &origin), ("upstream", &upstream)] {
+            git(&remote.path, &["init", "--bare", "-q"]);
+            git(
+                &repo.path,
+                &["remote", "add", name, remote.path.to_str().unwrap()],
+            );
+        }
+        git(&repo.path, &["push", "-q", "origin", base]);
+        git(
+            &repo.path,
+            &["commit", "--allow-empty", "-m", "feat: parent moved on"],
+        );
+        git(&repo.path, &["push", "-q", "upstream", base]);
+        git(&repo.path, &["reset", "-q", "--hard", "HEAD~"]);
+
+        run_go_in_repo(&repo.path, "new-work").expect("go should branch from the parent");
+
+        assert_eq!(
+            git(&repo.path, &["log", "-1", "--format=%s"]).trim(),
+            "feat: parent moved on"
+        );
+    }
+
+    #[test]
     fn go_does_not_create_a_branch_after_a_failed_fetch() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
@@ -535,7 +573,7 @@ mod tests {
         let error =
             run_go_in_repo(&repo.path, "new-work").expect_err("failed fetch must stop branching");
 
-        assert!(error.to_string().contains("Could not check origin"));
+        assert!(error.to_string().contains("Could not fetch origin"));
         assert_eq!(git(&repo.path, &["symbolic-ref", "HEAD"]), before);
         assert!(
             crate::test_support::with_repo_cwd(&repo.path, || check_ref("refs/heads/new-work"))
