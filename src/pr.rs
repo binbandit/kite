@@ -336,7 +336,7 @@ fn view_repository(url: &str) -> Result<Repository> {
 /// maintained on their own, so the parent is only targeted once a remote
 /// says so. An unconfigured fork stops here rather than guess either way.
 fn pull_request_target(origin_url: String, origin: &Repository) -> Result<Target> {
-    let configured = configured_base_remote();
+    let configured = configured_base_remote()?;
     if let Some(remote) = configured.as_deref().filter(|remote| *remote != "origin") {
         let url = remote_url(remote)?;
         let repository = view_repository(&url)?;

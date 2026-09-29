@@ -7,7 +7,7 @@
 - This command is optional. It creates and checks out a new branch for a fresh flow, or switches to the named local branch when it already exists.
 - Prints `Switched to <name>` for an existing branch and `Created <name> from <base>` for a new one, so the verb tells you which happened.
 - `kt`, `kt land`, and `kt publish` all operate on the current branch whether or not `kt go` was used.
-- Prefer the base remote's `HEAD`, then `origin/HEAD`, when they exist (see Forks below).
+- Use the base remote's recorded `HEAD` (see Forks below). When a base remote other than `origin` has none, record it with `git remote set-head <remote> --auto` rather than guessing from the fork.
 - Otherwise fall back to `main`, `master`, or the current branch.
 - Fetch `origin`, and the base remote when it differs, before creating a branch. If the named branch exists on `origin`, check it out with tracking.
 - Stop on a fetch failure. New branches start from the base remote's default branch when available, otherwise its local branch, without tracking the default branch.
@@ -95,6 +95,7 @@
 
 - Kite always publishes to `origin`.
 - The base remote decides where new branches start and where pull requests go: the remote marked by `gh repo set-default` (`remote.<name>.gh-resolved = base`), otherwise `upstream`, otherwise `origin`.
+- When `gh-resolved` names a repository (`owner/name`) instead, use the remote whose URL points to it. If none does, stop and suggest `git remote add upstream <url>`.
 - `kt publish` and `kt undo` never touch the base remote.
 
 ## OpenAI environment variables

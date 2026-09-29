@@ -232,7 +232,7 @@ fn go(name: &str) -> Result<()> {
 
     let remote_ref = format!("refs/remotes/origin/{name}");
     let has_remote = has_remote();
-    let base_remote = base_remote();
+    let base_remote = base_remote()?;
 
     if has_remote {
         let mut remotes = vec!["origin"];
@@ -544,11 +544,19 @@ mod tests {
             );
         }
         git(&repo.path, &["push", "-q", "origin", base]);
+        // The parent has since moved its default branch; the fork has not.
         git(
             &repo.path,
             &["commit", "--allow-empty", "-m", "feat: parent moved on"],
         );
-        git(&repo.path, &["push", "-q", "upstream", base]);
+        git(
+            &repo.path,
+            &["push", "-q", "upstream", "HEAD:refs/heads/release"],
+        );
+        git(
+            &upstream.path,
+            &["symbolic-ref", "HEAD", "refs/heads/release"],
+        );
         git(&repo.path, &["reset", "-q", "--hard", "HEAD~"]);
 
         run_go_in_repo(&repo.path, "new-work").expect("go should branch from the parent");

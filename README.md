@@ -115,7 +115,7 @@ Creates and checks out a new flow branch. If the branch already exists — local
 
 `kt go` does not change how landing works. After it switches branches, you keep working normally with `kt`, `kt land`, and `kt publish` on that branch.
 
-New branches start from the base remote's default branch, which is `origin` unless you work in a [fork](#forks). Kite prefers that remote's `HEAD`, then `origin/HEAD`, otherwise falls back to `main`, `master`, or the current branch. It stops if fetching either remote fails, and new branches do not automatically track the default branch.
+New branches start from the base remote's default branch, which is `origin` unless you work in a [fork](#forks). Kite uses that remote's recorded `HEAD`; a fork's parent is asked directly when Git has not recorded one. Without a remote `HEAD`, Kite falls back to `main`, `master`, or the current branch. It stops if fetching either remote fails, and new branches do not automatically track the default branch.
 
 ```bash
 kt go stripe-webhooks
@@ -282,7 +282,8 @@ Nothing about the detached path is a special mode: the same rollback marker, pla
 
 Kite always publishes to `origin`. New work starts from, and pull requests target, the base remote: the remote chosen with `gh repo set-default`, otherwise a remote named `upstream`, otherwise `origin`. The usual fork layout, where `origin` is your fork and `upstream` is the parent (as `gh repo fork` and `gh repo clone` set it up), works with no configuration.
 
-- `kt go` fetches both remotes and starts new branches from the parent's default branch rather than your fork's possibly stale copy of it. A branch that already exists on your fork is still checked out from there.
+- When `gh repo set-default` names a repository rather than one of your remotes, Kite uses whichever remote points to it, and asks you to add one if none does.
+- `kt go` fetches both remotes and starts new branches from the parent's default branch rather than your fork's possibly stale copy of it, even when the two use different default branch names. A branch that already exists on your fork is still checked out from there.
 - `kt pr` pushes to your fork, then opens the pull request in the parent from `<your-owner>:<branch>`. The draft's commits and diff are measured against the parent's base branch, title examples come from the parent's merged pull requests, and an existing pull request is only refreshed when it comes from your fork.
 - If `origin` is a GitHub fork and neither `upstream` nor a `gh` default is configured, `kt pr` stops before publishing and asks where pull requests belong. Add the parent as `upstream` to target it, or run `gh repo set-default origin` for a fork maintained on its own.
 

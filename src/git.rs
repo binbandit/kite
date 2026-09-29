@@ -293,18 +293,17 @@ fn indent_block(text: &str) -> String {
 
 pub(crate) fn get_default_branch() -> Result<String> {
     if has_remote() {
-        // `git remote add` only records the remote's HEAD from Git 2.48 on, so
-        // a fork's parent often has none. The fork inherited its default
-        // branch from the parent, which makes origin's the next best answer.
-        let base = base_remote();
-        for remote in [base.as_str(), "origin"] {
-            let prefix = format!("refs/remotes/{remote}/");
-            if let Ok(output) = execute_git(&["symbolic-ref", "--quiet", &format!("{prefix}HEAD")])
-                && let Some(branch) = output.trim().strip_prefix(&prefix)
-                && !branch.is_empty()
-            {
-                return Ok(branch.to_string());
-            }
+        let base = base_remote()?;
+        if let Some(branch) = recorded_default_branch(&base) {
+            return Ok(branch);
+        }
+        // `git remote add` only records the remote's HEAD from Git 2.48 on,
+        // and a fork's own default can differ from its parent's, so ask.
+        if base != "origin" {
+            execute_git(&["remote", "set-head", &base, "--auto"])
+                .with_context(|| format!("Could not determine the default branch of {base}"))?;
+            return recorded_default_branch(&base)
+                .with_context(|| format!("{base} did not report a default branch"));
         }
     }
 
@@ -323,6 +322,16 @@ pub(crate) fn get_default_branch() -> Result<String> {
             "Could not determine a default branch. Expected a remote HEAD, `main`, or `master`."
         )
     }
+}
+
+fn recorded_default_branch(remote: &str) -> Option<String> {
+    let prefix = format!("refs/remotes/{remote}/");
+    let output = execute_git(&["symbolic-ref", "--quiet", &format!("{prefix}HEAD")]).ok()?;
+    output
+        .trim()
+        .strip_prefix(&prefix)
+        .filter(|branch| !branch.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 pub(crate) fn has_head_commit() -> bool {
@@ -516,26 +525,72 @@ fn remote_exists(remote: &str) -> bool {
 
 /// The remote new work starts from and pull requests target. Kite still
 /// publishes to origin, so in a fork this is the parent repository.
-pub(crate) fn base_remote() -> String {
-    configured_base_remote().unwrap_or_else(|| "origin".to_string())
+pub(crate) fn base_remote() -> Result<String> {
+    Ok(configured_base_remote()?.unwrap_or_else(|| "origin".to_string()))
 }
 
 /// The base remote when the repository names one: the remote chosen with
 /// `gh repo set-default`, else one called `upstream` by fork convention.
-pub(crate) fn configured_base_remote() -> Option<String> {
-    let gh_default = execute_git(&["config", "--get-regexp", r"^remote\..+\.gh-resolved$"])
+pub(crate) fn configured_base_remote() -> Result<Option<String>> {
+    if let Some((remote, choice)) = gh_default() {
+        // gh records `base` on a chosen remote, but a fork's parent that has
+        // no remote of its own is recorded by name on the fork's remote.
+        if choice != "base" {
+            return remote_for_repository(&remote, &choice).map(Some);
+        }
+        if remote_exists(&remote) {
+            return Ok(Some(remote));
+        }
+    }
+    Ok(remote_exists("upstream").then(|| "upstream".to_string()))
+}
+
+/// The remote carrying `gh repo set-default`'s choice, and that choice.
+fn gh_default() -> Option<(String, String)> {
+    let output = execute_git(&["config", "--get-regexp", r"^remote\..+\.gh-resolved$"]).ok()?;
+    output.lines().find_map(|line| {
+        let (key, choice) = line.split_once(' ')?;
+        let remote = key.strip_prefix("remote.")?.strip_suffix(".gh-resolved")?;
+        Some((remote.to_string(), choice.trim().to_string()))
+    })
+}
+
+/// The remote whose URL points to `repository` (`owner/name`). Without one
+/// there is nothing to fetch the chosen repository's branches from.
+fn remote_for_repository(recorded_on: &str, repository: &str) -> Result<String> {
+    let remotes = execute_git(&["remote"])?;
+    for remote in remotes
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let url = execute_git(&["remote", "get-url", remote])?;
+        if split_repository_url(url.trim())
+            .is_some_and(|(_, path)| path.eq_ignore_ascii_case(repository))
+        {
+            return Ok(remote.to_string());
+        }
+    }
+
+    let example = execute_git(&["remote", "get-url", recorded_on])
         .ok()
-        .and_then(|output| {
-            output.lines().find_map(|line| {
-                line.strip_suffix(" base")?
-                    .strip_prefix("remote.")?
-                    .strip_suffix(".gh-resolved")
-                    .map(ToOwned::to_owned)
-            })
-        });
-    gh_default
-        .filter(|remote| remote_exists(remote))
-        .or_else(|| remote_exists("upstream").then(|| "upstream".to_string()))
+        .and_then(|url| {
+            split_repository_url(url.trim()).map(|(host, _)| format!("{host}{repository}"))
+        })
+        .unwrap_or_else(|| "<url>".to_string());
+    anyhow::bail!(
+        "`gh repo set-default` chose `{repository}`, but no remote points to it. Add it with `git remote add upstream {example}`, then try again."
+    )
+}
+
+/// Splits `https://host/owner/name.git` or `git@host:owner/name.git` into
+/// everything before the owner and `owner/name`.
+fn split_repository_url(url: &str) -> Option<(&str, &str)> {
+    let path = url.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let name = path.rfind('/')?;
+    let owner = path[..name].rfind(['/', ':'])? + 1;
+    Some((&path[..owner], &path[owner..]))
 }
 
 pub(crate) fn check_ref(ref_name: &str) -> Option<String> {
@@ -936,7 +991,11 @@ mod tests {
     fn base_remote_prefers_the_gh_default_then_upstream_then_origin() {
         let _lock = acquire_cwd_lock();
         let repo = init_repo();
-        let base = || with_repo_cwd(&repo.path, || (configured_base_remote(), base_remote()));
+        let base = || {
+            with_repo_cwd(&repo.path, || {
+                (configured_base_remote().unwrap(), base_remote().unwrap())
+            })
+        };
 
         git(&repo.path, &["remote", "add", "origin", "../fork.git"]);
         assert_eq!(base(), (None, "origin".to_string()));
@@ -949,6 +1008,43 @@ mod tests {
 
         git(&repo.path, &["config", "remote.origin.gh-resolved", "base"]);
         assert_eq!(base(), (Some("origin".to_string()), "origin".to_string()));
+    }
+
+    /// `gh repo set-default owner/name` on a fork whose parent has no remote
+    /// records the name on the fork's remote instead of `base`.
+    #[test]
+    fn a_gh_default_named_by_repository_resolves_to_its_remote() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        git(
+            &repo.path,
+            &["remote", "add", "origin", "git@example.com:me/repo.git"],
+        );
+        git(
+            &repo.path,
+            &["config", "remote.origin.gh-resolved", "Acme/Repo"],
+        );
+
+        let error = with_repo_cwd(&repo.path, configured_base_remote)
+            .expect_err("a chosen repository without a remote cannot be fetched");
+        assert!(
+            format!("{error:#}").contains("git remote add upstream git@example.com:Acme/Repo"),
+            "{error:#}"
+        );
+
+        git(
+            &repo.path,
+            &[
+                "remote",
+                "add",
+                "parent",
+                "https://example.com/acme/repo.git",
+            ],
+        );
+        assert_eq!(
+            with_repo_cwd(&repo.path, configured_base_remote).unwrap(),
+            Some("parent".to_string())
+        );
     }
 
     #[test]
