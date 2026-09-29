@@ -1,0 +1,121 @@
+name: Tidy Pullfrog reviews
+
+on:
+  workflow_run:
+    workflows: [Pullfrog]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Pull request number to tidy
+        type: number
+        required: true
+
+permissions:
+  pull-requests: write
+
+jobs:
+  tidy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # No checkout: privileged cleanup never executes code from a reviewed PR.
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const numbers = [];
+            if (context.eventName === 'workflow_dispatch') {
+              const number = Number(context.payload.inputs.pull_request);
+              if (!Number.isSafeInteger(number) || number < 1) {
+                throw new Error('pull_request must be a positive integer');
+              }
+              numbers.push(number);
+            } else {
+              // Pullfrog dispatches on main, so workflow_run.pull_requests is empty.
+              // Include recently merged PRs: auto-merge can precede this cleanup.
+              const run = context.payload.workflow_run;
+              const since = Date.parse(run.run_started_at || run.created_at) - 60_000;
+              if (!Number.isFinite(since)) throw new Error('Missing run start time');
+              for await (const { data } of github.paginate.iterator(github.rest.pulls.list, {
+                owner, repo, state: 'all', sort: 'updated', direction: 'desc', per_page: 100,
+              })) {
+                numbers.push(...data.filter(pr => Date.parse(pr.updated_at) >= since).map(pr => pr.number));
+                if (data.some(pr => Date.parse(pr.updated_at) < since)) break;
+              }
+            }
+
+            let minimized = 0;
+            for (const number of numbers) {
+              async function connection(field, fields) {
+                const nodes = [];
+                let cursor = null;
+                let head;
+                do {
+                  const result = await github.graphql(`
+                    query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                      repository(owner: $owner, name: $repo) {
+                        pullRequest(number: $number) {
+                          headRefOid
+                          ${field}(first: 100, after: $cursor) {
+                            nodes { ${fields} }
+                            pageInfo { hasNextPage endCursor }
+                          }
+                        }
+                      }
+                    }`, { owner, repo, number, cursor });
+                  const pr = result.repository.pullRequest;
+                  head = pr.headRefOid;
+                  nodes.push(...pr[field].nodes);
+                  cursor = pr[field].pageInfo.hasNextPage ? pr[field].pageInfo.endCursor : null;
+                } while (cursor);
+                return { nodes, head };
+              }
+
+              const { nodes } = await connection('reviews', `
+                id databaseId state submittedAt isMinimized viewerCanMinimize
+                commit { oid }
+                author { __typename login }
+              `);
+              const reviews = nodes.filter(review =>
+                review.author?.__typename === 'Bot' && review.author.login === 'pullfrog' &&
+                review.state !== 'PENDING' && review.submittedAt
+              ).sort((a, b) => Date.parse(a.submittedAt) - Date.parse(b.submittedAt) || a.databaseId - b.databaseId);
+              if (reviews.length < 2) continue;
+
+              const threads = await connection('reviewThreads', `
+                isResolved
+                comments(first: 1) { nodes { pullRequestReview { id } } }
+              `);
+              const unresolved = new Set();
+              let missingThreadOwner = false;
+              for (const thread of threads.nodes) {
+                if (thread.isResolved) continue;
+                const id = thread.comments.nodes[0]?.pullRequestReview?.id;
+                if (id) unresolved.add(id);
+                else missingThreadOwner = true;
+              }
+              if (missingThreadOwner) {
+                core.warning(`PR #${number}: keeping summaries because an unresolved thread has no review`);
+                continue;
+              }
+
+              const latest = reviews.at(-1);
+              const approvedHead = latest.state === 'APPROVED' && latest.commit?.oid === threads.head;
+              for (const review of reviews.slice(0, -1)) {
+                if (review.isMinimized || unresolved.has(review.id)) continue;
+                // Non-approving summaries may contain findings without inline threads.
+                if (review.state !== 'APPROVED' && !approvedHead) continue;
+                if (!review.viewerCanMinimize) throw new Error(`Cannot minimize review ${review.id}`);
+                await github.graphql(`
+                  mutation($id: ID!) {
+                    minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) {
+                      minimizedComment { isMinimized }
+                    }
+                  }`, { id: review.id });
+                core.info(`PR #${number}: collapsed superseded Pullfrog review ${review.databaseId}`);
+                minimized++;
+              }
+            }
+            await core.summary.addRaw(`Collapsed ${minimized} superseded Pullfrog review summaries.\n`).write();
