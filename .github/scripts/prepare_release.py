@@ -12,6 +12,14 @@ import subprocess
 BOT_NAME = "github-actions[bot]"
 BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
 CALENDAR_TAG = "[0-9][0-9][0-9][0-9].[0-1][0-9].[0-3][0-9]"
+# Include assets used by Rust sources/tests as well as Rust build inputs. Keep
+# repository automation out, even if it contains a Rust fixture or manifest.
+RUST_PATHS = (
+    "src", "tests", "benches", "examples", "crates",
+    ":(glob)**/*.rs", ":(glob)**/Cargo.toml", ":(glob)**/Cargo.lock",
+    ".cargo", "rust-toolchain", "rust-toolchain.toml",
+    ":(exclude).github",
+)
 SECTIONS = {
     "breaking": "Breaking Changes",
     "feat": "Features",
@@ -32,6 +40,15 @@ CONVENTIONAL = re.compile(r"^([a-z]+)(?:\(([^)]+)\))?(!)?: (.+)$")
 
 def git(*args):
     return subprocess.check_output(["git", *args], text=True).strip("\r\n")
+
+
+def has_rust_changes(previous, source_sha):
+    # Compare trees, rather than commits, so reverted changes do not release.
+    # An empty tree also handles the first release without a previous tag.
+    baseline = previous or subprocess.check_output(
+        ["git", "hash-object", "-t", "tree", "--stdin"], input="", text=True,
+    ).strip()
+    return bool(git("diff", "--name-only", "--no-renames", baseline, source_sha, "--", *RUST_PATHS))
 
 
 def release_notes(range_spec, repo_url):
@@ -90,6 +107,10 @@ def main():
     source_sha = git("rev-parse", "HEAD")
     previous_tags = git("tag", "--merged", source_sha, "--list", CALENDAR_TAG, "--sort=-version:refname")
     previous = next((value for value in previous_tags.splitlines() if value < tag), None)
+    if not tag_exists and not has_rust_changes(previous, source_sha):
+        output.write_text("should_release=false\n")
+        print("No Rust source or build input changes since the previous release.")
+        return
     range_spec = f"{previous}..{source_sha}" if previous else source_sha
     notes = release_notes(range_spec, repo_url)
     if not notes:
