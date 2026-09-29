@@ -2,8 +2,16 @@ const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const path = require('node:path');
-const script = fs.readFileSync(path.join(__dirname, '../workflows/tidy-pullfrog-reviews.yml'), 'utf8').split('          script: |\n')[1]
-  .split('\n').map(line => line.replace(/^ {12}/, '')).join('\n');
+const lines = fs.readFileSync(path.join(__dirname, '../workflows/tidy-pullfrog-reviews.yml'), 'utf8').split('\n');
+const start = lines.findIndex(line => /^ +script: \|$/.test(line));
+assert.notEqual(start, -1, 'Missing inline cleanup script');
+const indent = ' '.repeat(lines[start].indexOf('script:') + 2);
+const scriptLines = [];
+for (const line of lines.slice(start + 1)) {
+  if (line.trim() && !line.startsWith(indent)) break;
+  scriptLines.push(line.slice(indent.length));
+}
+const script = scriptLines.join('\n');
 const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 const review = (id, state = 'APPROVED', extra = {}) => ({
   id: String(id), databaseId: id, state, submittedAt: new Date(id * 1000).toISOString(),
@@ -20,6 +28,7 @@ async function run({reviews, threads = [], head = 'head', automatic = false, pag
       if (query.includes('mutation')) { changed.push(id); return {}; }
       queried.push(number);
       const field = query.includes('reviews(first:') ? 'reviews' : 'reviewThreads';
+      if (field === 'reviews') assert.match(query, /\bbody\b/, 'Review query must request body');
       const all = field === 'reviews' ? reviews : threads;
       const offset = cursor ? Number(cursor) : 0;
       const next = offset + 100;
@@ -78,6 +87,9 @@ test('keep body findings of every severity, malformed formats, and unanchored wa
     summary().replace('Pullfrog review metadata.', 'Custom metadata.'),
     summary().replace('<!-- PULLFROG_DIVIDER_DO_NOT_REMOVE_PLZ -->', ''),
     summary().replace('**Reviewed changes**', 'New body-only feedback'),
+    summary().replace('<!--\nPullfrog review metadata.', '### ⚠️ Migration order\nMigrate first.\n\n<!--\nPullfrog review metadata.'),
+    summary().replace('<!--\nPullfrog review metadata.', '<details><summary>Finding</summary>Fix this.</details>\n\n<!--\nPullfrog review metadata.'),
+    undefined,
   ]) {
     assert.deepEqual((await run({reviews: [review(1, 'COMMENTED', {body}),
       review(2, 'COMMENTED', {body: summary()})]})).changed, []);

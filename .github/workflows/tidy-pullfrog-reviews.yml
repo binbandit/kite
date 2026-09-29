@@ -108,7 +108,8 @@ jobs:
               const latestSummary = reviews.findLast(review => review.body?.trim());
               const approvedHead = latest.state === 'APPROVED' && latest.commit?.oid === threads.head;
               function hasOnlySupersededSummary(review) {
-                const body = (review.body || '').trim();
+                if (typeof review.body !== 'string') return false;
+                const body = review.body.trim();
                 if (!body) return true;
                 // Pullfrog's default format puts body-only findings after this metadata.
                 // Unknown formats and any extra feedback stay visible until approval.
@@ -116,6 +117,8 @@ jobs:
                 if (parts.length !== 2) return false;
                 const summary = parts[0].match(/^([\s\S]*?)<!--\s*Pullfrog review metadata\.[\s\S]*?-->(\s*)$/);
                 if (!summary || !summary[1].includes('**Reviewed changes**')) return false;
+                // Some reviews put findings before metadata instead of after it.
+                if (/^\s*(?:#{1,6}\s|<details\b|```|~~~)/m.test(summary[1])) return false;
                 if (/^> (?:✅|ℹ️)/u.test(summary[1])) return true;
                 // A warning is obsolete only when its inline findings existed and resolved.
                 return /^> \[!(?:IMPORTANT|CAUTION)\]/.test(summary[1]) && withThreads.has(review.id);
