@@ -74,11 +74,17 @@ exit 1
     }
 
     fn pr_command(&self, base: &str, prs: &str, failure: bool) -> Command {
+        let mut command = self.pr_command_with_default_base(prs, failure);
+        command.args(["--base", base]);
+        command
+    }
+
+    fn pr_command_with_default_base(&self, prs: &str, failure: bool) -> Command {
         let mut paths = vec![self.cli.path.clone()];
         paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
         let mut command = Command::new(env!("CARGO_BIN_EXE_kt"));
         command
-            .args(["pr", "--yes", "--base", base])
+            .args(["pr", "--yes"])
             .current_dir(&self.repo.path)
             .env("PATH", std::env::join_paths(paths).unwrap())
             // Keeps the developer's own PR writing skills out of the drafts.
@@ -414,6 +420,49 @@ fn fork_pr_targets_upstream_from_the_fork_against_the_parent_base() {
     // Measured against the parent's base, not the fork's stale copy of it.
     assert!(calls.contains("- feat: add feature"), "{calls}");
     assert!(!calls.contains("upstream change"), "{calls}");
+}
+
+#[test]
+fn fork_pr_defaults_to_a_freshly_added_parents_own_default_branch() {
+    let repo = PrRepo::new();
+    let upstream = TempDir::new("kite-pr-upstream");
+    git(&upstream.path, &["init", "--bare"]);
+    let path = &repo.repo.path;
+    // The parent's default is `release`, not the fork's, and the remote was
+    // just added, so no tracking refs exist yet.
+    git(
+        path,
+        &[
+            "push",
+            upstream.path.to_str().unwrap(),
+            "HEAD~:refs/heads/release",
+        ],
+    );
+    git(
+        &upstream.path,
+        &["symbolic-ref", "HEAD", "refs/heads/release"],
+    );
+    git(
+        path,
+        &["remote", "add", "upstream", upstream.path.to_str().unwrap()],
+    );
+
+    let output = repo
+        .pr_command_with_default_base("[]", false)
+        .env("FETCH_REPO", repository("me/repo", Some("acme/repo")))
+        .env("UPSTREAM_URL", &upstream.path)
+        .env("UPSTREAM_REPO", repository("acme/repo", None))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = repo.calls();
+    assert!(calls.contains("pr create --head me:feature"), "{calls}");
+    assert!(calls.contains("--base release"), "{calls}");
 }
 
 #[test]

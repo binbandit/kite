@@ -300,9 +300,16 @@ pub(crate) fn get_default_branch() -> Result<String> {
         // `git remote add` only records the remote's HEAD from Git 2.48 on,
         // and a fork's own default can differ from its parent's, so ask.
         if base != "origin" {
-            execute_git(&["remote", "set-head", &base, "--auto"])
+            let advertised = execute_git(&["ls-remote", "--symref", &base, "HEAD"])
                 .with_context(|| format!("Could not determine the default branch of {base}"))?;
-            return recorded_default_branch(&base)
+            return advertised
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("ref: refs/heads/")?
+                        .strip_suffix("\tHEAD")
+                })
+                .filter(|branch| !branch.is_empty())
+                .map(ToOwned::to_owned)
                 .with_context(|| format!("{base} did not report a default branch"));
         }
     }
