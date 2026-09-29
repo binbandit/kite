@@ -39,6 +39,7 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 - Do not call `kt go` automatically just because the user mentioned an issue or task. If they are already on the right branch, stay there.
 - Treat `kt land` as a local rewrite unless the user explicitly asked to publish or passed `--push`.
 - A detached `HEAD` is fine for `kt`, `kt land`, and `kt undo` — they move `HEAD` itself. Only `kt publish`, `kt pr`, and `kt land --push` need a branch, so create one with `git switch -c <name>` when the user actually wants to push.
+- In a fork, Kite publishes to `origin` (the fork) and opens pull requests in the parent named by `upstream` or `gh repo set-default`. If `kt pr` stops because `origin` is an unconfigured fork, ask the user whether the PR belongs in the parent or the fork instead of choosing for them.
 - Kite refuses history-changing commands during an active rebase, merge, cherry-pick, revert, bisect, `git am`, or sequencer operation; finish or abort Git's operation first.
 - If landing falls back to manual mode, provide a commit message that matches the repo's existing style when possible.
 - If a landed commit is blocked by hooks, Kite restores the saves and preserves hook edits as unstaged changes. Help fix and save those changes before retrying. Only reach for `kt land --no-verify` when the user asks to bypass the hooks.

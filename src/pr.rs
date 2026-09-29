@@ -14,8 +14,8 @@ use std::process::Command;
 use crate::ai::{self, extract_json_block};
 use crate::diff::{MAX_DIFF_BYTES, render_diff};
 use crate::git::{
-    branch_to_publish, check_ref, execute_git, get_default_branch, has_remote, is_save_subject,
-    repo_root,
+    branch_to_publish, check_ref, configured_base_remote, execute_git, get_default_branch,
+    has_remote, is_save_subject, repo_root,
 };
 use crate::land::publish_current_branch;
 use crate::ui::{Spinner, confirm, pluralize, print_ai_unavailable};
@@ -72,8 +72,64 @@ struct ExistingPr {
     body: String,
     #[serde(rename = "baseRefName")]
     base: String,
-    #[serde(rename = "isCrossRepository")]
-    is_cross_repository: bool,
+    /// Null when the repository the PR came from has been deleted.
+    #[serde(rename = "headRepository")]
+    head_repository: Option<Named>,
+    #[serde(rename = "headRepositoryOwner")]
+    head_owner: Option<Login>,
+}
+
+impl ExistingPr {
+    fn is_from(&self, repository: &Repository) -> bool {
+        let (Some(name), Some(owner)) = (&self.head_repository, &self.head_owner) else {
+            return false;
+        };
+        format!("{}/{}", owner.login, name.name).eq_ignore_ascii_case(&repository.name_with_owner)
+    }
+}
+
+/// A repository as `gh repo view` identifies it.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Repository {
+    url: String,
+    name_with_owner: String,
+    parent: Option<ParentRepository>,
+}
+
+#[derive(Clone, Deserialize)]
+struct ParentRepository {
+    name: String,
+    owner: Login,
+}
+
+#[derive(Deserialize)]
+struct Named {
+    name: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct Login {
+    login: String,
+}
+
+impl Repository {
+    fn is(&self, other: &Repository) -> bool {
+        self.url.eq_ignore_ascii_case(&other.url)
+    }
+
+    fn owner(&self) -> &str {
+        self.name_with_owner
+            .split_once('/')
+            .map_or(&self.name_with_owner, |(owner, _)| owner)
+    }
+}
+
+/// Where the pull request is opened: origin itself, or the parent of a fork.
+struct Target {
+    remote: String,
+    url: String,
+    repository: Repository,
 }
 
 struct PrContext {
@@ -95,30 +151,27 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
         );
     }
 
-    // Fetching, publishing, and GitHub operations must address one repository.
-    // gh otherwise prefers its own default, which may be an upstream fork.
-    let origin = execute_git(&["remote", "get-url", "origin"])?;
-    let origin = origin.trim();
+    // Every git and gh operation names its repository explicitly. gh would
+    // otherwise pick its own default, which need not match the remotes used.
+    let origin_url = remote_url("origin")?;
+    let origin = view_repository(&origin_url)?;
     let push_url = execute_git(&["remote", "get-url", "--push", "origin"])?;
-    if origin != push_url.trim() {
-        let fetch_repo = gh(&["repo", "view", origin, "--json", "url", "--jq", ".url"])?;
-        let push_repo = gh(&[
-            "repo",
-            "view",
-            push_url.trim(),
-            "--json",
-            "url",
-            "--jq",
-            ".url",
-        ])?;
-        if !fetch_repo.trim().eq_ignore_ascii_case(push_repo.trim()) {
-            anyhow::bail!(
-                "`kt pr` requires origin's fetch and push URLs to point to the same GitHub repository."
-            );
-        }
+    let push_url = push_url.trim();
+    if push_url != origin_url && !view_repository(push_url)?.is(&origin) {
+        anyhow::bail!(
+            "`kt pr` requires origin's fetch and push URLs to point to the same GitHub repository."
+        );
     }
 
-    let existing = open_pr(origin, &branch)?;
+    let target = pull_request_target(origin_url, &origin)?;
+    let is_fork = !target.repository.is(&origin);
+    let head_ref = if is_fork {
+        format!("{}:{branch}", origin.owner())
+    } else {
+        branch.clone()
+    };
+
+    let existing = open_pr(&target.url, &branch, &origin)?;
     if let (Some(requested), Some(existing)) = (&options.base, &existing)
         && requested != &existing.base
     {
@@ -140,16 +193,22 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
         );
     }
 
+    let remote = &target.remote;
     execute_git(&[
         "fetch",
-        "origin",
-        &format!("+refs/heads/{base}:refs/remotes/origin/{base}"),
+        remote,
+        &format!("+refs/heads/{base}:refs/remotes/{remote}/{base}"),
     ])
-    .with_context(|| format!("Could not fetch base branch `{base}` from origin"))?;
+    .with_context(|| format!("Could not fetch base branch `{base}` from {remote}"))?;
     ensure_branch_unchanged(&branch, &head)?;
-    let context = collect_pr_context(branch, base, &head)?;
+    let context = collect_pr_context(branch, base, remote, &head)?;
 
-    print_flow_header(&context.branch, &context.base);
+    let destination = if is_fork {
+        format!("{}:{}", target.repository.name_with_owner, context.base)
+    } else {
+        context.base.clone()
+    };
+    print_flow_header(&context.branch, &destination);
     if let Some(existing) = &existing {
         println!("{} Already open: {}", "·".cyan(), existing.url);
     }
@@ -158,7 +217,7 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
     announce_guidance(&context);
 
     let spinner = Spinner::start("Drafting pull request");
-    let title_examples = merged_pr_titles(origin);
+    let title_examples = merged_pr_titles(&target.url);
     let drafted = draft_with_ai(&context, &title_examples, existing.as_ref()).await;
     spinner.stop();
     ensure_branch_unchanged(&context.branch, &head)?;
@@ -199,7 +258,7 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
                 "edit",
                 &existing.url,
                 "--repo",
-                origin,
+                &target.url,
                 "--title",
                 &draft.title,
                 "--body",
@@ -208,13 +267,7 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
             println!("{} Updated {}", "✓".green(), existing.url);
         }
         None => {
-            let url = gh_pr_create(
-                origin,
-                &draft,
-                &context.branch,
-                &context.base,
-                options.draft,
-            )?;
+            let url = gh_pr_create(&target.url, &draft, &head_ref, &context.base, options.draft)?;
             println!("{} {}", "✓".green(), url.trim());
         }
     }
@@ -268,9 +321,55 @@ fn gh(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn remote_url(remote: &str) -> Result<String> {
+    Ok(execute_git(&["remote", "get-url", remote])?
+        .trim()
+        .to_string())
+}
+
+fn view_repository(url: &str) -> Result<Repository> {
+    let raw = gh(&["repo", "view", url, "--json", "url,nameWithOwner,parent"])?;
+    serde_json::from_str(&raw).context("Could not read repository details from GitHub CLI")
+}
+
+/// A fork's pull requests belong in its parent, but some forks are
+/// maintained on their own, so the parent is only targeted once a remote
+/// says so. An unconfigured fork stops here rather than guess either way.
+fn pull_request_target(origin_url: String, origin: &Repository) -> Result<Target> {
+    let configured = configured_base_remote()?;
+    if let Some(remote) = configured.as_deref().filter(|remote| *remote != "origin") {
+        let url = remote_url(remote)?;
+        let repository = view_repository(&url)?;
+        return Ok(Target {
+            remote: remote.to_string(),
+            url,
+            repository,
+        });
+    }
+
+    if configured.is_none()
+        && let Some(parent) = &origin.parent
+    {
+        let parent = format!("{}/{}", parent.owner.login, parent.name);
+        let parent_url = origin
+            .url
+            .strip_suffix(&origin.name_with_owner)
+            .map_or_else(|| "<url>".to_string(), |host| format!("{host}{parent}"));
+        anyhow::bail!(
+            "`origin` is a fork of `{parent}`. To open the pull request there, add it with `git remote add upstream {parent_url}`. To keep pull requests in your fork, run `gh repo set-default origin`."
+        );
+    }
+
+    Ok(Target {
+        remote: "origin".to_string(),
+        url: origin_url,
+        repository: origin.clone(),
+    })
+}
+
 /// An empty successful lookup means there is no open PR. Network, permission,
 /// and response errors must stop here, before publishing or creating anything.
-fn open_pr(repository: &str, branch: &str) -> Result<Option<ExistingPr>> {
+fn open_pr(repository: &str, branch: &str, origin: &Repository) -> Result<Option<ExistingPr>> {
     let raw = gh(&[
         "pr",
         "list",
@@ -279,13 +378,15 @@ fn open_pr(repository: &str, branch: &str) -> Result<Option<ExistingPr>> {
         "--head",
         branch,
         "--json",
-        "url,title,body,baseRefName,isCrossRepository",
+        "url,title,body,baseRefName,headRepository,headRepositoryOwner",
         "--repo",
         repository,
     ])?;
     let mut prs: Vec<ExistingPr> =
         serde_json::from_str(&raw).context("Could not read open pull requests from GitHub CLI")?;
-    prs.retain(|pr| !pr.is_cross_repository);
+    // `--head` matches the branch name in every fork, so only a pull request
+    // from origin's own repository is this branch's.
+    prs.retain(|pr| pr.is_from(origin));
     if prs.len() > 1 {
         anyhow::bail!(
             "Multiple open pull requests use branch `{branch}`. Refresh the intended pull request in GitHub."
@@ -294,9 +395,9 @@ fn open_pr(repository: &str, branch: &str) -> Result<Option<ExistingPr>> {
     Ok(prs.pop())
 }
 
-fn collect_pr_context(branch: String, base: String, head: &str) -> Result<PrContext> {
+fn collect_pr_context(branch: String, base: String, remote: &str, head: &str) -> Result<PrContext> {
     // Prefer the remote base so the PR diff matches what GitHub will show.
-    let base_ref = check_ref(&format!("refs/remotes/origin/{base}"))
+    let base_ref = check_ref(&format!("refs/remotes/{remote}/{base}"))
         .or_else(|| check_ref(&format!("refs/heads/{base}")))
         .with_context(|| format!("Could not resolve base branch `{base}`"))?;
 
@@ -631,7 +732,8 @@ mod tests {
             title: "feat: add gadgets".to_string(),
             body: "## Summary\n\nAdds gadgets.".to_string(),
             base: "main".to_string(),
-            is_cross_repository: false,
+            head_repository: None,
+            head_owner: None,
         };
 
         let reflowed = PrDraft {
@@ -655,7 +757,8 @@ mod tests {
             title: "feat: old title".to_string(),
             body: "Old body.".to_string(),
             base: "main".to_string(),
-            is_cross_repository: false,
+            head_repository: None,
+            head_owner: None,
         };
 
         let input = build_pr_input(&ctx, &[], Some(&existing));
@@ -675,7 +778,8 @@ mod tests {
                 "x".repeat(6_001)
             ),
             base: "main".to_string(),
-            is_cross_repository: false,
+            head_repository: None,
+            head_owner: None,
         };
         let input = build_pr_input(&context(None, vec!["feat: update"]), &[], Some(&existing));
         let input: serde_json::Value = serde_json::from_str(&input).unwrap();
@@ -747,7 +851,8 @@ mod tests {
             title: "feat: add webhooks".to_string(),
             body: template.content.clone(),
             base: "main".to_string(),
-            is_cross_repository: false,
+            head_repository: None,
+            head_owner: None,
         };
         let unchanged = PrDraft {
             title: existing.title.clone(),
@@ -813,6 +918,7 @@ mod tests {
             collect_pr_context(
                 "feat/manual-webhooks".to_string(),
                 base,
+                "origin",
                 &check_ref("HEAD").unwrap(),
             )
         })

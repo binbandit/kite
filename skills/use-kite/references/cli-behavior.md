@@ -7,10 +7,10 @@
 - This command is optional. It creates and checks out a new branch for a fresh flow, or switches to the named local branch when it already exists.
 - Prints `Switched to <name>` for an existing branch and `Created <name> from <base>` for a new one, so the verb tells you which happened.
 - `kt`, `kt land`, and `kt publish` all operate on the current branch whether or not `kt go` was used.
-- Prefer `origin/HEAD` when it exists.
+- Use the base remote's recorded `HEAD` (see Forks below). When a base remote other than `origin` has none, ask it with `git ls-remote --symref <remote> HEAD` rather than guessing from the fork.
 - Otherwise fall back to `main`, `master`, or the current branch.
-- Fetch `origin` before creating a branch. If the named branch exists there, check it out with tracking.
-- Stop on a fetch failure. New branches start from the remote default branch when available, otherwise its local branch, without tracking the default branch.
+- Fetch `origin`, and the base remote when it differs, before creating a branch. If the named branch exists on `origin`, check it out with tracking.
+- Stop on a fetch failure. New branches start from the base remote's default branch when available, otherwise its local branch, without tracking the default branch.
 
 ### `kt`
 
@@ -65,7 +65,8 @@
 
 - Requires the GitHub CLI (`gh`) to be installed and authenticated (checked offline via `gh auth token`), and a remote to exist.
 - Refuses to run on the base branch, on a detached `HEAD`, or with unlanded `[kite] save` commits anywhere in the branch's changes. Top saves can be landed normally; buried saves need consolidation first.
-- Target `origin` explicitly, excluding fork PRs with the same branch name. Fetch and push URLs must identify the same repository; equivalent SSH and HTTPS URLs are accepted.
+- Target the base remote's repository explicitly. In a fork, publish to `origin`, fetch the base branch from the parent, and create the PR there with `--head <origin-owner>:<branch>`. Reuse an existing PR only when its head repository is `origin`. Fetch and push URLs must identify the same repository; equivalent SSH and HTTPS URLs are accepted.
+- If `origin` is a GitHub fork with no base remote configured, stop before publishing and suggest adding the parent as `upstream` or running `gh repo set-default origin`.
 - If an open pull request already exists for the branch, pushes any new commits, asks the AI whether the body still reflects the branch, and offers a refreshed body (`gh pr edit`) after preview and confirmation; if it still fits, prints "nothing to update". Without AI the existing body is left untouched. Merged or closed PRs do not block a new one.
 - Fetches and validates the base branch, then publishes using the normal publish checks. Lookup failures stop before publication.
 - Stop if the branch or HEAD changes during lookup, drafting, or review. Draft from captured commit ids so concurrent changes cannot silently replace the reviewed input.
@@ -89,6 +90,13 @@
 - Undoing a land requires a clean working tree, restores the pre-land saves, then clears its rollback marker. Interrupted undo preserves later working-tree edits or refuses if they conflict.
 - Only undo a land where it happened — a branch, or a detached `HEAD` in the same linked worktree. Anywhere else it refuses and says where to go.
 - If `origin` still points to the exact landed commit, restore the pre-land saves remotely using an explicit lease. Leave newer remote work and detached lands alone.
+
+## Forks
+
+- Kite always publishes to `origin`.
+- The base remote decides where new branches start and where pull requests go: the remote marked by `gh repo set-default` (`remote.<name>.gh-resolved = base`), otherwise `upstream`, otherwise `origin`.
+- When `gh-resolved` names a repository (`owner/name`) instead, use the remote whose URL points to it. If none does, stop and suggest `git remote add upstream <url>`.
+- `kt publish` and `kt undo` never touch the base remote.
 
 ## OpenAI environment variables
 
