@@ -74,7 +74,7 @@ jobs:
               }
 
               const { nodes } = await connection('reviews', `
-                id databaseId state submittedAt isMinimized viewerCanMinimize
+                id databaseId state body submittedAt isMinimized viewerCanMinimize
                 commit { oid }
                 author { __typename login }
               `);
@@ -89,10 +89,12 @@ jobs:
                 comments(first: 1) { nodes { pullRequestReview { id } } }
               `);
               const unresolved = new Set();
+              const withThreads = new Set();
               let missingThreadOwner = false;
               for (const thread of threads.nodes) {
-                if (thread.isResolved) continue;
                 const id = thread.comments.nodes[0]?.pullRequestReview?.id;
+                if (id) withThreads.add(id);
+                if (thread.isResolved) continue;
                 if (id) unresolved.add(id);
                 else missingThreadOwner = true;
               }
@@ -102,11 +104,26 @@ jobs:
               }
 
               const latest = reviews.at(-1);
+              // Thread replies can create empty reviews. Keep the latest actual summary too.
+              const latestSummary = reviews.findLast(review => review.body?.trim());
               const approvedHead = latest.state === 'APPROVED' && latest.commit?.oid === threads.head;
+              function hasOnlySupersededSummary(review) {
+                const body = (review.body || '').trim();
+                if (!body) return true;
+                // Pullfrog's default format puts body-only findings after this metadata.
+                // Unknown formats and any extra feedback stay visible until approval.
+                const parts = body.split('<!-- PULLFROG_DIVIDER_DO_NOT_REMOVE_PLZ -->');
+                if (parts.length !== 2) return false;
+                const summary = parts[0].match(/^([\s\S]*?)<!--\s*Pullfrog review metadata\.[\s\S]*?-->(\s*)$/);
+                if (!summary || !summary[1].includes('**Reviewed changes**')) return false;
+                if (/^> (?:✅|ℹ️)/u.test(summary[1])) return true;
+                // A warning is obsolete only when its inline findings existed and resolved.
+                return /^> \[!(?:IMPORTANT|CAUTION)\]/.test(summary[1]) && withThreads.has(review.id);
+              }
               for (const review of reviews.slice(0, -1)) {
-                if (review.isMinimized || unresolved.has(review.id)) continue;
-                // Non-approving summaries may contain findings without inline threads.
-                if (review.state !== 'APPROVED' && !approvedHead) continue;
+                if (review.id === latestSummary?.id || review.isMinimized || unresolved.has(review.id)) continue;
+                if (review.state !== 'APPROVED' && !approvedHead &&
+                    (review.state !== 'COMMENTED' || !hasOnlySupersededSummary(review))) continue;
                 if (!review.viewerCanMinimize) throw new Error(`Cannot minimize review ${review.id}`);
                 await github.graphql(`
                   mutation($id: ID!) {
