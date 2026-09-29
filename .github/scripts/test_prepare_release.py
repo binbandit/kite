@@ -104,7 +104,9 @@ class PrepareReleaseTests(unittest.TestCase):
 
     def test_previous_release_excludes_old_changes(self):
         self.git("tag", "2000.01.01")
-        self.git("commit", "--allow-empty", "-m", "docs: fresh change")
+        (self.repo / "src/main.rs").write_text('fn main() { println!("fresh change"); }')
+        self.git("add", "src/main.rs")
+        self.git("commit", "-m", "fix: fresh change")
         result = self.prepare()
         self.assertEqual(result.returncode, 0, result.stderr)
         notes = (self.repo / "release_notes.md").read_text()
@@ -117,6 +119,66 @@ class PrepareReleaseTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs(), {"should_release": "false"})
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_unrelated_changes_skip_release_without_modifying_files(self):
+        self.git("tag", "2000.01.01")
+        for filename in [".github/workflows/ci.yml", ".github/fixture.rs", ".github/Cargo.toml",
+                         "README.md", "docs/guide.md", "skills/example/SKILL.md", "justfile"]:
+            with self.subTest(filename=filename):
+                path = self.repo / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("unrelated change\n")
+                self.git("add", filename)
+                self.git("commit", "-m", "chore: update repository files")
+                result = self.prepare()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.outputs(), {"should_release": "false"})
+                self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_rust_build_inputs_and_test_assets_trigger_release(self):
+        self.git("tag", "2000.01.01")
+        for filename, content in [
+            ("Cargo.toml", '\n# build metadata\n'),
+            ("Cargo.lock", '\n# dependency metadata\n'),
+            ("build.rs", 'fn main() {}\n'),
+            (".cargo/config.toml", '# cargo configuration\n'),
+            ("rust-toolchain.toml", '[toolchain]\nchannel = "stable"\n'),
+            ("tests/fixtures/input.txt", 'test input\n'),
+        ]:
+            with self.subTest(filename=filename):
+                path = self.repo / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a") as file:
+                    file.write(content)
+                self.git("add", filename)
+                self.git("commit", "-m", "build: update Rust inputs")
+                result = self.prepare()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.outputs()["should_release"], "true")
+                self.git("reset", "--hard", "2000.01.01")
+                self.git("clean", "-fd")
+
+    def test_reverted_rust_change_skips_release(self):
+        self.git("tag", "2000.01.01")
+        (self.repo / "src/main.rs").write_text('fn main() {}')
+        self.git("add", "src/main.rs")
+        self.git("commit", "-m", "fix: temporary change")
+        self.git("revert", "--no-edit", "HEAD")
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {"should_release": "false"})
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_deleted_rust_file_triggers_release(self):
+        (self.repo / "src/unused.rs").write_text('// old module\n')
+        self.git("add", "src/unused.rs")
+        self.git("commit", "-m", "feat: old module")
+        self.git("tag", "2000.01.01")
+        self.git("rm", "src/unused.rs")
+        self.git("commit", "-m", "refactor: delete unused module")
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["should_release"], "true")
 
 
 if __name__ == "__main__":

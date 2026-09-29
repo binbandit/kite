@@ -17,6 +17,10 @@ python3 .github/scripts/test_prepare_release.py
 
 Use a disposable Git repository when trying commands that save, land, or undo. The compiled program is `target/debug/kt`. The test suite creates temporary repositories, local remotes, and fake AI/GitHub responses; it needs no account credentials or live AI calls.
 
+## Daily releases
+
+The daily and manually dispatched release checks publish a new release only when Rust-related files differ from the previous release tag. These include `src/`, `tests/`, `benches/`, `examples/`, `crates/`, Rust files (`*.rs`), Cargo manifests and lockfiles, `.cargo/`, and the root Rust toolchain configuration. Changes under `.github/` never qualify. Documentation-only changes and fully reverted Rust changes skip release builds and publishing. Retrying an existing release tag still uses its pinned source to finish publishing.
+
 ## Find the code
 
 | File or directory | Responsibility |
