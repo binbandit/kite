@@ -89,11 +89,23 @@ test('keep body findings of every severity, malformed formats, and unanchored wa
     summary().replace('**Reviewed changes**', 'New body-only feedback'),
     summary().replace('<!--\nPullfrog review metadata.', '### ⚠️ Migration order\nMigrate first.\n\n<!--\nPullfrog review metadata.'),
     summary().replace('<!--\nPullfrog review metadata.', '<details><summary>Finding</summary>Fix this.</details>\n\n<!--\nPullfrog review metadata.'),
+    summary().replace('<!--\nPullfrog review metadata.', 'Migrate existing data before deploying this change.\n\n<!--\nPullfrog review metadata.'),
+    summary().replace('<!--\nPullfrog review metadata.', '- Migrate existing data before deploying.\n\n<!--\nPullfrog review metadata.'),
+    summary().replace('Follow-up tests.', 'Follow-up tests.\nMigrate existing data before deploying.'),
     undefined,
   ]) {
     assert.deepEqual((await run({reviews: [review(1, 'COMMENTED', {body}),
       review(2, 'COMMENTED', {body: summary()})]})).changed, []);
   }
+});
+
+test('recognize the standard titled change bullets without admitting extra paragraphs', async () => {
+  const body = summary().replace('<!--\nPullfrog review metadata.',
+    '- **Coverage** Added browser cases.\n- **Verification** All tests passed.\n\n<!--\nPullfrog review metadata.');
+  const reviews = [review(1, 'COMMENTED', {body}), review(2, 'COMMENTED', {body: summary()})];
+  assert.deepEqual((await run({reviews})).changed, ['1']);
+  reviews[0].body = body.replace('- **Verification**', 'An unheaded concern needs attention.\n\n- **Verification**');
+  assert.deepEqual((await run({reviews})).changed, []);
 });
 
 test('keep blocking reviews until a later approval covers the current head', async () => {

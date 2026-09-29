@@ -116,9 +116,13 @@ jobs:
                 const parts = body.split('<!-- PULLFROG_DIVIDER_DO_NOT_REMOVE_PLZ -->');
                 if (parts.length !== 2) return false;
                 const summary = parts[0].match(/^([\s\S]*?)<!--\s*Pullfrog review metadata\.[\s\S]*?-->(\s*)$/);
-                if (!summary || !summary[1].includes('**Reviewed changes**')) return false;
-                // Some reviews put findings before metadata instead of after it.
-                if (/^\s*(?:#{1,6}\s|<details\b|```|~~~)/m.test(summary[1])) return false;
+                if (!summary) return false;
+                // Accept only the observed preamble: callout, scope sentence, titled bullets.
+                // Extra paragraphs or sections (even without headings) can contain findings.
+                const [callout, scope, ...changes] = summary[1].trim().split(/\r?\n\s*\r?\n/);
+                if (!callout.split(/\r?\n/).every(line => /^> .+$/.test(line)) ||
+                    !/^\*\*Reviewed changes\*\* [^\r\n]+$/.test(scope || '') ||
+                    changes.some(block => !block.split(/\r?\n/).every(line => /^- \*\*[^*\r\n]+\*\* [^\r\n]+$/.test(line)))) return false;
                 if (/^> (?:✅|ℹ️)/u.test(summary[1])) return true;
                 // A warning is obsolete only when its inline findings existed and resolved.
                 return /^> \[!(?:IMPORTANT|CAUTION)\]/.test(summary[1]) && withThreads.has(review.id);
