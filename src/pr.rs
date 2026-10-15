@@ -14,10 +14,10 @@ use std::process::Command;
 use crate::ai::{self, extract_json_block};
 use crate::diff::{MAX_DIFF_BYTES, render_diff};
 use crate::git::{
-    branch_to_publish, check_ref, configured_base_remote, execute_git, get_default_branch,
+    Hooks, branch_to_publish, check_ref, configured_base_remote, execute_git, get_default_branch,
     has_remote, is_save_subject, repo_root,
 };
-use crate::land::publish_current_branch;
+use crate::land::{LandOptions, land, publish_current_branch};
 use crate::ui::{Spinner, confirm, pluralize, print_ai_unavailable};
 
 mod guidance;
@@ -141,7 +141,44 @@ struct PrContext {
     skills: Vec<Guidance>,
 }
 
+struct PreparedPr {
+    branch: String,
+    head: String,
+    base: String,
+    target: Target,
+    head_ref: String,
+    existing: Option<ExistingPr>,
+    is_fork: bool,
+}
+
 pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
+    let prepared = prepare_pull_request(&options)?;
+    create_prepared_pull_request(prepared, options).await
+}
+
+pub(crate) async fn ship(options: PrOptions, tag: Option<String>, hooks: Hooks) -> Result<()> {
+    // Resolve the destination before saving or rewriting anything. Publishing
+    // belongs to the PR step so an invalid PR history is never pushed first.
+    let mut prepared = prepare_pull_request(&options)?;
+    crate::save()?;
+    land(LandOptions {
+        push: false,
+        yes: true,
+        allow_dirty: false,
+        tag,
+        hooks,
+    })
+    .await?;
+    if branch_to_publish()? != prepared.branch {
+        anyhow::bail!(
+            "The branch changed while shipping. Run `kt ship` again from the intended branch."
+        );
+    }
+    prepared.head = check_ref("HEAD").context("Could not resolve landed HEAD")?;
+    create_prepared_pull_request(prepared, options).await
+}
+
+fn prepare_pull_request(options: &PrOptions) -> Result<PreparedPr> {
     let branch = branch_to_publish()?;
     let head = check_ref(&format!("refs/heads/{branch}"))
         .context("Make an initial commit before opening a pull request")?;
@@ -201,7 +238,29 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
     ])
     .with_context(|| format!("Could not fetch base branch `{base}` from {remote}"))?;
     ensure_branch_unchanged(&branch, &head)?;
-    let context = collect_pr_context(branch, base, remote, &head)?;
+    Ok(PreparedPr {
+        branch,
+        head,
+        base,
+        target,
+        head_ref,
+        existing,
+        is_fork,
+    })
+}
+
+async fn create_prepared_pull_request(prepared: PreparedPr, options: PrOptions) -> Result<()> {
+    let PreparedPr {
+        branch,
+        head,
+        base,
+        target,
+        head_ref,
+        existing,
+        is_fork,
+    } = prepared;
+    ensure_branch_unchanged(&branch, &head)?;
+    let context = collect_pr_context(branch, base, &target.remote, &head)?;
 
     let destination = if is_fork {
         format!("{}:{}", target.repository.name_with_owner, context.base)

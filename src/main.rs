@@ -21,7 +21,7 @@ use crate::git::{
     is_inside_git_repository, kite_save_stack, lock_current_worktree,
 };
 use crate::land::{LandOptions, land, publish_current_branch, recovery_blocks_commands, undo};
-use crate::pr::{PrOptions, create_pull_request};
+use crate::pr::{PrOptions, create_pull_request, ship};
 use crate::ui::{Spinner, pluralize};
 
 const WORKFLOW_HELP: &str = "\
@@ -30,6 +30,7 @@ Everyday flow:
   kt land         rewrite your saves into reviewable commits
   kt publish      push the branch (force-with-lease), or `kt push`
   kt pr           open a GitHub pull request with gh
+  kt ship         quicksave, land, publish, and open a PR (auto-confirm)
 
 Run `kt <command> --help` for details.";
 
@@ -81,6 +82,25 @@ enum Commands {
         /// Skip the confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+    /// Quicksave, land, publish, and open or refresh a PR (auto-confirms land and PR)
+    #[command(
+        after_help = "Like `kt && kt land -yp && kt pr -y`, with one push after PR target checks.
+Stops on failure. Remote-history replacement still requires confirmation."
+    )]
+    Ship {
+        /// Create the pull request as a draft
+        #[arg(long)]
+        draft: bool,
+        /// Target base branch (defaults to an existing PR's base or the default branch)
+        #[arg(long)]
+        base: Option<String>,
+        /// Reference tag to append to landed commit titles (e.g. PROJ-123)
+        #[arg(short = 't', long)]
+        tag: Option<String>,
+        /// Skip Git hooks while creating the landed commits
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Undo the last quicksave, or the last land when there is no quicksave
     Undo,
@@ -137,6 +157,20 @@ fn run(cli: Cli) -> Result<()> {
         Some(Commands::Pr { draft, base, yes }) => {
             block_on(create_pull_request(PrOptions { draft, base, yes }))
         }
+        Some(Commands::Ship {
+            draft,
+            base,
+            tag,
+            no_verify,
+        }) => block_on(ship(
+            PrOptions {
+                draft,
+                base,
+                yes: true,
+            },
+            tag,
+            if no_verify { Hooks::Skip } else { Hooks::Run },
+        )),
         Some(Commands::Undo) => undo(),
     }
 }

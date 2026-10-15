@@ -57,7 +57,10 @@ case "$1 $2" in
       printf '%s\n' "$GH_PRS" ;;
     esac
     exit 0 ;;
-  'pr create') echo 'https://example.invalid/pull/1'; exit 0 ;;
+  'pr edit') exit 0 ;;
+  'pr create')
+    if [ "$GH_CREATE_FAILURE" = 'true' ]; then exit 1; fi
+    echo 'https://example.invalid/pull/1'; exit 0 ;;
 esac
 echo 'unexpected gh command' >&2
 exit 1
@@ -80,11 +83,23 @@ exit 1
     }
 
     fn pr_command_with_default_base(&self, prs: &str, failure: bool) -> Command {
+        let mut command = self.workflow_command("pr", prs, failure);
+        command.arg("--yes");
+        command
+    }
+
+    fn ship_command(&self, prs: &str) -> Command {
+        let mut command = self.workflow_command("ship", prs, false);
+        command.args(["--base", &self.base]);
+        command
+    }
+
+    fn workflow_command(&self, workflow: &str, prs: &str, failure: bool) -> Command {
         let mut paths = vec![self.cli.path.clone()];
         paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
         let mut command = Command::new(env!("CARGO_BIN_EXE_kt"));
         command
-            .args(["pr", "--yes"])
+            .arg(workflow)
             .current_dir(&self.repo.path)
             .env("PATH", std::env::join_paths(paths).unwrap())
             // Keeps the developer's own PR writing skills out of the drafts.
@@ -565,33 +580,7 @@ fn commits_made_during_ai_drafting_stop_pr_creation() {
     listener.set_nonblocking(true).unwrap();
     let path = repo.repo.path.clone();
     let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "CLI never requested a draft");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("{error}"),
-            }
-        };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut reader = BufReader::new(&stream);
-        let mut length = 0;
-        loop {
-            let mut line = String::new();
-            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-            if line == "\r\n" {
-                break;
-            }
-            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                length = value.trim().parse().unwrap();
-            }
-        }
-        reader.read_exact(&mut vec![0; length]).unwrap();
+        let mut stream = accept_model_request(&listener);
         git(
             &path,
             &[
@@ -624,4 +613,318 @@ fn commits_made_during_ai_drafting_stop_pr_creation() {
         git(&repo.repo.path, &["rev-parse", "HEAD"]),
         git(&repo.remote.path, &["rev-parse", "feature"])
     );
+}
+
+fn accept_model_request(listener: &TcpListener) -> std::net::TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "CLI never requested AI output");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(&stream);
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap();
+        }
+    }
+    reader.read_exact(&mut vec![0; length]).unwrap();
+    stream
+}
+
+/// A bounded local Responses endpoint, used for the land and PR in one CLI run.
+fn model_server(replies: Vec<serde_json::Value>) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        for reply in replies {
+            let mut stream = accept_model_request(&listener);
+            let body = serde_json::json!({"output_text": reply.to_string()}).to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    (url, server)
+}
+
+fn ship_plan() -> serde_json::Value {
+    serde_json::json!({"groups": [{"message": "feat: ship latest edits", "files": ["tracked.txt", "new.txt"]}]})
+}
+
+fn ship_draft() -> serde_json::Value {
+    serde_json::json!({"title": "feat: ship latest edits", "body": "Adds the latest edits."})
+}
+
+fn edit_for_ship(repo: &PrRepo) {
+    write_file(&repo.repo.path, "tracked.txt", "latest edits\n");
+    write_file(&repo.repo.path, "new.txt", "new file\n");
+}
+
+fn hook(repo: &PrRepo, name: &str, body: &str) {
+    let file = format!(".git/hooks/{name}");
+    write_file(&repo.repo.path, &file, &format!("#!/bin/sh\n{body}\n"));
+    std::fs::set_permissions(
+        repo.repo.path.join(file),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+}
+
+#[test]
+fn ship_saves_lands_publishes_once_and_creates_pr_without_prompts() {
+    let repo = PrRepo::new();
+    edit_for_ship(&repo);
+    hook(&repo, "pre-push", "echo pushed >> .git/push-count");
+    hook(&repo, "pre-commit", "echo hooked >> .git/commit-count");
+    let (url, server) = model_server(vec![ship_plan(), ship_draft()]);
+    let output = repo
+        .workflow_command("ship", "[]", false)
+        .args(["--draft", "--tag", "PROJ-123"])
+        .env("KITE_OPENAI_URL", url)
+        .env("KITE_OPENAI_API_KEY", "local-test-key")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(git(&repo.repo.path, &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git(&repo.repo.path, &["log", "-1", "--format=%s"]).trim(),
+        "feat: ship latest edits [PROJ-123]"
+    );
+    let save = git(&repo.repo.path, &["rev-parse", "refs/kite/pre_land"]);
+    assert!(
+        git(&repo.repo.path, &["log", "-1", "--format=%s", save.trim()]).starts_with("[kite] save")
+    );
+    assert_eq!(
+        git(&repo.repo.path, &["rev-parse", "HEAD^{tree}"]),
+        git(
+            &repo.repo.path,
+            &["rev-parse", &format!("{}^{{tree}}", save.trim())]
+        )
+    );
+    assert_eq!(
+        git(&repo.repo.path, &["rev-parse", "HEAD"]),
+        git(&repo.remote.path, &["rev-parse", "feature"])
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.repo.path.join(".git/push-count")).unwrap(),
+        "pushed\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.repo.path.join(".git/commit-count")).unwrap(),
+        "hooked\n"
+    );
+    let calls = repo.calls();
+    assert!(calls.contains("pr create --head feature"), "{calls}");
+    assert!(calls.contains("--draft"), "{calls}");
+    assert!(calls.contains("Adds the latest edits."), "{calls}");
+}
+
+#[test]
+fn ship_refreshes_an_existing_pr_with_no_new_saves() {
+    let repo = PrRepo::new();
+    let before = git(&repo.repo.path, &["rev-parse", "HEAD"]);
+    let prs = serde_json::json!([open_pr(1, "Old title", &repo.base, "owner/repo")]);
+    let (url, server) = model_server(vec![ship_draft()]);
+    let output = repo
+        .workflow_command("ship", &prs.to_string(), false)
+        .env("KITE_OPENAI_URL", url)
+        .env("KITE_OPENAI_API_KEY", "local-test-key")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(git(&repo.repo.path, &["rev-parse", "HEAD"]), before);
+    assert_eq!(git(&repo.remote.path, &["rev-parse", "feature"]), before);
+    let calls = repo.calls();
+    assert!(
+        calls.contains("pr edit https://example.invalid/pull/1"),
+        "{calls}"
+    );
+    assert!(!calls.contains("pr create"), "{calls}");
+}
+
+#[test]
+fn ship_rejects_invalid_destination_before_saving() {
+    for base in ["missing", "feature"] {
+        let repo = PrRepo::new();
+        edit_for_ship(&repo);
+        let before = git(&repo.repo.path, &["rev-parse", "HEAD"]);
+        let status = git(&repo.repo.path, &["status", "--porcelain"]);
+        let output = repo
+            .workflow_command("ship", "[]", false)
+            .args(["--base", base])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(git(&repo.repo.path, &["rev-parse", "HEAD"]), before);
+        assert_eq!(git(&repo.repo.path, &["status", "--porcelain"]), status);
+        repo.assert_unpublished();
+    }
+}
+
+#[test]
+fn ship_stops_when_ai_cannot_land_and_keeps_the_save() {
+    let repo = PrRepo::new();
+    edit_for_ship(&repo);
+    let output = repo.ship_command("[]").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Rerun `kt land` without --yes"));
+    assert!(git(&repo.repo.path, &["log", "-1", "--format=%s"]).starts_with("[kite] save"));
+    assert!(git(&repo.repo.path, &["status", "--porcelain"]).is_empty());
+    repo.assert_unpublished();
+}
+
+#[test]
+fn ship_preserves_the_staged_selection_and_stops_with_unsaved_work() {
+    let repo = PrRepo::new();
+    edit_for_ship(&repo);
+    git(&repo.repo.path, &["add", "tracked.txt"]);
+    let output = repo.ship_command("[]").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Working directory must be clean"));
+    assert_eq!(
+        git(
+            &repo.repo.path,
+            &["show", "--format=", "--name-only", "HEAD"]
+        )
+        .trim(),
+        "tracked.txt"
+    );
+    assert_eq!(
+        git(&repo.repo.path, &["status", "--porcelain"]).trim(),
+        "?? new.txt"
+    );
+    repo.assert_unpublished();
+}
+
+#[test]
+fn ship_stops_on_failed_commit_or_push_hook() {
+    for name in ["pre-commit", "pre-push"] {
+        let repo = PrRepo::new();
+        edit_for_ship(&repo);
+        hook(&repo, name, "echo 'hook blocked shipping' >&2; exit 1");
+        let (url, server) = model_server(vec![ship_plan()]);
+        let output = repo
+            .ship_command("[]")
+            .env("KITE_OPENAI_URL", url)
+            .env("KITE_OPENAI_API_KEY", "local-test-key")
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("hook blocked shipping"));
+        let subject = git(&repo.repo.path, &["log", "-1", "--format=%s"]);
+        assert_eq!(subject.starts_with("[kite] save"), name == "pre-commit");
+        assert_eq!(
+            std::fs::read_to_string(repo.repo.path.join("new.txt")).unwrap(),
+            "new file\n"
+        );
+        repo.assert_unpublished();
+    }
+}
+
+#[test]
+fn ship_can_retry_after_pr_creation_fails() {
+    let repo = PrRepo::new();
+    edit_for_ship(&repo);
+    let (url, server) = model_server(vec![ship_plan(), ship_draft()]);
+    let output = repo
+        .ship_command("[]")
+        .env("GH_CREATE_FAILURE", "true")
+        .env("KITE_OPENAI_URL", url)
+        .env("KITE_OPENAI_API_KEY", "local-test-key")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(!output.status.success());
+    let head = git(&repo.repo.path, &["rev-parse", "HEAD"]);
+    assert_eq!(git(&repo.remote.path, &["rev-parse", "feature"]), head);
+    let output = repo.ship_command("[]").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(git(&repo.repo.path, &["rev-parse", "HEAD"]), head);
+    assert_eq!(repo.calls().matches("pr create").count(), 2);
+}
+
+#[test]
+fn ship_refuses_detached_head_or_missing_origin_before_saving() {
+    for detached in [true, false] {
+        let repo = PrRepo::new();
+        if detached {
+            git(&repo.repo.path, &["checkout", "--detach"]);
+        } else {
+            git(&repo.repo.path, &["remote", "remove", "origin"]);
+        }
+        edit_for_ship(&repo);
+        let before = git(&repo.repo.path, &["rev-parse", "HEAD"]);
+        let status = git(&repo.repo.path, &["status", "--porcelain"]);
+        let output = repo.ship_command("[]").output().unwrap();
+        assert!(!output.status.success());
+        assert_eq!(git(&repo.repo.path, &["rev-parse", "HEAD"]), before);
+        assert_eq!(git(&repo.repo.path, &["status", "--porcelain"]), status);
+        assert!(!repo.cli.path.join("calls").exists());
+    }
+}
+
+#[test]
+fn ship_to_parent_publishes_only_to_fork_and_can_skip_commit_hooks() {
+    let repo = PrRepo::new();
+    let upstream = repo.add_upstream();
+    edit_for_ship(&repo);
+    hook(&repo, "pre-commit", "exit 1");
+    hook(&repo, "pre-push", "echo pushed >> .git/push-count");
+    let (url, server) = model_server(vec![ship_plan(), ship_draft()]);
+    let output = repo
+        .ship_command("[]")
+        .arg("--no-verify")
+        .env("FETCH_REPO", repository("me/repo", Some("acme/repo")))
+        .env("UPSTREAM_URL", &upstream.path)
+        .env("UPSTREAM_REPO", repository("acme/repo", None))
+        .env("KITE_OPENAI_URL", url)
+        .env("KITE_OPENAI_API_KEY", "local-test-key")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        git(&repo.repo.path, &["rev-parse", "HEAD"]),
+        git(&repo.remote.path, &["rev-parse", "feature"])
+    );
+    assert!(git(&upstream.path, &["branch", "--list", "feature"]).is_empty());
+    assert_eq!(
+        std::fs::read_to_string(repo.repo.path.join(".git/push-count")).unwrap(),
+        "pushed\n"
+    );
+    assert!(repo.calls().contains("pr create --head me:feature"));
 }

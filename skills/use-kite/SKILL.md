@@ -1,6 +1,6 @@
 ---
 name: use-kite
-description: Operate the Kite CLI (`kt`) for repositories that use Kite's quicksave-and-land workflow. Use when Codex needs to inspect Kite state, start a flow with `kt go`, create quicksaves with `kt`, land contiguous `[kite] save` commits into polished history with `kt land`, publish with `kt publish`, open a pull request with `kt pr`, explain or troubleshoot Kite behavior, or configure Kite's OpenAI settings.
+description: Operate the Kite CLI (`kt`) for repositories that use Kite's quicksave-and-land workflow. Use when Codex needs to inspect Kite state, start a flow with `kt go`, create quicksaves with `kt`, land contiguous `[kite] save` commits into polished history with `kt land`, publish with `kt publish`, open a pull request with `kt pr`, run the combined save/land/publish/PR flow with `kt ship`, explain or troubleshoot Kite behavior, or configure Kite's OpenAI settings.
 ---
 
 # Use Kite
@@ -18,19 +18,20 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 2. Choose the command that matches the user's intent.
 
 - Use `kt go <name>` only when the user explicitly wants a fresh branch or the current branch is clearly the wrong place to start the work.
-- Use `kt` to quicksave tracked and untracked changes without hooks.
+- Use `kt` to quicksave tracked and untracked changes without hooks. An existing staged selection limits the save to that selection; other work remains unsaved.
 - Use `kt land` to preview and rewrite contiguous Kite saves into grouped local commits.
 - Use `kt publish` to push a landed branch after review.
 - Use `kt pr` to open a GitHub pull request for a landed branch. It requires `gh` and publishes the branch before previewing the title and body. Declining the preview prevents PR creation or editing, but does not undo the push. An existing PR can receive new commits and a refreshed body.
+- Use `kt ship` when the user wants to save, land, publish, and create or refresh the PR together. It automatically accepts land and PR previews, checks the PR destination before saving, and pushes once. It does not merge. Use `kt land --push` instead when the requested destination is main without a PR.
 - Use `kt undo` when the user explicitly wants to reverse a quicksave or the last land.
 
 3. Treat history-rewriting commands as high-impact.
 
-- `kt land` rewrites recent Kite save history.
+- `kt land` and `kt ship` rewrite recent Kite save history.
 - `kt publish` and `kt undo` may force-push.
 - `kt pr` publishes the branch when needed and creates a pull request on GitHub after user confirmation (or immediately with `--yes`).
 - Undoing a save preserves working files and clears staging. Undoing a completed land requires a clean tree and may restore its saves remotely, only if the remote still points to the exact landed commit.
-- If the user asked you to "use Kite" but did not explicitly ask for history rewriting, explain the effect before running `kt land` or `kt undo`.
+- Select only the steps the user authorized. A request to use Kite alone does not authorize opening a PR; a request to ship the full workflow does. Explain a rewrite when it was not already part of the request.
 
 ## Operating Rules
 
@@ -38,14 +39,15 @@ Use Kite instead of manual staging and WIP commits when the repository's workflo
 - Before `kt land`, confirm the feature is ready and the worktree is either clean or explicitly handled by `--allow-dirty`.
 - Do not call `kt go` automatically just because the user mentioned an issue or task. If they are already on the right branch, stay there.
 - Treat `kt land` as a local rewrite unless the user explicitly asked to publish or passed `--push`.
-- A detached `HEAD` is fine for `kt`, `kt land`, and `kt undo` — they move `HEAD` itself. Only `kt publish`, `kt pr`, and `kt land --push` need a branch, so create one with `git switch -c <name>` when the user actually wants to push.
+- A detached `HEAD` is fine for `kt`, `kt land`, and `kt undo` - they move `HEAD` itself. `kt publish`, `kt pr`, `kt ship`, and `kt land --push` need a branch, so create one with `git switch -c <name>` when the user actually wants to push.
 - In a fork, Kite publishes to `origin` (the fork) and opens pull requests in the parent named by `upstream` or `gh repo set-default`. If `kt pr` stops because `origin` is an unconfigured fork, ask the user whether the PR belongs in the parent or the fork instead of choosing for them.
 - Kite refuses history-changing commands during an active rebase, merge, cherry-pick, revert, bisect, `git am`, or sequencer operation; finish or abort Git's operation first.
-- If landing falls back to manual mode, provide a commit message that matches the repo's existing style when possible.
+- If AI planning fails, `kt land --yes` and `kt ship` stop with the saves intact. Rerun `kt land` without `--yes` to provide a manual message that matches the repo's style; blank input aborts. New PRs can use a generic fallback without AI, while existing PR text is left unchanged.
 - If a landed commit is blocked by hooks, Kite restores the saves and preserves hook edits as unstaged changes. Help fix and save those changes before retrying. Only reach for `kt land --no-verify` when the user asks to bypass the hooks.
 - Successful hooks may format and stage the current commit's files; Kite includes those changes in the same land. Do not ask the user to save and land again just because the hook's formatting differs from the editor. Hooks that stage unrelated files or leave post-commit staging still need correction.
 - If a land is interrupted, use `kt undo` in the originating worktree to recover it. This also restores work stashed by `--allow-dirty`, even if interruption happened during AI planning. Do not delete the worktree or its recovery state to bypass this check.
 - Saves that cancel each other out can still be landed without AI. Do not add artificial changes just to make them landable.
+- `kt ship` stops on errors but does not roll back completed steps. Inspect state before retrying; a failed push leaves landed commits, and a failed PR write may leave a published branch. Staged-only saves can leave a dirty tree that blocks landing.
 - After running any Kite command, summarize what changed in the worktree, branch, and remote state.
 
 ## Reference

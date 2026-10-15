@@ -2,12 +2,13 @@
 
 **Fast quicksaves and inspectable AI-assisted landing for Git.**
 
-Kite splits version control into two phases:
+Kite turns quicksaves into reviewable history and pull requests:
 
 - `kt` creates instant `[kite] save` snapshots while you are coding.
 - `kt land` rewrites contiguous Kite saves into reviewable commits.
 - `kt publish` pushes the rewritten branch when you are ready.
 - `kt pr` opens a GitHub pull request for the landed branch with `gh`.
+- `kt ship` quicksaves, lands, publishes, and opens or refreshes the PR in one command, automatically accepting the land and PR previews.
 
 `kt go` is optional. It creates and checks out a fresh branch for a new piece of work, or switches to the named branch when it already exists. If you are already on the branch you want, keep using `kt`, `kt land`, and `kt publish` there.
 
@@ -55,7 +56,7 @@ Typical landed output looks like:
 - `feat(api): add stripe webhook endpoints`
 - `feat(ui): build checkout modal component`
 
-If the AI is unavailable, Kite shows the failure and asks for one manual commit message before any history is changed.
+If the AI is unavailable, Kite shows the failure and asks for one manual commit message before any history is changed. With `--yes`, it exits with an error instead of prompting; rerun `kt land` without `--yes` for the manual fallback.
 
 ### 3. Open a Pull Request
 
@@ -66,6 +67,14 @@ kt pr
 ```
 
 Kite gathers everything a good pull request needs, drafts it with the same AI as `kt land`, shows you the result, and only creates it after you confirm. See [`kt pr`](#kt-pr) below for details.
+
+### Ready to Ship in One Command
+
+```bash
+kt ship
+```
+
+Runs the save → land → publish → PR workflow, like `kt && kt land -yp && kt pr -y`. It checks the PR destination first and pushes once, after landing and validating the PR history. See [`kt ship`](#kt-ship) for options and failure behavior.
 
 ## Installation
 
@@ -227,7 +236,7 @@ Opens a GitHub pull request for the current branch using the [GitHub CLI](https:
 - Fetches and validates the base branch before publishing. A failed pull request lookup stops the command instead of being treated as permission to create a duplicate.
 - Uses recent merged pull request titles from the repository as style examples for the new title.
 - Drafts the title and body with the same AI as `kt land`. Without AI, a new PR uses a clean generic `## Summary` section populated from the branch's commit subjects and never copies an unfilled repository template.
-- Always previews the pull request and asks for confirmation before creating anything.
+- Always previews the pull request; asks for confirmation unless `--yes` is set.
 
 ```bash
 kt pr
@@ -240,6 +249,22 @@ kt pr --draft
 kt pr --base release/1.2
 kt pr --yes
 ```
+
+### `kt ship`
+
+Quicksaves current changes, lands all contiguous saves, publishes the branch, and creates or refreshes its GitHub pull request. The land and PR previews are shown and accepted automatically; no `-y` is needed. Use the individual commands when you want to review either preview before continuing.
+
+```bash
+kt ship
+kt ship --draft
+kt ship --base release/1.2 --tag PROJ-123
+```
+
+- Requires an existing commit, a branch other than the PR base, `origin`, and authenticated `gh`. Destination and lookup failures stop before saving. Fork targeting works exactly as it does for `kt pr`.
+- Respects an existing staged selection, just like `kt`. If this leaves unsaved work, landing stops; save or stash that work before retrying.
+- Runs commit hooks during landing and pre-push hooks during publication. `--no-verify` skips only the landing commit hooks. Remote commits that are not Kite saves still require confirmation before replacement.
+- Stops at the first error. An AI planning failure leaves the quicksave intact; run `kt land` without `--yes` to enter a message manually. A push or PR failure leaves completed local commits intact, and a PR failure may leave the branch published. Fix the cause and rerun `kt ship` or the remaining command.
+- Works when there is nothing new to save or land, so it can publish already-landed commits or refresh an existing PR. It never merges the PR. `kt undo` can undo the land, but does not delete the PR.
 
 ### `kt undo`
 
@@ -274,7 +299,7 @@ Kite works on a detached `HEAD` — for example, in a linked worktree, while rev
 - `kt undo` rewinds the detached `HEAD`, and refuses if you have since moved somewhere else — a land recorded on a branch will not be undone from a detached `HEAD`, and vice versa. The refusal names the commit to `git switch --detach` back onto.
 - An interrupted land is detected before another command can build on its partial history. Run `kt undo` in the originating worktree to put `HEAD` back on the commit it started from with every save intact.
 - Rollback and interrupted-land recovery are tied to the originating worktree, so a Kite command in another detached worktree cannot move or undo it.
-- `kt publish`, `kt pr`, and `kt land --push` need a branch, because `git push` has to be told which remote ref to write and a detached `HEAD` supplies no name. They refuse before anything is rewritten and tell you the commit you are on, so `git switch -c <name>` is a one-liner away.
+- `kt publish`, `kt pr`, `kt ship`, and `kt land --push` need a branch, because `git push` has to be told which remote ref to write and a detached `HEAD` supplies no name. They refuse before anything is rewritten and tell you the commit you are on, so `git switch -c <name>` is a one-liner away.
 
 Nothing about the detached path is a special mode: the same rollback marker, plan preview, and exact-tree verification apply.
 
@@ -311,7 +336,7 @@ export KITE_OPENAI_TIMEOUT_SECS="120"
 
 **Manual fallback**
 
-If the AI is unavailable, Kite shows the failure and keeps working: `kt land` asks for one manual commit message (leaving it blank aborts without changing history), and a new `kt pr` uses a clean generic `## Summary` section populated from the branch's commit subjects without copying an unfilled repository template.
+If the AI is unavailable, interactive `kt land` asks for one manual commit message (leaving it blank aborts without changing history). `kt land --yes` and a `kt ship` that needs landing fail with the saves intact; rerun `kt land` interactively. A new `kt pr` uses a clean generic `## Summary` section populated from the branch's commit subjects without copying an unfilled repository template.
 
 The failure it shows is the endpoint's own message — a rejected key, an unknown model, a schema the endpoint will not accept — so a misconfigured setup is diagnosable rather than just "the AI never works". Requests that cannot succeed on a retry are not retried.
 
@@ -329,7 +354,7 @@ Kite keeps the risky parts explicit:
 - **Failure leaves no mess:** landing deletes its exact temporary branch and never overwrites your working files, so a normal failure puts you back where you were — branch or detached commit — with nothing staged and nothing to clean up. If the process itself is interrupted, the originating worktree is blocked until `kt undo` performs the same recovery explicitly.
 - **Concurrent-command guard:** one Kite command at a time may mutate a worktree, and branch moves use expected old commit ids. A branch advanced or checked out elsewhere is left untouched.
 - **No dropped changes:** If the AI misses a file, it still lands, in a `chore: unclassified updates` commit, rather than being silently omitted.
-- **Explicit publish:** Landing is local by default. Publishing remains a separate step unless you opt into `--push`.
+- **Explicit publish:** Landing is local by default. `kt land --push`, `kt pr`, and `kt ship` opt into publishing.
 - **Preview before PR creation:** `kt pr` publishes the branch, then shows the full title and body for confirmation before creating or editing the PR.
 
 ## Contributing
