@@ -14,7 +14,7 @@
 
 ### `kt`
 
-- Run `git status --porcelain`.
+- Outside a Git repository, show help without creating anything. Inside one, inspect status from the repository root, including all untracked files and submodule changes.
 - If the worktree is clean, print how many saves are ready to land (or "nothing to save") and exit without creating a commit.
 - If the index already contains staged changes, create a quicksave from only that staged selection.
 - Otherwise run `git add -A` and create a quicksave commit with message `[kite] save HH:MM:SS`.
@@ -23,7 +23,7 @@
 - The normal recommended workflow is still to let Kite quicksave everything; staged-only quicksaves are an explicit override.
 - Disable all commit hooks with a command-local `core.hooksPath` override.
 
-### `kt land [--push|-p] [--yes] [--allow-dirty] [--tag <tag>] [--no-verify]`
+### `kt land [--push|-p] [--yes|-y] [--allow-dirty] [--tag|-t <tag>] [--no-verify]`
 
 - Require an existing `HEAD` commit. If the repo has no commits yet, Kite prints a warning and exits.
 - By default, require a clean working tree. If the user still has WIP changes, they should `kt` them first or stash them.
@@ -36,9 +36,9 @@
   - the diff introduced by those saves, plus the list of changed files the AI assigns to commits (every file lands whole in exactly one commit)
   - recent non-Kite commit messages from the current repo as style examples
 - Package repository evidence in JSON. Prefer minimal coherent groups, keeping a feature with its tests, documentation, and dependency changes. Preserve repository conventions over default message style.
-- Synthesize with the OpenAI Responses API using the configured base URL, model, API key, and `KITE_OPENAI_TIMEOUT_SECS` or default 120 seconds; if it is unavailable, a manual fallback asks for one commit message before rewriting history.
+- Synthesize with the OpenAI Responses API using the configured base URL, model, API key, and `KITE_OPENAI_TIMEOUT_SECS` or default 120 seconds; if it is unavailable, interactive mode asks for one manual commit message before rewriting history. With `--yes`, fail without rewriting and instruct the user to rerun interactively.
 - Stage each landed commit as whole files, so hooks, linters, and formatters only ever see complete files.
-- Show the proposed grouped commit plan, listing the files under each commit, before rewriting anything; `--yes` skips only the confirmation prompt.
+- Show the proposed grouped commit plan, listing the files under each commit, before rewriting anything; `--yes` accepts the plan automatically and fails instead of prompting for a manual message when AI is unavailable. It does not bypass hooks or remote-history replacement confirmation.
 - Record the pre-land `HEAD` at `refs/kite/pre_land`, and store the complete transaction phase, target, owner, and keepalive in one atomic compare-and-swap marker.
 - Build commits on one exact, transaction-owned temporary branch for hook compatibility, then delete only that recorded ref with its expected commit id.
 - Run the repository's commit hooks by default; `--no-verify` disables all commit hooks. Publishing still runs pre-push hooks.
@@ -56,18 +56,18 @@
 
 ### `kt publish` (alias: `kt push`)
 
-- If no remote exists, print a note and exit successfully.
+- If no `origin` remote exists, print a note and exit successfully.
 - Require a branch: `git push` has to be told which remote ref to write, so a detached `HEAD` is refused with the commit it is on and a `git switch -c <name>` hint.
 - Push the current branch with `--set-upstream origin <branch>`. Fast-forward pushes are ordinary pushes; rewrites use a lease pinned to the reviewed remote commit. Remote non-save commits require confirmation. Never rebase onto stale saves first.
 - A rejected lease (someone else pushed) is reported as an error for the user to reconcile manually.
 
-### `kt pr [--draft] [--base <branch>] [--yes]`
+### `kt pr [--draft] [--base <branch>] [--yes|-y]`
 
-- Requires the GitHub CLI (`gh`) to be installed and authenticated (checked offline via `gh auth token`), and a remote to exist.
+- Requires the GitHub CLI (`gh`) to be installed and authenticated, and an `origin` remote to exist. Repository and PR lookups through `gh` validate access.
 - Refuses to run on the base branch, on a detached `HEAD`, or with unlanded `[kite] save` commits anywhere in the branch's changes. Top saves can be landed normally; buried saves need consolidation first.
 - Target the base remote's repository explicitly. In a fork, publish to `origin`, fetch the base branch from the parent, and create the PR there with `--head <origin-owner>:<branch>`. Reuse an existing PR only when its head repository is `origin`. Fetch and push URLs must identify the same repository; equivalent SSH and HTTPS URLs are accepted.
 - If `origin` is a GitHub fork with no base remote configured, stop before publishing and suggest adding the parent as `upstream` or running `gh repo set-default origin`.
-- If an open pull request already exists for the branch, pushes any new commits, asks the AI whether the body still reflects the branch, and offers a refreshed body (`gh pr edit`) after preview and confirmation; if it still fits, prints "nothing to update". Without AI the existing body is left untouched. Merged or closed PRs do not block a new one.
+- If an open pull request already exists for the branch, pushes any new commits, asks the AI whether the title and body still reflect the branch, and offers refreshed text (`gh pr edit`) after preview and confirmation; if it still fits, prints "Pull request already reflects the branch". Without AI the existing title and body are left untouched. Merged or closed PRs do not block a new one.
 - Fetches and validates the base branch, then publishes using the normal publish checks. Lookup failures stop before publication.
 - Stop if the branch or HEAD changes during lookup, drafting, or review. Draft from captured commit ids so concurrent changes cannot silently replace the reviewed input.
 - Gathers context for the draft:
@@ -79,7 +79,18 @@
 - Read at most three skills, 4 KB each, and a 6 KB template. Do not follow referenced files. Exclude incidental PR mentions in operational skills such as `use-kite`; skill instructions control writing only, never command execution. Do not claim tests passed merely because tests were added.
 - Previews the draft and asks for confirmation before running `gh pr create` (skip with `--yes`).
 - The branch is already published when the preview appears. Declining prevents PR creation or editing, not the earlier push.
-- `--draft` creates a draft pull request; `--base` overrides the detected default branch.
+- `--draft` creates a draft pull request and does not convert an existing PR. The base defaults to the existing PR's base when one exists, otherwise the repository default. `--base` overrides the default for new PRs; a mismatch with an existing PR's base is an error. Multiple matching open PRs also stop the command.
+
+### `kt ship [--draft] [--base <branch>] [--tag|-t <tag>] [--no-verify]`
+
+- Combine quicksave, land, publish, and PR creation or refresh. Equivalent workflow to `kt && kt land -yp && kt pr -y`, but validate the PR destination before saving and publish once through the PR step after checking the landed history.
+- Automatically accept land and PR previews; there is no `--yes` flag. Keep the normal hooks, explicit push leases, and confirmation before discarding remote non-save commits.
+- Require an existing commit, `origin`, an attached branch other than the PR base, and working GitHub access. Reuse `kt pr` destination, fork, existing-PR, and base validation.
+- Use the ordinary quicksave rules. An existing staged subset is respected; leftover changes block landing. There is no `--allow-dirty` option.
+- Land with `--yes`. Forward `--tag` and `--no-verify` to landing, and `--draft` and `--base` to PR handling. `--no-verify` does not skip pre-push hooks.
+- Stop at the first error; completed steps remain. AI planning errors leave the quicksave intact and require interactive `kt land` for manual messages. Failed publication leaves local commits; failed PR writes may leave a published branch. After fixing the cause, rerun `kt ship` or the remaining command.
+- Clean saves and lands with no pending saves are no-ops, so shipping can resume after a partial success or refresh an existing PR. Buried saves or no commits relative to the base stop before publishing.
+- Never merge the PR. `kt undo` handles the saved or landed history as usual and does not remove the PR.
 
 ### `kt undo`
 
@@ -120,4 +131,4 @@
 - `git log --oneline -n 12`
 - `command -v kt`
 - `git remote -v`
-- `command -v gh` (before `kt pr`)
+- `command -v gh` (before `kt pr` or `kt ship`)
