@@ -1,9 +1,11 @@
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) fn acquire_cwd_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
@@ -74,6 +76,73 @@ pub(crate) fn with_repo_cwd<T>(repo: &Path, f: impl FnOnce() -> T) -> T {
     let _restore = RestoreCwd(std::env::current_dir().expect("current dir should resolve"));
     std::env::set_current_dir(repo).expect("should enter temp repo");
     f()
+}
+
+/// Waits up to ten seconds for one request to a fake AI endpoint and reads
+/// all of it, returning the connection so the test decides when, or whether,
+/// to answer. The deadline turns a CLI that never calls into a failure
+/// rather than a hung test.
+pub(crate) fn accept_ai_request(listener: &TcpListener) -> TcpStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "the CLI never called the AI");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    read_ai_request(&stream);
+    stream
+}
+
+/// Reads one whole request from an accepted fake AI connection and returns
+/// its body.
+pub(crate) fn read_ai_request(stream: &TcpStream) -> Vec<u8> {
+    // BSD-derived systems, macOS included, hand the listener's non-blocking
+    // mode to accepted sockets. Linux does not, so CI alone cannot catch this.
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap();
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    body
+}
+
+/// Answers an accepted AI request with `body` as the whole JSON response.
+pub(crate) fn respond_json(mut stream: TcpStream, body: &serde_json::Value) {
+    let body = body.to_string();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+}
+
+/// Answers an accepted AI request with `reply` as the model's output text.
+pub(crate) fn respond_with_model_output(stream: TcpStream, reply: &serde_json::Value) {
+    respond_json(
+        stream,
+        &serde_json::json!({ "output_text": reply.to_string() }),
+    );
 }
 
 pub(crate) fn init_repo() -> TempDir {
