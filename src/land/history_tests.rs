@@ -374,7 +374,7 @@ fn a_land_that_stopped_with_its_private_checkout_is_cleaned_up_by_undo() {
         .unwrap();
 
     // Install the transaction and its checkout as a crash would leave them.
-    with_repo_cwd(&repo.path, || {
+    let folder = with_repo_cwd(&repo.path, || {
         let transaction_ref = unique_kite_ref(TRANSACTION_REF_PREFIX);
         install_in_progress_marker(
             &PreLandMarker::capture(),
@@ -384,8 +384,9 @@ fn a_land_that_stopped_with_its_private_checkout_is_cleaned_up_by_undo() {
             &transaction_ref,
         )
         .unwrap();
-        let checkout = std::env::temp_dir()
+        let folder = std::env::temp_dir()
             .join(transaction_ref.replace(TRANSACTION_REF_PREFIX, "kite-land-"));
+        let checkout = folder.join("checkout");
         execute_git(&[
             "worktree",
             "add",
@@ -398,6 +399,7 @@ fn a_land_that_stopped_with_its_private_checkout_is_cleaned_up_by_undo() {
         if let KiteBase::Commit(base) = &scope.base {
             execute_git(&["update-ref", &transaction_ref, base]).unwrap();
         }
+        folder
     });
     assert!(with_repo_cwd(&repo.path, recovery_blocks_commands).unwrap());
 
@@ -406,4 +408,5 @@ fn a_land_that_stopped_with_its_private_checkout_is_cleaned_up_by_undo() {
     assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]).trim(), tip);
     assert_eq!(git(&repo.path, &["status", "--porcelain"]), "");
     assert_no_private_checkouts(&repo.path);
+    assert!(!folder.exists(), "{}", folder.display());
 }

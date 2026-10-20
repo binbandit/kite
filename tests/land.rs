@@ -797,13 +797,17 @@ impl FakeModel {
     }
 
     fn land(&self, repo: &Path, args: &[&str]) -> Output {
-        kt(repo, args)
+        self.configure(kt(repo, args)).output().unwrap()
+    }
+
+    /// Points a `kt` command, however it is launched, at this model.
+    fn configure(&self, mut command: Command) -> Command {
+        command
             .env("KITE_OPENAI_URL", format!("http://{}", self.address))
             .env("KITE_OPENAI_API_KEY", "local-test-key")
             .env("KITE_OPENAI_TIMEOUT_SECS", "10")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap()
+            .stdin(std::process::Stdio::null());
+        command
     }
 
     /// How many requests were made.
@@ -1080,4 +1084,140 @@ fn an_interrupted_fine_land_recovers_with_undo() {
     assert_eq!(git(&repo.path, &["status", "--porcelain"]), "");
     assert_eq!(git(&repo.path, &["worktree", "list"]).lines().count(), 1);
     assert_eq!(git(&repo.path, &["branch", "--list", "kite-landing-*"]), "");
+}
+
+/// The private checkout holds every saved file, including ones a later save
+/// deleted. A shared temp directory and a permissive umask must not expose it.
+#[cfg(unix)]
+#[test]
+fn a_fine_land_keeps_its_private_checkout_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = init_repo();
+    std::fs::set_permissions(&repo.path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    timed_saves(&repo.path, &[0, 1, 2]);
+    // A world-readable temp directory, unlike the per-user one macOS uses.
+    let shared_temp = TempDir::new("kite-shared-temp");
+    std::fs::set_permissions(&shared_temp.path, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let modes = repo.path.join(".git/kite-test-modes");
+    let hook = repo.path.join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nls -ld .. \"$PWD\" > \"$KITE_TEST_MODES\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let model = FakeModel::start(200);
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "umask 000 && exec \"$0\" \"$@\"",
+            env!("CARGO_BIN_EXE_kt"),
+        ])
+        .args(["land", "--yes", "-g", "fine"])
+        .current_dir(&repo.path)
+        .env("TMPDIR", &shared_temp.path)
+        .env("KITE_TEST_MODES", &modes);
+    let output = model.configure(command).output().unwrap();
+    model.finish();
+    assert_success(&output);
+
+    let listed = std::fs::read_to_string(&modes).unwrap();
+    let mut lines = listed.lines();
+    let folder = lines.next().unwrap();
+    assert!(folder.starts_with("drwx------"), "{listed}");
+    assert!(lines.next().unwrap().contains("kite-land-"), "{listed}");
+    // Nothing is left behind in the shared directory.
+    assert_eq!(std::fs::read_dir(&shared_temp.path).unwrap().count(), 0);
+}
+
+/// Saves a superproject commit at `minute`, after `change` has run in it.
+fn timed_save(repo: &Path, minute: i64, label: &str, change: impl FnOnce()) -> String {
+    change();
+    git(repo, &["add", "-A"]);
+    let date = format!("@{} +0000", 1_790_000_000 + minute * 60);
+    let committed = Command::new("git")
+        .args(["commit", "-qm", &format!("[kite] save {label}")])
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert_success(&committed);
+    git(repo, &["rev-parse", "HEAD"]).trim().to_string()
+}
+
+/// Submodule pointers are saved as commits, not files. The private checkout
+/// has no submodule checked out, so they must land from the saves.
+#[test]
+fn windowed_lands_carry_submodule_pointers() {
+    let library = init_repo();
+    let commits: Vec<String> = ["second", "third"]
+        .iter()
+        .map(|label| {
+            git(
+                &library.path,
+                &[
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    &format!("feat: {label}"),
+                ],
+            );
+            git(&library.path, &["rev-parse", "HEAD"])
+                .trim()
+                .to_string()
+        })
+        .collect();
+    let library_url = library.path.to_str().unwrap();
+
+    let repo = init_repo();
+    git(&repo.path, &["clone", "-q", library_url, "module"]);
+    git(&repo.path.join("module"), &["checkout", "-q", "HEAD~2"]);
+    git(&repo.path, &["add", "module"]);
+    git(&repo.path, &["commit", "-qm", "chore: add module"]);
+    let base = git(&repo.path, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let module = repo.path.join("module");
+    let extra = repo.path.join("extra");
+    let saves = [
+        timed_save(&repo.path, 0, "1", || {
+            git(&module, &["checkout", "-q", &commits[0]]);
+            write_file(&repo.path, "notes.txt", "moved the module\n");
+        }),
+        // After a pause, so it is a window of its own: a pointer is added...
+        timed_save(&repo.path, 120, "2", || {
+            git(&module, &["checkout", "-q", &commits[1]]);
+            git(&repo.path, &["clone", "-q", library_url, "extra"]);
+        }),
+        // ...and removed again.
+        timed_save(&repo.path, 121, "3", || {
+            git(&repo.path, &["rm", "-q", "--cached", "extra"]);
+            std::fs::remove_dir_all(&extra).unwrap();
+            write_file(&repo.path, "notes.txt", "dropped the extra module\n");
+        }),
+    ];
+    let save_trees: Vec<String> = saves.iter().map(|save| tree_of(&repo.path, save)).collect();
+
+    for (granularity, expected) in [
+        ("fine", vec![save_trees[0].clone(), save_trees[2].clone()]),
+        ("per-save", save_trees.clone()),
+    ] {
+        let model = FakeModel::start(200);
+        let output = model.land(&repo.path, &["land", "--yes", "-g", granularity]);
+        model.finish();
+        assert_success(&output);
+
+        assert_eq!(landed_trees(&repo.path, &base), expected, "{granularity}");
+        assert_eq!(
+            git(&repo.path, &["status", "--porcelain"]),
+            "",
+            "{granularity}"
+        );
+        assert_success(&kt(&repo.path, &["undo"]).output().unwrap());
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]).trim(), saves[2]);
+    }
 }

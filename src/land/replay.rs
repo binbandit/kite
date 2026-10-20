@@ -6,12 +6,12 @@
 //! but its index and files stay as they were saved: they already hold the
 //! final state, and other tools or people may be using them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::commits::{changed_paths, create_commits};
+use super::commits::{Staging, changed_paths, create_commits};
 use super::state::TRANSACTION_REF_PREFIX;
 use super::windows::{WindowPlan, describe_range};
 use crate::git::{
@@ -19,8 +19,8 @@ use crate::git::{
     short_sha,
 };
 
-/// Private checkouts are named after their land transaction, so recovery can
-/// find one left behind by an interrupted land.
+/// Private checkouts live in a folder named after their land transaction, so
+/// recovery can find one left behind by an interrupted land.
 const CHECKOUT_PREFIX: &str = "kite-land-";
 
 /// Builds every window's commits on `transaction_ref` and returns the files
@@ -66,8 +66,11 @@ pub(super) fn remove_abandoned_checkout(transaction_ref: &str) {
         .filter_map(|line| line.strip_prefix("worktree "))
     {
         let path = Path::new(path);
-        if path.file_name().is_some_and(|file| file == name.as_str()) {
-            remove_checkout(path);
+        if let Some(folder) = path
+            .parent()
+            .filter(|folder| folder.file_name().is_some_and(|file| file == name.as_str()))
+        {
+            remove_checkout(path, folder);
         }
     }
 }
@@ -91,7 +94,14 @@ fn build_windows(
     execute_git(&["symbolic-ref", "HEAD", transaction_ref])?;
     match base {
         KiteBase::Commit(base_sha) => {
-            execute_git(&["reset", "-q", "--hard", base_sha])?;
+            execute_git(&[
+                "-c",
+                "submodule.recurse=false",
+                "reset",
+                "-q",
+                "--hard",
+                base_sha,
+            ])?;
         }
         // An unborn transaction branch makes the first landed commit a root.
         KiteBase::Root => {
@@ -119,20 +129,30 @@ fn build_windows(
 }
 
 /// Lands one window: checks out its last save's files, carrying committed
-/// hook edits to files the window leaves alone, then commits its groups.
+/// hook edits to files the window leaves alone, then commits its groups
+/// from the save's exact entries.
 fn land_window(previous_save: &str, window: &WindowPlan, hooks: Hooks) -> Result<HashSet<String>> {
+    let entries = saved_entries(previous_save, &window.save)?;
     let current = head_tree()?;
-    let target = apply_changes(&current, previous_save, &window.save)?;
+    let target = apply_entries(&current, &entries)?;
     // `--reset` also discards edits a hook left unstaged in an earlier
     // window. They were never committed, and this checkout is Kite's alone.
-    execute_git(&["read-tree", "-u", "--reset", &target])?;
+    // Submodules stay as they are: their pointers are staged from the save.
+    execute_git(&[
+        "-c",
+        "submodule.recurse=false",
+        "read-tree",
+        "-u",
+        "--reset",
+        &target,
+    ])?;
     // Unstage again: each group stages its own files.
     match check_ref("HEAD") {
-        Some(_) => execute_git(&["reset", "-q"])?,
+        Some(_) => execute_git(&["-c", "submodule.recurse=false", "reset", "-q"])?,
         None => execute_git(&["read-tree", "--empty"])?,
     };
 
-    let hook_changes = create_commits(&window.commits, hooks)?;
+    let hook_changes = create_commits(&window.commits, hooks, &Staging::Saved(&entries))?;
     for path in changed_paths(&target, &head_tree()?)? {
         if !hook_changes.contains(&path) {
             anyhow::bail!(
@@ -151,9 +171,9 @@ fn head_tree() -> Result<String> {
     }
 }
 
-/// `tree` with the changes between saves `from` and `to` applied, using a
-/// scratch index so the checkout's own index is untouched.
-fn apply_changes(tree: &str, from: &str, to: &str) -> Result<String> {
+/// Each path that changed between saves `from` and `to`, with the
+/// `--index-info` record that sets it to its entry in `to`.
+fn saved_entries(from: &str, to: &str) -> Result<HashMap<String, String>> {
     let changes = execute_git(&[
         "diff-tree",
         "-r",
@@ -163,10 +183,23 @@ fn apply_changes(tree: &str, from: &str, to: &str) -> Result<String> {
         from,
         to,
     ])?;
-    let entries = index_entries(&changes)?;
+    index_records(&changes)
+}
+
+/// `tree` with `entries` applied, written through a scratch index so the
+/// checkout's own index is untouched.
+fn apply_entries(tree: &str, entries: &HashMap<String, String>) -> Result<String> {
     if entries.is_empty() {
         return Ok(tree.to_string());
     }
+    // Sorted, so a file replaced by a directory is removed before the
+    // directory's files are added, as `diff-tree` lists them.
+    let mut paths: Vec<&String> = entries.keys().collect();
+    paths.sort();
+    let records: String = paths
+        .into_iter()
+        .map(|path| entries[path].as_str())
+        .collect();
 
     let index = PathBuf::from(current_worktree_key()?).join("kite-window-index");
     let index_path = index
@@ -178,7 +211,7 @@ fn apply_changes(tree: &str, from: &str, to: &str) -> Result<String> {
         execute_git_with(
             &["update-index", "-z", "--index-info"],
             &env,
-            Some(&entries),
+            Some(&records),
         )?;
         Ok(execute_git_with(&["write-tree"], &env, None)?
             .trim()
@@ -189,11 +222,12 @@ fn apply_changes(tree: &str, from: &str, to: &str) -> Result<String> {
 }
 
 /// Turns `diff-tree -z` records (`:old new old-oid new-oid status`, then the
-/// path) into `--index-info` lines that set each path to its new entry. A
-/// deleted path has mode 0, which removes it.
-fn index_entries(raw: &str) -> Result<String> {
+/// path) into `--index-info` records that set each path to its new entry. A
+/// deleted path has mode 0, which removes it; a submodule keeps mode 160000
+/// and its commit.
+fn index_records(raw: &str) -> Result<HashMap<String, String>> {
     let mut fields = raw.split('\0');
-    let mut entries = String::new();
+    let mut records = HashMap::new();
     while let Some(header) = fields.next().filter(|header| !header.is_empty()) {
         let path = fields
             .next()
@@ -202,13 +236,15 @@ fn index_entries(raw: &str) -> Result<String> {
         let [_, mode, _, oid, _] = parts.as_slice() else {
             anyhow::bail!("Unexpected diff-tree record {header:?}");
         };
-        entries.push_str(&format!("{mode} {oid}\t{path}\0"));
+        records.insert(path.to_string(), format!("{mode} {oid}\t{path}\0"));
     }
-    Ok(entries)
+    Ok(records)
 }
 
-/// A linked worktree outside the repository, named after the land.
+/// A linked worktree outside the repository, inside an owner-only folder
+/// named after the land.
 struct PrivateCheckout {
+    folder: PathBuf,
     path: PathBuf,
 }
 
@@ -216,13 +252,15 @@ impl PrivateCheckout {
     fn add(pre_land_sha: &str, transaction_ref: &str) -> Result<Self> {
         let name = checkout_name(transaction_ref)
             .context("Kite generated an invalid land transaction ref")?;
-        let path = std::env::temp_dir().join(name);
+        let folder = std::env::temp_dir().join(name);
+        create_private_folder(&folder)?;
+        let path = folder.join("checkout");
         let path_arg = path
             .to_str()
             .context("The temporary directory path must be valid UTF-8")?;
         // Detached and empty: it attaches to the transaction ref and fills
         // its files itself, and no checkout hook needs to run for that.
-        execute_git(&[
+        let added = execute_git(&[
             "-c",
             "core.hooksPath=/dev/null",
             "worktree",
@@ -231,9 +269,12 @@ impl PrivateCheckout {
             "--no-checkout",
             path_arg,
             pre_land_sha,
-        ])
-        .context("Could not create a private checkout to land the saves in")?;
-        Ok(Self { path })
+        ]);
+        if let Err(error) = added {
+            remove_checkout(&path, &folder);
+            return Err(error.context("Could not create a private checkout to land the saves in"));
+        }
+        Ok(Self { folder, path })
     }
 
     /// Runs `work` with Git commands aimed at this checkout.
@@ -248,17 +289,42 @@ impl PrivateCheckout {
     }
 
     fn remove(self) {
-        remove_checkout(&self.path);
+        remove_checkout(&self.path, &self.folder);
     }
 }
 
+/// The checkout holds the repository's files, including saves that later
+/// deleted a secret, and the system temp directory can be shared. So the
+/// folder is owner-only before anything is written into it, whatever the
+/// umask. Creating rather than reusing it also refuses a folder or link
+/// someone else put there first.
+fn create_private_folder(folder: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        builder.mode(0o700);
+        builder
+            .create(folder)
+            .with_context(|| format!("Could not create {}", folder.display()))?;
+        // A umask can remove the owner's own bits too; set them exactly.
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("Could not protect {}", folder.display()))?;
+    }
+    #[cfg(not(unix))]
+    builder
+        .create(folder)
+        .with_context(|| format!("Could not create {}", folder.display()))?;
+    Ok(())
+}
+
 /// Best effort: a leftover checkout holds nothing the saves do not.
-fn remove_checkout(path: &Path) {
+fn remove_checkout(path: &Path, folder: &Path) {
     let removed = path.to_str().is_some_and(|path| {
         execute_git(&["worktree", "remove", "--force", "--force", path]).is_ok()
     });
+    let _ = std::fs::remove_dir_all(folder);
     if !removed {
-        let _ = std::fs::remove_dir_all(path);
         let _ = execute_git(&["worktree", "prune"]);
     }
 }
@@ -268,20 +334,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn diff_tree_records_become_index_entries() {
+    fn diff_tree_records_become_index_records() {
         let zero = "0".repeat(40);
         let old = "1".repeat(40);
         let new = "2".repeat(40);
         let raw = format!(
-            ":100644 100644 {old} {new} M\0src/a.rs\0:100644 000000 {old} {zero} D\0gone\nline.txt\0:000000 120000 {zero} {new} A\0link\0"
+            ":100644 100644 {old} {new} M\0src/a.rs\0:100644 000000 {old} {zero} D\0gone\nline.txt\0:000000 120000 {zero} {new} A\0link\0:160000 160000 {old} {new} M\0module\0"
         );
 
+        let records = index_records(&raw).unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records["src/a.rs"], format!("100644 {new}\tsrc/a.rs\0"));
         assert_eq!(
-            index_entries(&raw).unwrap(),
-            format!("100644 {new}\tsrc/a.rs\0000000 {zero}\tgone\nline.txt\0120000 {new}\tlink\0")
+            records["gone\nline.txt"],
+            format!("000000 {zero}\tgone\nline.txt\0")
         );
-        assert_eq!(index_entries("").unwrap(), "");
-        index_entries(":100644 100644 x\0").expect_err("a malformed record must not be guessed at");
+        assert_eq!(records["link"], format!("120000 {new}\tlink\0"));
+        // A submodule pointer is staged as the commit it was saved at.
+        assert_eq!(records["module"], format!("160000 {new}\tmodule\0"));
+        assert!(index_records("").unwrap().is_empty());
+        index_records(":100644 100644 x\0").expect_err("a malformed record must not be guessed at");
     }
 
     #[test]

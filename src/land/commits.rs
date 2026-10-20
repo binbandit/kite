@@ -1,18 +1,55 @@
 //! Build planned commits, accepting hook edits only to each commit's files.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-use crate::git::{Hooks, check_ref, commit_git, execute_git, stage_paths};
+use crate::git::{Hooks, check_ref, commit_git, execute_git, execute_git_with, stage_paths};
 use crate::synth::CommitGroup;
 
-pub(super) fn create_commits(commits: &[CommitGroup], hooks: Hooks) -> Result<HashSet<String>> {
+/// Where each commit's planned files are staged from.
+pub(super) enum Staging<'a> {
+    /// The working tree, which holds the saved files.
+    Worktree,
+    /// Exact saved entries, as `update-index --index-info` records keyed by
+    /// path. Submodule pointers stage correctly even where the submodule is
+    /// not checked out, and no file passes through a filter again.
+    Saved(&'a HashMap<String, String>),
+}
+
+impl Staging<'_> {
+    fn stage(&self, files: &[String]) -> Result<()> {
+        match self {
+            Staging::Worktree => stage_paths(files),
+            Staging::Saved(entries) => {
+                let mut records = String::new();
+                for path in files {
+                    let record = entries
+                        .get(path)
+                        .with_context(|| format!("{path:?} has no saved entry to stage"))?;
+                    records.push_str(record);
+                }
+                execute_git_with(&["update-index", "-z", "--index-info"], &[], Some(&records))?;
+                // Entries written this way carry no file timestamps. Refresh
+                // them so hooks comparing the index with the files see no
+                // phantom edits.
+                let _ = execute_git(&["update-index", "-q", "--refresh"]);
+                Ok(())
+            }
+        }
+    }
+}
+
+pub(super) fn create_commits(
+    commits: &[CommitGroup],
+    hooks: Hooks,
+    staging: &Staging,
+) -> Result<HashSet<String>> {
     let mut hook_changes = HashSet::new();
     for commit in commits {
         let previous_tree = execute_git(&["write-tree"])?;
         if !commit.files.is_empty() {
-            stage_paths(&commit.files)?;
+            staging.stage(&commit.files)?;
         }
         let staged_tree = execute_git(&["write-tree"])?;
         // Even literal Git paths include descendants when a saved file was

@@ -7,7 +7,7 @@ mod replay;
 mod stash;
 mod state;
 mod windows;
-use commits::{create_commits, verify_saved_tree};
+use commits::{Staging, create_commits, verify_saved_tree};
 pub(crate) use publish::publish_current_branch;
 #[cfg(test)]
 pub(crate) use recovery::heal_interrupted_land;
@@ -403,7 +403,7 @@ fn execute_land(base: &KiteBase, commits: &[CommitGroup], hooks: Hooks) -> Resul
         } else {
             commits
         };
-        create_commits(groups, hooks)
+        create_commits(groups, hooks, &Staging::Worktree)
     })
 }
 
