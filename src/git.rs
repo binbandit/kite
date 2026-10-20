@@ -636,27 +636,37 @@ pub(crate) fn stage_paths(paths: &[String]) -> Result<()> {
     .map(|_| ())
 }
 
-/// Runs one diff of `base` against `HEAD`, with `format` deciding what the
+/// The empty tree, written to the object store so plumbing can read it.
+pub(crate) fn empty_tree() -> Result<String> {
+    Ok(execute_git_with(
+        &["hash-object", "-w", "-t", "tree", "--stdin"],
+        &[],
+        Some(""),
+    )?
+    .trim()
+    .to_string())
+}
+
+impl KiteBase {
+    /// What the saves are diffed against: the base commit, or the empty tree
+    /// when they reach the root. diff-tree --root HEAD would compare only the
+    /// final save with its parent, omitting earlier files.
+    pub(crate) fn tree_ish(&self) -> Result<String> {
+        match self {
+            KiteBase::Commit(hash) => Ok(hash.clone()),
+            KiteBase::Root => empty_tree(),
+        }
+    }
+}
+
+/// Runs one diff of `from` against `to`, with `format` deciding what the
 /// output looks like.
 ///
 /// `--no-renames` lives here rather than at the call sites so it cannot be
 /// applied to one and not the other. With rename detection on, `--name-only`
 /// reports a rename as the new path alone, and landing would stage that
 /// addition while leaving the old file sitting in the landed tree.
-fn diff_against_base(base: &KiteBase, format: &[&str]) -> Result<String> {
-    let base = match base {
-        KiteBase::Commit(hash) => hash.clone(),
-        // The stack can contain several saves. diff-tree --root HEAD would
-        // compare only its final save with its parent, omitting earlier files.
-        KiteBase::Root => execute_git_with(
-            &["hash-object", "-w", "-t", "tree", "--stdin"],
-            &[],
-            Some(""),
-        )?
-        .trim()
-        .to_string(),
-    };
-
+fn diff_between(from: &str, to: &str, format: &[&str]) -> Result<String> {
     // core.quotepath=false keeps non-ASCII paths readable in the patch; `-z`
     // makes it moot for the path list.
     let mut args = vec![
@@ -669,21 +679,27 @@ fn diff_against_base(base: &KiteBase, format: &[&str]) -> Result<String> {
         "--no-renames",
     ];
     args.extend(format);
-    args.extend([&base, "HEAD", "--"]);
+    args.extend([from, to, "--"]);
 
     execute_git(&args)
 }
 
 /// What a set of saves changed: the exact paths, and the diff explaining them.
+pub(crate) fn saved_changes(base: &KiteBase) -> Result<(Vec<String>, String)> {
+    changes_between(&base.tree_ish()?, "HEAD")
+}
+
+/// The exact paths that differ between two commits or trees, and the diff
+/// explaining them.
 ///
 /// They are fetched together because landing stages the paths while the model
 /// only reads the diff. Two independently flagged commands could describe
 /// different changes, and the paths are the half that decides what lands.
-pub(crate) fn saved_changes(base: &KiteBase) -> Result<(Vec<String>, String)> {
+pub(crate) fn changes_between(from: &str, to: &str) -> Result<(Vec<String>, String)> {
     // NUL-separated: git otherwise C-quotes any path holding a quote, a
     // backslash, or a newline, and escapes every non-ASCII one, none of which
     // name the file they came from.
-    let listed = diff_against_base(base, &["--name-only", "-z"])?;
+    let listed = diff_between(from, to, &["--name-only", "-z"])?;
     let paths = listed
         .split('\0')
         .filter(|path| !path.is_empty())
@@ -692,12 +708,83 @@ pub(crate) fn saved_changes(base: &KiteBase) -> Result<(Vec<String>, String)> {
 
     // Explicit prefixes and colour off keep the patch in the shape the model
     // expects whatever the user's diff configuration says.
-    let diff = diff_against_base(
-        base,
+    let diff = diff_between(
+        from,
+        to,
         &["-p", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"],
     )?;
 
     Ok((paths, diff))
+}
+
+/// One `[kite] save` commit, with enough about its size to plan around.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Save {
+    pub(crate) commit: String,
+    /// Committer time, in seconds since the Unix epoch.
+    pub(crate) time: i64,
+    pub(crate) files: usize,
+    /// Added plus deleted lines; binary files count as none.
+    pub(crate) lines: usize,
+}
+
+/// The newest `count` first-parent commits, oldest first: the save stack that
+/// `kite_save_stack` counted, in the order the saves were made.
+pub(crate) fn kite_saves(count: usize) -> Result<Vec<Save>> {
+    let output = execute_git(&[
+        "log",
+        "--first-parent",
+        "--reverse",
+        "--no-renames",
+        "--numstat",
+        "--format=%x00%H %ct",
+        "-n",
+        &count.to_string(),
+        "HEAD",
+        "--",
+    ])?;
+    let saves = parse_save_log(&output)?;
+    if saves.len() != count {
+        anyhow::bail!(
+            "Expected {count} saves in history but found {}",
+            saves.len()
+        );
+    }
+    Ok(saves)
+}
+
+/// Each record is `\0<sha> <time>` followed by numstat lines,
+/// `added<TAB>deleted<TAB>path`, where binary files show `-` for both counts.
+fn parse_save_log(output: &str) -> Result<Vec<Save>> {
+    output
+        .split('\0')
+        .filter(|record| !record.trim().is_empty())
+        .map(|record| {
+            let mut lines = record.lines();
+            let header = lines.next().unwrap_or_default();
+            let (commit, time) = header
+                .split_once(' ')
+                .with_context(|| format!("Unexpected save log entry {header:?}"))?;
+            let time = time
+                .trim()
+                .parse()
+                .with_context(|| format!("Unexpected save time in {header:?}"))?;
+            let mut save = Save {
+                commit: commit.to_string(),
+                time,
+                files: 0,
+                lines: 0,
+            };
+            for stat in lines.filter(|line| !line.trim().is_empty()) {
+                let mut counts = stat.splitn(3, '\t');
+                let added = counts.next().and_then(|count| count.parse::<usize>().ok());
+                let deleted = counts.next().and_then(|count| count.parse::<usize>().ok());
+                save.files += 1;
+                save.lines += added.unwrap_or(0) + deleted.unwrap_or(0);
+            }
+            Ok(save)
+        })
+        .collect()
 }
 
 /// Best-effort style examples; an unreadable log just means no examples.

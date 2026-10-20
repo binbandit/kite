@@ -12,6 +12,11 @@ const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4";
 const DEFAULT_REASONING_EFFORT: &str = "low";
 const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 120;
+/// Requests in flight at once when a land is planned in several parts. Low
+/// enough to stay inside ordinary rate limits; throttled requests back off.
+const DEFAULT_OPENAI_CONCURRENCY: usize = 4;
+/// The longest Kite waits between attempts, whatever the provider asks.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 /// Enough of an error payload to identify the problem, without pasting an
 /// HTML error page into the terminal.
@@ -33,6 +38,8 @@ struct AiError {
     retryable: bool,
     /// An optional request field the provider refused; retry without it.
     rejected: Option<OptionalField>,
+    /// How long the provider asked callers to wait before retrying.
+    retry_after: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +63,39 @@ pub(crate) fn is_retryable(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<AiError>()
         .is_none_or(|failure| failure.retryable)
+}
+
+/// How long to wait before retrying after `error` on the given zero-based
+/// attempt. Throttling and outages get time to clear, as long as the provider
+/// asks within reason; a malformed or invalid reply is retried at once, since
+/// waiting will not change it.
+pub(crate) fn retry_delay(error: &anyhow::Error, attempt: usize) -> Duration {
+    match error.downcast_ref::<AiError>() {
+        Some(failure) if failure.retryable => failure
+            .retry_after
+            .unwrap_or(Duration::from_secs(1 << attempt.min(4)))
+            .min(MAX_RETRY_DELAY),
+        _ => Duration::ZERO,
+    }
+}
+
+/// OpenAI sends `retry-after-ms`; the standard header is in seconds.
+fn requested_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let header = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<f64>().ok();
+    let delay = header("retry-after-ms")
+        .map(|millis| millis / 1000.0)
+        .or_else(|| header("retry-after"))?;
+    Duration::try_from_secs_f64(delay).ok()
+}
+
+/// How many requests to run at once, from `KITE_OPENAI_CONCURRENCY`.
+pub(crate) fn concurrency() -> Result<usize> {
+    let Some(raw) = first_non_empty_env(&["KITE_OPENAI_CONCURRENCY"]) else {
+        return Ok(DEFAULT_OPENAI_CONCURRENCY);
+    };
+    parse_positive(&raw)
+        .and_then(|value| usize::try_from(value).map_err(Into::into))
+        .context("Invalid request count in KITE_OPENAI_CONCURRENCY")
 }
 
 /// One client for the process; timeouts vary per request, connections pool.
@@ -171,16 +211,19 @@ async fn send_responses(
         // Timeouts, connection resets and DNS blips are all worth another go.
         retryable: true,
         rejected: None,
+        retry_after: None,
     })?;
 
     let status = response.status();
     if !status.is_success() {
+        let retry_after = requested_retry_delay(response.headers());
         // Preserve the provider's explanation, not just its HTTP status.
         let body = response.text().await.unwrap_or_default();
         return Err(AiError {
             message: describe_api_failure(status, &body),
             retryable: is_retryable_status(status),
             rejected: rejected_field(status, &body),
+            retry_after,
         });
     }
 
@@ -188,6 +231,7 @@ async fn send_responses(
         message: format!("Could not read the reply from {responses_url}: {error}"),
         retryable: true,
         rejected: None,
+        retry_after: None,
     })?;
 
     let json: serde_json::Value = serde_json::from_str(&body).map_err(|error| AiError {
@@ -197,6 +241,7 @@ async fn send_responses(
         ),
         retryable: true,
         rejected: None,
+        retry_after: None,
     })?;
 
     extract_openai_output_text(&json)
@@ -340,6 +385,7 @@ fn extract_openai_output_text(json: &serde_json::Value) -> std::result::Result<S
         message,
         retryable,
         rejected: None,
+        retry_after: None,
     };
     if let Some(error) = json.get("error").filter(|error| !error.is_null()) {
         let detail = error.get("message").and_then(|value| value.as_str());
@@ -437,17 +483,17 @@ fn env_duration_secs(key: &str, default_secs: u64) -> Result<Duration> {
         return Ok(Duration::from_secs(default_secs));
     };
 
-    parse_timeout_secs(&raw)
+    parse_positive(&raw)
         .map(Duration::from_secs)
         .with_context(|| format!("Invalid timeout in {key}"))
 }
 
-fn parse_timeout_secs(raw: &str) -> Result<u64> {
-    let seconds: u64 = raw.trim().parse()?;
-    if seconds == 0 {
-        anyhow::bail!("timeout must be greater than zero seconds");
+fn parse_positive(raw: &str) -> Result<u64> {
+    let value: u64 = raw.trim().parse()?;
+    if value == 0 {
+        anyhow::bail!("the value must be greater than zero");
     }
-    Ok(seconds)
+    Ok(value)
 }
 
 /// Extracts the first balanced JSON value delimited by `open`/`close` from
@@ -679,24 +725,47 @@ mod tests {
     }
 
     #[test]
-    fn parse_timeout_secs_accepts_positive_integer_seconds() {
+    fn parse_positive_accepts_positive_integers() {
+        assert_eq!(parse_positive("120").expect("timeout should parse"), 120);
         assert_eq!(
-            parse_timeout_secs("120").expect("timeout should parse"),
-            120
-        );
-        assert_eq!(
-            parse_timeout_secs(" 45 ").expect("trimmed timeout should parse"),
+            parse_positive(" 45 ").expect("trimmed timeout should parse"),
             45
         );
     }
 
     #[test]
-    fn parse_timeout_secs_rejects_zero_and_invalid_values() {
-        let zero = parse_timeout_secs("0").expect_err("zero should fail");
+    fn parse_positive_rejects_zero_and_invalid_values() {
+        let zero = parse_positive("0").expect_err("zero should fail");
         assert!(format!("{zero:#}").contains("greater than zero"));
 
-        let invalid = parse_timeout_secs("slow").expect_err("non-number should fail");
+        let invalid = parse_positive("slow").expect_err("non-number should fail");
         assert!(format!("{invalid:#}").contains("invalid digit"));
+    }
+
+    #[test]
+    fn only_provider_failures_wait_before_a_retry() {
+        let throttled = |retry_after| -> anyhow::Error {
+            AiError {
+                message: "AI request failed (429 Too Many Requests)".to_string(),
+                retryable: true,
+                rejected: None,
+                retry_after,
+            }
+            .into()
+        };
+        assert_eq!(retry_delay(&throttled(None), 0), Duration::from_secs(1));
+        assert_eq!(retry_delay(&throttled(None), 1), Duration::from_secs(2));
+        // The provider's own estimate wins, within reason.
+        let asked = Some(Duration::from_millis(7_500));
+        assert_eq!(
+            retry_delay(&throttled(asked), 0),
+            Duration::from_millis(7_500)
+        );
+        let unreasonable = Some(Duration::from_secs(3_600));
+        assert_eq!(retry_delay(&throttled(unreasonable), 0), MAX_RETRY_DELAY);
+        // A reply that failed validation will not improve by waiting.
+        let invalid = anyhow::anyhow!("Model reply contained no commit groups");
+        assert_eq!(retry_delay(&invalid, 1), Duration::ZERO);
     }
 
     #[test]
@@ -749,9 +818,33 @@ mod tests {
             message: "AI request failed (401 Unauthorized)".to_string(),
             retryable: false,
             rejected: None,
+            retry_after: None,
         }
         .into();
         assert!(!is_retryable(&hard_failure));
+    }
+
+    #[test]
+    fn retry_hints_are_read_from_either_header() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(requested_retry_delay(&headers), None);
+        headers.insert("retry-after", "3".parse().unwrap());
+        assert_eq!(
+            requested_retry_delay(&headers),
+            Some(Duration::from_secs(3))
+        );
+        headers.insert("retry-after-ms", "250".parse().unwrap());
+        assert_eq!(
+            requested_retry_delay(&headers),
+            Some(Duration::from_millis(250))
+        );
+        // An HTTP date is legal but rare; it falls back to Kite's own backoff.
+        headers.remove("retry-after-ms");
+        headers.insert(
+            "retry-after",
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(requested_retry_delay(&headers), None);
     }
 
     #[test]

@@ -58,6 +58,14 @@ Typical landed output looks like:
 
 If the AI is unavailable, Kite shows the failure and asks for one manual commit message before any history is changed. With `--yes`, it exits with an error instead of prompting; rerun `kt land` without `--yes` for the manual fallback.
 
+Grouping everything at once suits a short run of saves. A long one, such as days of saves from several agents, collapses into a few large commits that say little. Land it so it follows the history instead:
+
+```bash
+kt land --granularity fine
+```
+
+Kite cuts the saves into windows of consecutive saves, at a pause of 30 minutes or more, or once a window reaches 12 saves, 5,000 changed lines, or 300 changed files. Each window is planned on its own and lands as one or more commits, in order, ending on that window's last save. Every window boundary is therefore a state you actually saved. `--granularity per-save` goes further and keeps every save as its own commit, replacing only its `[kite] save` message.
+
 ### 3. Open a Pull Request
 
 Once the branch is landed, run:
@@ -166,6 +174,10 @@ Synthesizes contiguous Kite quicksaves into a polished local history.
 - Refuses hooks that stage files outside the current group or leave staged changes after the commit was written. Failed hooks still restore your saves and preserve their edits for correction and retry.
 - Stops if your checkout, commits, or working files change while the plan is being prepared or reviewed.
 - Landing builds on one uniquely named temporary branch so ordinary Git hooks see a normal checkout. It records that exact ref, moves your branch with a compare-and-swap — or, if you were already detached, moves `HEAD` itself — and removes the temporary branch before returning.
+- `--granularity` (`-g`) chooses how finely saves become commits. `coarse`, the default, plans all saved changes at once. `fine` plans each window of consecutive saves and lands the windows in order. `per-save` keeps every save as its own commit with a written message. The final tree is the saved tip at every granularity, apart from changes hooks commit; with `fine` and `per-save`, each window or save also ends on its own saved tree.
+- A `fine` land sends one AI request per window, and a `per-save` land one per batch of up to eight saves, so a long history never needs one giant request. Up to four run at once (`KITE_OPENAI_CONCURRENCY`), each with the usual timeout and retries, and progress shows while they run. If any request fails, no history changes. There is no manual-message fallback, since one message cannot stand in for a history of commits; retry, or use the default granularity to enter one message by hand.
+- `fine` and `per-save` lands build their commits in a private checkout: a temporary linked worktree holding each window's saved files, inside an owner-only folder in the system temp directory, whatever the umask. Each commit stages the saves' exact entries, so submodule pointers land as saved without the submodules being checked out there. Commit hooks see exactly the files each commit lands, while your worktree and its untracked or ignored files are left alone. Changes a hook commits are copied into your worktree at the end; edits it leaves unstaged are discarded with the checkout. Hooks that need untracked files such as installed dependencies will not find them there, and a hook can reject an earlier save that a later one fixed. Pass `--no-verify` for those, or land with the default granularity. The checkout is removed when the land ends; after an interruption, `kt undo` removes it.
+- Their preview lists every commit's subject and file count under the saves it comes from, rather than each commit's files.
 - If landing fails for any reason — a rejected pre-commit hook is the usual one — Kite undoes the attempt and leaves you exactly where you started: on your branch or your detached commit, saves intact, nothing staged, no branch to clean up. Fix the problem and run `kt land` again. Files a hook rewrote are kept as unstaged changes.
 - If landing is interrupted rather than failing — Ctrl-C, a crash, a closed terminal — the next `kt` command stops and asks you to run `kt undo`. Recovery is explicit because a worktree id alone cannot prove that a detached commit checked out later is still Kite's partial rewrite.
 - Lands locally by default. Use `kt publish` afterward, or pass `--push` (`-p`) to publish immediately after landing.
@@ -196,6 +208,13 @@ Tag every landed commit title with a reference:
 
 ```bash
 kt land --tag PROJ-123
+```
+
+Land a long run of saves as commits that follow its history, or keep every save and only write its message:
+
+```bash
+kt land --granularity fine
+kt land -g per-save
 ```
 
 Land and publish in one step:
@@ -258,11 +277,12 @@ Quicksaves current changes, lands all contiguous saves, publishes the branch, an
 kt ship
 kt ship --draft
 kt ship --base release/1.2 --tag PROJ-123
+kt ship --granularity fine
 ```
 
 - Requires an existing commit, a branch other than the PR base, `origin`, and authenticated `gh`. Destination and lookup failures stop before saving. Fork targeting works exactly as it does for `kt pr`.
 - Respects an existing staged selection, just like `kt`. If this leaves unsaved work, landing stops; save or stash that work before retrying.
-- Runs commit hooks during landing and pre-push hooks during publication. `--no-verify` skips only the landing commit hooks. Remote commits that are not Kite saves still require confirmation before replacement.
+- Runs commit hooks during landing and pre-push hooks during publication. `--no-verify` skips only the landing commit hooks, and `--granularity` chooses how finely the saves land, as for `kt land`. Remote commits that are not Kite saves still require confirmation before replacement.
 - Stops at the first error. An AI planning failure leaves the quicksave intact; run `kt land` without `--yes` to enter a message manually. A push or PR failure leaves completed local commits intact, and a PR failure may leave the branch published. Fix the cause and rerun `kt ship` or the remaining command.
 - Works when there is nothing new to save or land, so it can publish already-landed commits or refresh an existing PR. It never merges the PR. `kt undo` can undo the land, but does not delete the PR.
 
@@ -321,10 +341,12 @@ Both `kt land` and `kt pr` use one AI, reached through the OpenAI Responses API,
 - API key env precedence: `KITE_OPENAI_API_KEY`, `OPENAI_API_KEY`, `KITE_API_KEY`, `OPENAI_KEY`, `AI_GATEWAY_API_KEY`
 - Reasoning effort env: `KITE_OPENAI_REASONING_EFFORT` (the model's supported values, such as `none`, `low`, or `medium`)
 - Timeout env: `KITE_OPENAI_TIMEOUT_SECS`
+- Concurrency env: `KITE_OPENAI_CONCURRENCY`, the requests a `fine` or `per-save` land runs at once
 - Default base URL: `https://api.openai.com/v1`
 - Default model: `gpt-5.4`
 - Default reasoning effort: `low`; a model or gateway that rejects the field is retried without it
-- Default timeout: 120 seconds
+- Default timeout: 120 seconds, per request
+- Default concurrency: 4. A throttled or failed request waits before its retry: as long as the provider asks, up to a minute, otherwise one and then two seconds
 - Kite normalizes base URLs that end in `/responses`, `/chat/completions`, or omit `/v1`
 
 ```bash
@@ -336,7 +358,7 @@ export KITE_OPENAI_TIMEOUT_SECS="120"
 
 **Manual fallback**
 
-If the AI is unavailable, interactive `kt land` asks for one manual commit message (leaving it blank aborts without changing history). `kt land --yes` and a `kt ship` that needs landing fail with the saves intact; rerun `kt land` interactively. A new `kt pr` uses a clean generic `## Summary` section populated from the branch's commit subjects without copying an unfilled repository template.
+If the AI is unavailable, interactive `kt land` asks for one manual commit message (leaving it blank aborts without changing history). `kt land --yes`, any `fine` or `per-save` land, and a `kt ship` that needs landing fail with the saves intact; rerun `kt land` interactively. A new `kt pr` uses a clean generic `## Summary` section populated from the branch's commit subjects without copying an unfilled repository template.
 
 The failure it shows is the endpoint's own message — a rejected key, an unknown model, a schema the endpoint will not accept — so a misconfigured setup is diagnosable rather than just "the AI never works". Requests that cannot succeed on a retry are not retried.
 

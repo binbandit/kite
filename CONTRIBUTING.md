@@ -29,12 +29,15 @@ The daily and manually dispatched release checks publish a new release only when
 | `src/git.rs` | Git subprocesses, refs, saved history, and exact file paths |
 | `src/land.rs` | Plan, preview, and execute a local land |
 | `src/land/commits.rs` | Build commit groups and check hook edits stay within their files |
+| `src/land/windows.rs` | Cut saves into windows and plan them concurrently for `--granularity` |
+| `src/land/replay.rs` | Build windowed lands in a private checkout, one window at a time |
 | `src/land/state.rs` | Persist the transaction and read older recovery markers |
 | `src/land/recovery.rs` | Undo saves and lands; recover interrupted operations |
 | `src/land/stash.rs` | Preserve and restore uncommitted work during dirty lands |
 | `src/land/publish.rs` | Publish with explicit protection for remote work |
 | `src/ai.rs` | AI configuration, requests, retries, and response extraction |
 | `src/synth.rs` | Commit planning prompt and validated file groups |
+| `src/synth/messages.rs` | One message per save for `--granularity per-save` |
 | `src/diff.rs` | Changed files and bounded diff context |
 | `src/pr.rs` | PR lookup, drafting, preview, and creation or refresh |
 | `src/pr/guidance.rs` | Find PR templates and dedicated writing skills |
@@ -42,7 +45,7 @@ The daily and manually dispatched release checks publish a new release only when
 | `tests/` | Tests that run the actual CLI against disposable repositories |
 | `.github/scripts/` | Release metadata preparation and its tests |
 
-Focused tests usually live beside the code. Landing's larger test collection is in `src/land/tests.rs`. Shared unit-test repository helpers live in `src/test_support.rs`.
+Focused tests usually live beside the code. Landing's larger test collection is in `src/land/tests.rs`, with lands that follow history in `src/land/history_tests.rs`. Shared unit-test repository helpers live in `src/test_support.rs`.
 
 ## Make a change
 
@@ -51,7 +54,7 @@ For a bug, first reproduce the user's sequence with the CLI and inspect the resu
 The important promises are concrete:
 
 - A failed hook returns users to their original branch or detached commit with every save intact. Keep hook edits so users can save and retry.
-- Landing preserves the saved file tree except for changes committed by successful hooks to the current group's files. Check staging before and after hooks so another group's files cannot slip in. AI suggests messages and file groups; Git state and file coverage stay under program control.
+- Landing preserves the saved file tree except for changes committed by successful hooks to the current group's files. A land that follows history also ends every window on its last save's tree, and builds it in a private checkout rather than the user's files. Check staging before and after hooks so another group's files cannot slip in. AI suggests messages and file groups; Git state and file coverage stay under program control.
 - Record recovery information before changing history or stashing work. A crash must leave enough information for `kt undo`.
 - Ref changes use the expected old commit. New work from another process or person must survive.
 

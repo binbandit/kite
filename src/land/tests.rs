@@ -18,7 +18,7 @@ fn detached_worktree(repo: &std::path::Path, revision: &str) -> (TempDir, std::p
     (holder, checkout)
 }
 
-fn collect_land_scope_in_repo(
+pub(super) fn collect_land_scope_in_repo(
     repo: &std::path::Path,
     allow_dirty: bool,
 ) -> Result<Option<LandScope>> {
@@ -33,7 +33,7 @@ fn execute_land_in_repo(
     with_repo_cwd(repo, || execute_land(base, commits, Hooks::Run))
 }
 
-fn undo_in_repo(repo: &std::path::Path) -> Result<()> {
+pub(super) fn undo_in_repo(repo: &std::path::Path) -> Result<()> {
     with_repo_cwd(repo, undo)
 }
 
@@ -69,7 +69,7 @@ fn files_commit(message: &str, files: &[&str]) -> CommitGroup {
     }
 }
 
-fn install_pre_commit_hook(repo: &std::path::Path, script: &str) {
+pub(super) fn install_pre_commit_hook(repo: &std::path::Path, script: &str) {
     write_file(repo, ".git/hooks/pre-commit", script);
     #[cfg(unix)]
     {
