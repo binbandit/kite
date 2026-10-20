@@ -753,3 +753,331 @@ fn rejected_hook_returns_to_original_branch_and_can_retry_without_recreating_wor
     assert_eq!(git(&repo.path, &["branch", "--list", "kite-landing-*"]), "");
     assert!(repo.path.join("node_modules/installed.txt").is_file());
 }
+
+/// Answers planning requests the way a model would, several at a time: one
+/// commit per window holding all its files, or one message per save.
+struct FakeModel {
+    address: std::net::SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    server: std::thread::JoinHandle<usize>,
+}
+
+impl FakeModel {
+    fn start(status: u16) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopping = std::sync::Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let mut answering = Vec::new();
+            while !stopping.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        answering.push(std::thread::spawn(move || answer(stream, status)))
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            let answered = answering.len();
+            for thread in answering {
+                thread.join().unwrap();
+            }
+            answered
+        });
+        Self {
+            address,
+            stop,
+            server,
+        }
+    }
+
+    fn land(&self, repo: &Path, args: &[&str]) -> Output {
+        kt(repo, args)
+            .env("KITE_OPENAI_URL", format!("http://{}", self.address))
+            .env("KITE_OPENAI_API_KEY", "local-test-key")
+            .env("KITE_OPENAI_TIMEOUT_SECS", "10")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    /// How many requests were made.
+    fn finish(self) -> usize {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.server.join().unwrap()
+    }
+}
+
+fn answer(stream: TcpStream, status: u16) {
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(&stream);
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap();
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let context: serde_json::Value =
+        serde_json::from_str(request["input"].as_str().unwrap()).unwrap();
+
+    let reply = if let Some(saves) = context["saves"].as_array() {
+        let messages: Vec<serde_json::Value> = saves
+            .iter()
+            .map(|save| {
+                serde_json::json!({
+                    "id": save["id"],
+                    "message": format!("feat: change {}", save["changed_files"][0].as_str().unwrap()),
+                })
+            })
+            .collect();
+        serde_json::json!({ "messages": messages })
+    } else {
+        let message = match context["history_slice"]["position"].as_u64() {
+            Some(position) => format!("feat: window {position}"),
+            None => "feat: landed".to_string(),
+        };
+        serde_json::json!({"groups": [{"message": message, "files": context["changed_files"]}]})
+    };
+    let body = match status {
+        200 => serde_json::json!({ "output_text": reply.to_string() }).to_string(),
+        _ => serde_json::json!({ "error": { "message": "Incorrect API key." } }).to_string(),
+    };
+    let mut stream = stream;
+    write!(
+        stream,
+        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+}
+
+/// One save per entry, each touching its own file and a shared one, made at
+/// the given number of minutes after an arbitrary start.
+fn timed_saves(repo: &Path, minutes: &[i64]) -> Vec<String> {
+    minutes
+        .iter()
+        .enumerate()
+        .map(|(index, minute)| {
+            write_file(repo, &format!("work/step_{index:02}.txt"), "done\n");
+            write_file(repo, "shared.txt", &format!("after step {index}\n"));
+            git(repo, &["add", "-A"]);
+            let date = format!("@{} +0000", 1_790_000_000 + minute * 60);
+            let committed = Command::new("git")
+                .args(["commit", "-qm", &format!("[kite] save {index}")])
+                .env("GIT_COMMITTER_DATE", &date)
+                .env("GIT_AUTHOR_DATE", &date)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert_success(&committed);
+            git(repo, &["rev-parse", "HEAD"]).trim().to_string()
+        })
+        .collect()
+}
+
+fn tree_of(repo: &Path, revision: &str) -> String {
+    git(repo, &["rev-parse", &format!("{revision}^{{tree}}")])
+}
+
+/// Trees of the commits on top of `base`, oldest first.
+fn landed_trees(repo: &Path, base: &str) -> Vec<String> {
+    git(
+        repo,
+        &["log", "--reverse", "--format=%T", &format!("{base}..HEAD")],
+    )
+    .lines()
+    .map(|tree| format!("{tree}\n"))
+    .collect()
+}
+
+#[test]
+fn a_fine_land_follows_the_history_in_windows() {
+    let repo = init_repo();
+    let base = git(&repo.path, &["rev-parse", "HEAD"]).trim().to_string();
+    // Ten saves a minute apart, a two-hour pause, then a busy stretch that
+    // outgrows one window.
+    let minutes: Vec<i64> = (0..10).chain((0..20).map(|minute| 130 + minute)).collect();
+    let saves = timed_saves(&repo.path, &minutes);
+    let branch = git(&repo.path, &["symbolic-ref", "HEAD"]);
+
+    let model = FakeModel::start(200);
+    let output = model.land(&repo.path, &["land", "--yes", "--granularity", "fine"]);
+    let requests = model.finish();
+    assert_success(&output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Plan: 30 saves → 3 commits in 3 windows"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Saves 11-22"), "{stdout}");
+    assert_eq!(requests, 3);
+    assert_eq!(
+        git(
+            &repo.path,
+            &["log", "--reverse", "--format=%s", &format!("{base}..HEAD")]
+        ),
+        "feat: window 1\nfeat: window 2\nfeat: window 3\n"
+    );
+    // Each commit is exactly the save its window ends on.
+    assert_eq!(
+        landed_trees(&repo.path, &base),
+        [&saves[9], &saves[21], &saves[29]].map(|save| tree_of(&repo.path, save))
+    );
+    assert_eq!(git(&repo.path, &["symbolic-ref", "HEAD"]), branch);
+    assert_eq!(git(&repo.path, &["status", "--porcelain"]), "");
+    assert_eq!(git(&repo.path, &["worktree", "list"]).lines().count(), 1);
+
+    assert_success(&kt(&repo.path, &["undo"]).output().unwrap());
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]).trim(), saves[29]);
+}
+
+#[test]
+fn a_per_save_land_keeps_every_save_and_rewrites_its_message() {
+    let repo = init_repo();
+    let base = git(&repo.path, &["rev-parse", "HEAD"]).trim().to_string();
+    let minutes: Vec<i64> = (0..10).collect();
+    let saves = timed_saves(&repo.path, &minutes);
+    write_file(&repo.path, "pending.txt", "uncommitted work\n");
+
+    let model = FakeModel::start(200);
+    let output = model.land(
+        &repo.path,
+        &[
+            "land",
+            "-y",
+            "-g",
+            "per-save",
+            "--allow-dirty",
+            "--tag",
+            "PROJ-7",
+        ],
+    );
+    let requests = model.finish();
+    assert_success(&output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Plan: 10 saves → 10 commits, one per save"),
+        "{stdout}"
+    );
+    // Eight saves fit one request; the other two take a second.
+    assert_eq!(requests, 2);
+    assert_eq!(
+        landed_trees(&repo.path, &base),
+        saves
+            .iter()
+            .map(|save| tree_of(&repo.path, save))
+            .collect::<Vec<_>>()
+    );
+    let subjects = git(
+        &repo.path,
+        &["log", "--reverse", "--format=%s", &format!("{base}..HEAD")],
+    );
+    assert_eq!(
+        subjects.lines().next(),
+        Some("feat: change shared.txt [PROJ-7]"),
+        "{subjects}"
+    );
+    assert!(!subjects.contains("[kite] save"), "{subjects}");
+    assert_eq!(
+        std::fs::read_to_string(repo.path.join("pending.txt")).unwrap(),
+        "uncommitted work\n"
+    );
+}
+
+#[test]
+fn a_fine_land_without_ai_fails_cleanly_and_asks_for_nothing() {
+    let repo = init_repo();
+    let saves = timed_saves(&repo.path, &[0, 1, 2]);
+
+    for args in [
+        &["land", "-g", "fine"][..],
+        &["land", "--yes", "-g", "per-save"],
+    ] {
+        let model = FakeModel::start(401);
+        let output = model.land(&repo.path, args);
+        model.finish();
+
+        assert!(!output.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("AI planning failed for saves"), "{stderr}");
+        assert!(stderr.contains("check the API key"), "{stderr}");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("commit message"),
+            "a windowed land must not fall back to one manual message"
+        );
+        assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]).trim(), saves[2]);
+        assert_eq!(git(&repo.path, &["status", "--porcelain"]), "");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interrupted_fine_land_recovers_with_undo() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+
+    let repo = init_repo();
+    let saves = timed_saves(&repo.path, &[0, 1, 2, 3]);
+    let branch = git(&repo.path, &["symbolic-ref", "HEAD"]);
+    let ready = repo.path.join(".git/kite-test-hook-ready");
+    let hook = repo.path.join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\n: > \"$KITE_TEST_READY\"\nwhile :; do sleep 1; done\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let model = FakeModel::start(200);
+    let child = kt(&repo.path, &["land", "--yes", "-g", "fine"])
+        .env("KITE_OPENAI_URL", format!("http://{}", model.address))
+        .env("KITE_OPENAI_API_KEY", "local-test-key")
+        .env("KITE_TEST_READY", &ready)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ready.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let killed = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .output()
+        .unwrap();
+    child.wait_with_output().unwrap();
+    model.finish();
+    assert!(ready.exists(), "the land never reached its commit hook");
+    assert_success(&killed);
+    std::fs::remove_file(hook).unwrap();
+
+    // The private checkout outlived the process; recovery removes it.
+    assert_eq!(git(&repo.path, &["worktree", "list"]).lines().count(), 2);
+    let blocked = kt(&repo.path, &[]).output().unwrap();
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("kt undo"));
+    assert_success(&kt(&repo.path, &["undo"]).output().unwrap());
+
+    assert_eq!(git(&repo.path, &["symbolic-ref", "HEAD"]), branch);
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]).trim(), saves[3]);
+    assert_eq!(git(&repo.path, &["status", "--porcelain"]), "");
+    assert_eq!(git(&repo.path, &["worktree", "list"]).lines().count(), 1);
+    assert_eq!(git(&repo.path, &["branch", "--list", "kite-landing-*"]), "");
+}

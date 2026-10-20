@@ -23,7 +23,7 @@
 - The normal recommended workflow is still to let Kite quicksave everything; staged-only quicksaves are an explicit override.
 - Disable all commit hooks with a command-local `core.hooksPath` override.
 
-### `kt land [--push|-p] [--yes|-y] [--allow-dirty] [--tag|-t <tag>] [--no-verify]`
+### `kt land [--push|-p] [--yes|-y] [--allow-dirty] [--tag|-t <tag>] [--no-verify] [--granularity|-g coarse|fine|per-save]`
 
 - Require an existing `HEAD` commit. If the repo has no commits yet, Kite prints a warning and exits.
 - By default, require a clean working tree. If the user still has WIP changes, they should `kt` them first or stash them.
@@ -53,6 +53,14 @@
 - Rewrite history locally by default.
 - If `--push` is passed, publish immediately after a successful local land.
 - If AI misses files, they land in a final `chore: unclassified updates` commit rather than being dropped.
+- `--granularity` chooses how finely saves become commits; the final tree is the saved tip at every setting, apart from committed hook changes.
+  - `coarse` (default) plans all saved changes at once, as described above.
+  - `fine` cuts the saves into windows of consecutive saves: at a pause of 30 minutes or more, or once a window reaches 12 saves, 5,000 changed lines, or 300 changed files. A single larger save is a window of its own. Each window is planned on its own and lands as one or more commits, in order, ending on the exact tree of its last save. A window whose saves cancel out lands nothing.
+  - `per-save` keeps every save as its own commit with its exact tree and writes it a message. Up to eight consecutive saves share one request, splitting one diff budget.
+  - Both send bounded requests, at most `KITE_OPENAI_CONCURRENCY` (default 4) at once, each with the normal timeout, retries, and file-coverage repair; progress shows while they run. Any failed request stops the land with no history changed and no manual-message fallback, with or without `--yes`. The prompt tells the model which slice of the history it is planning.
+  - Both build commits in a private linked worktree under the system temp directory, named `kite-land-<transaction id>` and attached to the transaction branch. Hooks see each commit's files as saved; the user's worktree, index, and untracked or ignored files are not touched until the end, when a two-way `read-tree` updates only files hooks changed, refusing to overwrite one edited meanwhile. Committed hook edits carry into later windows that leave the file alone; unstaged hook edits are discarded with the private worktree. Each window is verified against its save, excusing only that window's committed hook changes.
+  - Hooks there cannot use untracked files from the user's worktree, such as installed dependencies, and may reject an earlier save that a later one fixed; the error names the saves and suggests `--no-verify` or a coarser granularity. The private worktree is removed when the land ends, and by `kt undo` after an interruption.
+  - The preview groups commits under the saves they come from and shows each commit's subject and file count, not its files or body.
 
 ### `kt publish` (alias: `kt push`)
 
@@ -81,13 +89,13 @@
 - The branch is already published when the preview appears. Declining prevents PR creation or editing, not the earlier push.
 - `--draft` creates a draft pull request and does not convert an existing PR. The base defaults to the existing PR's base when one exists, otherwise the repository default. `--base` overrides the default for new PRs; a mismatch with an existing PR's base is an error. Multiple matching open PRs also stop the command.
 
-### `kt ship [--draft] [--base <branch>] [--tag|-t <tag>] [--no-verify]`
+### `kt ship [--draft] [--base <branch>] [--tag|-t <tag>] [--no-verify] [--granularity|-g coarse|fine|per-save]`
 
 - Combine quicksave, land, publish, and PR creation or refresh. Equivalent workflow to `kt && kt land -yp && kt pr -y`, but validate the PR destination before saving and publish once through the PR step after checking the landed history.
 - Automatically accept land and PR previews; there is no `--yes` flag. Keep the normal hooks, explicit push leases, and confirmation before discarding remote non-save commits.
 - Require an existing commit, `origin`, an attached branch other than the PR base, and working GitHub access. Reuse `kt pr` destination, fork, existing-PR, and base validation.
 - Use the ordinary quicksave rules. An existing staged subset is respected; leftover changes block landing. There is no `--allow-dirty` option.
-- Land with `--yes`. Forward `--tag` and `--no-verify` to landing, and `--draft` and `--base` to PR handling. `--no-verify` does not skip pre-push hooks.
+- Land with `--yes`. Forward `--tag`, `--no-verify`, and `--granularity` to landing, and `--draft` and `--base` to PR handling. `--no-verify` does not skip pre-push hooks.
 - Stop at the first error; completed steps remain. AI planning errors leave the quicksave intact and require interactive `kt land` for manual messages. Failed publication leaves local commits; failed PR writes may leave a published branch. After fixing the cause, rerun `kt ship` or the remaining command.
 - Clean saves and lands with no pending saves are no-ops, so shipping can resume after a partial success or refresh an existing PR. Buried saves or no commits relative to the base stop before publishing.
 - Never merge the PR. `kt undo` handles the saved or landed history as usual and does not remove the PR.
@@ -116,10 +124,12 @@
 - API key: `KITE_OPENAI_API_KEY`, `OPENAI_API_KEY`, `KITE_API_KEY`, `OPENAI_KEY`, `AI_GATEWAY_API_KEY`
 - Reasoning effort: `KITE_OPENAI_REASONING_EFFORT`
 - Timeout: `KITE_OPENAI_TIMEOUT_SECS`
+- Concurrency for `fine` and `per-save` lands: `KITE_OPENAI_CONCURRENCY`
 - Default base URL: `https://api.openai.com/v1`
 - Default model: `gpt-5.4`
 - Default reasoning effort: `low`, dropped and retried when a model or gateway rejects it
-- Default timeout: 120 seconds
+- Default timeout: 120 seconds per request
+- Default concurrency: 4. Throttled or failed requests wait before retrying: the provider's `retry-after-ms` or `retry-after`, up to a minute, otherwise one and then two seconds
 - Kite normalizes base URLs before calling `/responses`:
   - strips a trailing `/responses`
   - strips a trailing `/chat/completions`

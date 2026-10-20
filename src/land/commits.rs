@@ -66,7 +66,7 @@ pub(super) fn verify_saved_tree(saved: &str, hook_changes: &HashSet<String>) -> 
     Ok(())
 }
 
-fn changed_paths(before: &str, after: &str) -> Result<Vec<String>> {
+pub(super) fn changed_paths(before: &str, after: &str) -> Result<Vec<String>> {
     Ok(execute_git(&[
         "diff",
         "--no-ext-diff",

@@ -2,6 +2,7 @@ use anyhow::Result;
 use colored::*;
 use std::io::{self, IsTerminal, Write};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -11,21 +12,28 @@ const SPINNER_TICK: Duration = Duration::from_millis(80);
 /// Terminal-only activity indicator. Dropping it stops the animation and
 /// clears its line, including on early returns through `?`.
 pub(crate) struct Spinner {
+    message: Arc<Mutex<String>>,
     animation: Option<(Sender<()>, JoinHandle<()>)>,
 }
 
 impl Spinner {
     pub(crate) fn start(message: impl Into<String>) -> Self {
+        let message = Arc::new(Mutex::new(message.into()));
         if !io::stdout().is_terminal() {
-            return Self { animation: None };
+            return Self {
+                message,
+                animation: None,
+            };
         }
 
-        let message = message.into();
+        let shown = Arc::clone(&message);
         // Dropping the sender wakes the animation thread immediately.
         let (stop, stopped) = mpsc::channel();
         let animation = std::thread::spawn(move || {
             for frame in SPINNER_FRAMES.iter().cycle() {
-                print!("\r{} {}... ", frame.cyan(), message);
+                let text = shown.lock().map(|text| text.clone()).unwrap_or_default();
+                // Clear the rest of the line in case the text got shorter.
+                print!("\r{} {}... \x1b[K", frame.cyan(), text);
                 let _ = io::stdout().flush();
                 match stopped.recv_timeout(SPINNER_TICK) {
                     Err(RecvTimeoutError::Timeout) => continue,
@@ -35,12 +43,58 @@ impl Spinner {
         });
 
         Self {
+            message,
             animation: Some((stop, animation)),
+        }
+    }
+
+    pub(crate) fn set_message(&self, message: impl Into<String>) {
+        if let Ok(mut text) = self.message.lock() {
+            *text = message.into();
         }
     }
 
     pub(crate) fn stop(self) {
         drop(self);
+    }
+}
+
+/// Counts the finished parts of a long task. A terminal shows the count on
+/// the spinner line; other output gets a line for each tenth of the work, so
+/// logs show it moving without one line per part.
+pub(crate) struct Progress {
+    spinner: Spinner,
+    label: String,
+    total: usize,
+    done: usize,
+    interactive: bool,
+}
+
+impl Progress {
+    pub(crate) fn start(label: impl Into<String>, total: usize) -> Self {
+        let label = label.into();
+        Self {
+            spinner: Spinner::start(format!("{label} 0/{total}")),
+            label,
+            total,
+            done: 0,
+            interactive: io::stdout().is_terminal(),
+        }
+    }
+
+    pub(crate) fn advance(&mut self, by: usize) {
+        let before = self.tenths();
+        self.done += by;
+        let progress = format!("{} {}/{}", self.label, self.done, self.total);
+        if self.interactive {
+            self.spinner.set_message(progress);
+        } else if self.tenths() > before {
+            println!("{} {}", "·".dimmed(), progress.dimmed());
+        }
+    }
+
+    fn tenths(&self) -> usize {
+        (self.done * 10).checked_div(self.total).unwrap_or(10)
     }
 }
 

@@ -17,7 +17,7 @@ use crate::git::{
     Hooks, branch_to_publish, check_ref, configured_base_remote, execute_git, get_default_branch,
     has_remote, is_save_subject, repo_root,
 };
-use crate::land::{LandOptions, land, publish_current_branch};
+use crate::land::{Granularity, LandOptions, land, publish_current_branch};
 use crate::ui::{Spinner, confirm, pluralize, print_ai_unavailable};
 
 mod guidance;
@@ -156,7 +156,12 @@ pub(crate) async fn create_pull_request(options: PrOptions) -> Result<()> {
     create_prepared_pull_request(prepared, options).await
 }
 
-pub(crate) async fn ship(options: PrOptions, tag: Option<String>, hooks: Hooks) -> Result<()> {
+pub(crate) async fn ship(
+    options: PrOptions,
+    tag: Option<String>,
+    hooks: Hooks,
+    granularity: Granularity,
+) -> Result<()> {
     // Resolve the destination before saving or rewriting anything. Publishing
     // belongs to the PR step so an invalid PR history is never pushed first.
     let mut prepared = prepare_pull_request(&options)?;
@@ -167,6 +172,7 @@ pub(crate) async fn ship(options: PrOptions, tag: Option<String>, hooks: Hooks) 
         allow_dirty: false,
         tag,
         hooks,
+        granularity,
     })
     .await?;
     if branch_to_publish()? != prepared.branch {

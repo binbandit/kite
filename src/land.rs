@@ -3,8 +3,10 @@
 mod commits;
 mod publish;
 mod recovery;
+mod replay;
 mod stash;
 mod state;
+mod windows;
 use commits::{create_commits, verify_saved_tree};
 pub(crate) use publish::publish_current_branch;
 #[cfg(test)]
@@ -15,9 +17,12 @@ use recovery::{
 };
 pub(crate) use recovery::{recovery_blocks_commands, undo};
 use state::*;
+pub(crate) use windows::Granularity;
+use windows::{HistoryPlan, WindowPlan, plan_history, render_history_plan};
 
 use anyhow::{Context, Result, anyhow};
 use colored::*;
+use std::collections::HashSet;
 
 use crate::diff::ChangedFiles;
 use crate::git::{
@@ -47,6 +52,39 @@ pub(crate) struct LandOptions {
     pub(crate) allow_dirty: bool,
     pub(crate) tag: Option<String>,
     pub(crate) hooks: Hooks,
+    pub(crate) granularity: Granularity,
+}
+
+/// The commits a land will create.
+enum LandPlan {
+    /// Commits built from the saved tip, all at once.
+    Whole(Vec<CommitGroup>),
+    /// Commits that follow the saves in order, window by window.
+    History(HistoryPlan),
+}
+
+impl LandPlan {
+    fn commits_mut(&mut self) -> Box<dyn Iterator<Item = &mut CommitGroup> + '_> {
+        match self {
+            LandPlan::Whole(commits) => Box::new(commits.iter_mut()),
+            LandPlan::History(plan) => Box::new(plan.commits_mut()),
+        }
+    }
+
+    fn render(&self, save_count: usize) -> String {
+        match self {
+            LandPlan::Whole(commits) if commits.is_empty() => String::new(),
+            LandPlan::Whole(commits) => render_land_plan(commits, save_count),
+            LandPlan::History(plan) => render_history_plan(plan),
+        }
+    }
+
+    fn execute(&self, base: &KiteBase, hooks: Hooks) -> Result<()> {
+        match self {
+            LandPlan::Whole(commits) => execute_land(base, commits, hooks),
+            LandPlan::History(plan) => execute_windowed_land(base, &plan.windows, hooks),
+        }
+    }
 }
 
 pub(crate) async fn land(options: LandOptions) -> Result<()> {
@@ -56,6 +94,7 @@ pub(crate) async fn land(options: LandOptions) -> Result<()> {
         allow_dirty,
         tag,
         hooks,
+        granularity,
     } = options;
 
     let Some(status) = land_preflight(push)? else {
@@ -73,18 +112,12 @@ pub(crate) async fn land(options: LandOptions) -> Result<()> {
             return Ok(());
         };
 
-        let Some(mut commits) = plan_commits(&scope.files, auto_confirm).await? else {
+        let Some(mut plan) = plan_land(&scope, granularity, auto_confirm).await? else {
             return Ok(());
         };
-        if commits.is_empty() && scope.base == KiteBase::Root {
-            commits.push(CommitGroup {
-                message: EMPTY_INITIAL_MESSAGE.to_string(),
-                files: Vec::new(),
-            });
-        }
 
         if let Some(tag) = tag.as_deref().filter(|s| !s.trim().is_empty()) {
-            for commit in &mut commits {
+            for commit in plan.commits_mut() {
                 commit.message = append_tag_to_message(&commit.message, tag);
             }
         }
@@ -93,9 +126,7 @@ pub(crate) async fn land(options: LandOptions) -> Result<()> {
             let outcome = if scope.base == KiteBase::Root { "replace them with one empty initial commit" } else { "remove them" };
             println!("{} These {} cancel out; {outcome} without changing any files.", "·".cyan(), pluralize(scope.save_count, "save"));
         }
-        if !commits.is_empty() {
-            print!("{}", render_land_plan(&commits, scope.save_count));
-        }
+        print!("{}", plan.render(scope.save_count));
 
         let question = if push {
             "Rewrite history and publish?"
@@ -112,7 +143,7 @@ pub(crate) async fn land(options: LandOptions) -> Result<()> {
         {
             anyhow::bail!("HEAD changed while planning the land. No history was rewritten; run `kt land` again to review the current saves.");
         }
-        execute_land(&scope.base, &commits, hooks)?;
+        plan.execute(&scope.base, hooks)?;
 
         if push {
             println!("{} Landed", "✓".green());
@@ -150,6 +181,32 @@ pub(crate) async fn land(options: LandOptions) -> Result<()> {
     }
 
     land_result
+}
+
+/// Saves that cancel out need no AI at any granularity, so they keep the
+/// whole-stack plan and its empty-root handling.
+async fn plan_land(
+    scope: &LandScope,
+    granularity: Granularity,
+    auto_confirm: bool,
+) -> Result<Option<LandPlan>> {
+    if granularity != Granularity::Coarse && !scope.files.paths().is_empty() {
+        // No manual fallback: one hand-written message cannot stand in for a
+        // history of commits, and an error leaves the saves as they are.
+        return plan_history(&scope.base, scope.save_count, granularity)
+            .await
+            .map(|plan| Some(LandPlan::History(plan)));
+    }
+    let Some(mut commits) = plan_commits(&scope.files, auto_confirm).await? else {
+        return Ok(None);
+    };
+    if commits.is_empty() && scope.base == KiteBase::Root {
+        commits.push(CommitGroup {
+            message: EMPTY_INITIAL_MESSAGE.to_string(),
+            files: Vec::new(),
+        });
+    }
+    Ok(Some(LandPlan::Whole(commits)))
 }
 
 async fn plan_commits(
@@ -334,6 +391,37 @@ fn execute_land(base: &KiteBase, commits: &[CommitGroup], hooks: Hooks) -> Resul
         anyhow::bail!("Refusing to land an empty plan - that would discard the saves.");
     }
 
+    run_land_transaction(|pre_land_sha, transaction_ref| {
+        prepare_landing_head(base, pre_land_sha, transaction_ref)?;
+        // An unborn branch still needs one commit to represent an empty tree.
+        let empty_root = [CommitGroup {
+            message: EMPTY_INITIAL_MESSAGE.to_string(),
+            files: Vec::new(),
+        }];
+        let groups = if *base == KiteBase::Root && commits.is_empty() {
+            &empty_root
+        } else {
+            commits
+        };
+        create_commits(groups, hooks)
+    })
+}
+
+fn execute_windowed_land(base: &KiteBase, windows: &[WindowPlan], hooks: Hooks) -> Result<()> {
+    if windows.iter().all(|window| window.commits.is_empty()) {
+        anyhow::bail!("Refusing to land an empty plan - that would discard the saves.");
+    }
+
+    run_land_transaction(|pre_land_sha, transaction_ref| {
+        replay::land_windows(base, pre_land_sha, transaction_ref, windows, hooks)
+    })
+}
+
+/// Rewrites the saves inside one recorded transaction. `build` creates the
+/// landed commits on the transaction ref, given the pre-land `HEAD` and that
+/// ref, and returns the files commit hooks changed. Whatever it leaves
+/// behind, a failure puts the user back where they started.
+fn run_land_transaction(build: impl FnOnce(&str, &str) -> Result<HashSet<String>>) -> Result<()> {
     // Most callers pass through preflight, but keep the history-mutating core
     // safe when invoked directly by tests or future commands.
     ensure_no_git_operation_in_progress("kt land")?;
@@ -367,18 +455,7 @@ fn execute_land(base: &KiteBase, commits: &[CommitGroup], hooks: Hooks) -> Resul
     )?;
 
     let rewrite = (|| -> Result<()> {
-        prepare_landing_head(base, pre_land_sha.trim(), &transaction_ref)?;
-        // An unborn branch still needs one commit to represent an empty tree.
-        let empty_root = [CommitGroup {
-            message: EMPTY_INITIAL_MESSAGE.to_string(),
-            files: Vec::new(),
-        }];
-        let groups = if *base == KiteBase::Root && commits.is_empty() {
-            &empty_root
-        } else {
-            commits
-        };
-        let hook_changes = create_commits(groups, hooks)?;
+        let hook_changes = build(pre_land_sha.trim(), &transaction_ref)?;
         verify_saved_tree(pre_land_sha.trim(), &hook_changes)?;
         stash::record_landed_head(execute_git(&["rev-parse", "HEAD"])?.trim())?;
         finalize_landed_head(&target, pre_land_sha.trim(), &transaction_ref)?;
@@ -478,5 +555,7 @@ fn finalize_landed_head(target: &Head, pre_land_sha: &str, transaction_ref: &str
     Ok(())
 }
 
+#[cfg(test)]
+mod history_tests;
 #[cfg(test)]
 mod tests;

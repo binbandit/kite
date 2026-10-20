@@ -36,6 +36,11 @@ impl ChangedFiles {
     pub(crate) fn render_diff(&self, budget: usize) -> String {
         render_diff(&self.diff, budget)
     }
+
+    /// Size of the full diff in bytes, before any compaction.
+    pub(crate) fn diff_len(&self) -> usize {
+        self.diff.len()
+    }
 }
 
 /// Fits a diff into `budget` bytes while keeping evidence of every change.
@@ -184,7 +189,7 @@ impl<'a> Section<'a> {
 
 /// Splits `budget` so no section gets more than it needs: small sections
 /// are satisfied first and the remainder is shared evenly by larger ones.
-fn fair_shares(sizes: &[usize], budget: usize) -> Vec<usize> {
+pub(crate) fn fair_shares(sizes: &[usize], budget: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..sizes.len()).collect();
     order.sort_by_key(|&index| sizes[index]);
     let mut shares = vec![0; sizes.len()];

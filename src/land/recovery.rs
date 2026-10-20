@@ -1,5 +1,6 @@
 //! Undo saves and lands, or finish recovery after an interrupted command.
 
+use super::replay::remove_abandoned_checkout;
 use super::{stash, state::*};
 use crate::git::{
     DETACHED_TARGET, Head, active_git_operation, check_ref, current_worktree_key, execute_git,
@@ -130,6 +131,8 @@ pub(super) fn recover_interrupted_land() -> Result<bool> {
     } else {
         Head::Branch(land.target.clone())
     };
+    // A windowed land may have left its private checkout behind.
+    remove_abandoned_checkout(&land.transaction_ref);
     restore_head(&restore_target, &land.pre_land_sha, &land.transaction_ref)
         .context("Could not recover the interrupted land")?;
     restore_previous_marker(&transaction).context(

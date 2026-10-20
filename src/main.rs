@@ -20,7 +20,9 @@ use crate::git::{
     get_default_branch, has_remote, has_staged_changes, has_unmerged_paths,
     is_inside_git_repository, kite_save_stack, lock_current_worktree,
 };
-use crate::land::{LandOptions, land, publish_current_branch, recovery_blocks_commands, undo};
+use crate::land::{
+    Granularity, LandOptions, land, publish_current_branch, recovery_blocks_commands, undo,
+};
 use crate::pr::{PrOptions, create_pull_request, ship};
 use crate::ui::{Spinner, pluralize};
 
@@ -67,6 +69,9 @@ enum Commands {
         /// Skip Git hooks while creating the landed commits
         #[arg(long)]
         no_verify: bool,
+        /// How finely to split the saves into commits
+        #[arg(short = 'g', long, value_enum, default_value_t)]
+        granularity: Granularity,
     },
     /// Publish the current branch after reviewing local history
     #[command(visible_alias = "push")]
@@ -101,6 +106,9 @@ Stops on failure. Remote-history replacement still requires confirmation."
         /// Skip Git hooks while creating the landed commits
         #[arg(long)]
         no_verify: bool,
+        /// How finely to split the saves into commits
+        #[arg(short = 'g', long, value_enum, default_value_t)]
+        granularity: Granularity,
     },
     /// Undo the last quicksave, or the last land when there is no quicksave
     Undo,
@@ -146,12 +154,14 @@ fn run(cli: Cli) -> Result<()> {
             yes,
             tag,
             no_verify,
+            granularity,
         }) => block_on(land(LandOptions {
             push,
             yes,
             allow_dirty,
             tag,
             hooks: if no_verify { Hooks::Skip } else { Hooks::Run },
+            granularity,
         })),
         Some(Commands::Publish) => publish_current_branch(),
         Some(Commands::Pr { draft, base, yes }) => {
@@ -162,6 +172,7 @@ fn run(cli: Cli) -> Result<()> {
             base,
             tag,
             no_verify,
+            granularity,
         }) => block_on(ship(
             PrOptions {
                 draft,
@@ -170,6 +181,7 @@ fn run(cli: Cli) -> Result<()> {
             },
             tag,
             if no_verify { Hooks::Skip } else { Hooks::Run },
+            granularity,
         )),
         Some(Commands::Undo) => undo(),
     }
@@ -693,6 +705,32 @@ mod tests {
         assert!(!push);
         assert!(yes);
         assert_eq!(tag.as_deref(), Some("PROJ-1"));
+    }
+
+    #[test]
+    fn granularity_defaults_to_coarse_and_reaches_land_and_ship() {
+        let granularity = |args: &[&str]| match Cli::parse_from(args).command {
+            Some(Commands::Land { granularity, .. } | Commands::Ship { granularity, .. }) => {
+                granularity
+            }
+            _ => panic!("`{}` should parse as land or ship", args.join(" ")),
+        };
+
+        assert_eq!(granularity(&["kt", "land"]), Granularity::Coarse);
+        assert_eq!(
+            granularity(&["kt", "land", "-g", "fine"]),
+            Granularity::Fine
+        );
+        assert_eq!(
+            granularity(&["kt", "land", "--granularity", "per-save"]),
+            Granularity::PerSave
+        );
+        assert_eq!(granularity(&["kt", "ship"]), Granularity::Coarse);
+        assert_eq!(
+            granularity(&["kt", "ship", "-g", "fine"]),
+            Granularity::Fine
+        );
+        assert!(Cli::try_parse_from(["kt", "land", "-g", "tiny"]).is_err());
     }
 
     #[test]

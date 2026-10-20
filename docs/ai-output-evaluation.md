@@ -26,6 +26,18 @@ The commands use the configured AI provider. No live model calls run as part of 
 
 A single commit is often the right answer. More commits do not earn more credit.
 
+## History cases
+
+`kt land --granularity fine` plans each window of saves separately, with a `history_slice` telling the model which part of the history it sees; `--granularity per-save` asks for one message per save, several saves per request. Compare their previews the same way, answering **no** at confirmation, on a disposable copy of a long save history.
+
+| Case | Repository context and change | A good plan | Reject |
+| --- | --- | --- | --- |
+| Slice of a feature | A window's saves add half of a settings screen; later windows finish it. | Commits describing what this window adds, such as `feat(settings): add the account section`. | Subjects claiming the whole feature, or bodies listing work from other windows. |
+| Interleaved agents | One window mixes saves from two agents: a git status fix with its test, and an unrelated sidebar restyle. | Two commits, each with its own files. | One commit naming only one of the changes, or a split that separates the fix from its test. |
+| Consecutive saves | Per-save messages for three saves that iterate on one parser: add it, handle empty input, rename a helper. | Three distinct messages, one per save, in order. | The same subject repeated, or a message describing a neighbouring save's change. |
+
+Across a whole land, also check that subjects do not repeat between windows and that the commit count reads as a history rather than one commit per file.
+
 ## PR draft cases
 
 | Case | Repository context and change | A good draft | Reject |
