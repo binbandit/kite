@@ -705,7 +705,7 @@ fn render_land_plan_summarizes_a_commit_with_too_many_files() {
     assert!(plan.contains("     ├─ src/f0.rs\n"));
     assert!(plan.contains("     ├─ src/f11.rs\n"));
     assert!(!plan.contains("src/f12.rs"));
-    assert!(plan.contains("… and 18 more"));
+    assert!(plan.contains("     └─ … and 18 more\n"));
 }
 
 #[test]

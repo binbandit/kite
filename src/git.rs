@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 const MAX_COMMIT_FAILURE_LINES: usize = 12;
-const LOG_PAGE_SIZE: usize = 100;
+const FIRST_LOG_PAGE_SIZE: usize = 100;
 
 pub(crate) const SAVE_PREFIX: &str = "[kite] save";
 
@@ -815,32 +815,40 @@ pub(crate) fn recent_commit_style_examples(limit: usize) -> Vec<String> {
     examples
 }
 
-/// Walks history from `HEAD` in pages until the first non-Kite commit, so huge
-/// repositories never pay for a full `git log`. `--first-parent` keeps the walk
-/// on the branch's own line of development: without it a merged-in side branch
-/// can interleave by commit date and move the base onto an unrelated commit,
-/// which would make `kt land` rewrite more history than the user's saves.
+/// Walks history from `HEAD` in pages until the first non-Kite commit, so
+/// huge repositories never pay for a full `git log`. `--first-parent` keeps the
+/// walk on the branch's own line of development: without it a merged-in side
+/// branch can interleave by commit date and move the base onto an unrelated
+/// commit, which would make `kt land` rewrite more history than the user's
+/// saves.
 pub(crate) fn kite_save_stack() -> Result<Option<SaveStack>> {
-    let mut count = 0;
+    save_stack_in_pages(FIRST_LOG_PAGE_SIZE)
+}
 
-    for page in 0.. {
-        let skip = (page * LOG_PAGE_SIZE).to_string();
-        let max = LOG_PAGE_SIZE.to_string();
-        let output = match execute_git(&[
-            "log",
-            "--first-parent",
-            "--format=%H %s",
-            "-n",
-            &max,
-            "--skip",
-            &skip,
-        ]) {
+/// Each page resumes from the last commit already read and is twice the size
+/// of the one before. Restarting every page at `HEAD` with `--skip` would
+/// re-walk all the saves above it, which grows with the square of a tall stack
+/// and costs a process per hundred saves.
+fn save_stack_in_pages(first_page_size: usize) -> Result<Option<SaveStack>> {
+    let mut count = 0;
+    let mut page_size = first_page_size;
+    let mut last_read: Option<String> = None;
+
+    loop {
+        let max = page_size.to_string();
+        let mut args = vec!["log", "--first-parent", "--format=%H %s", "-n", &max];
+        if let Some(hash) = &last_read {
+            args.extend(["--skip", "1", hash]);
+        }
+        args.push("--");
+        let output = match execute_git(&args) {
             Ok(output) => output,
-            Err(_) if page == 0 => return Ok(None), // no commits yet
+            Err(_) if last_read.is_none() => return Ok(None), // no commits yet
             Err(error) => return Err(error),
         };
 
         let mut page_lines = 0;
+        let mut last_hash = None;
         for line in output.lines().filter(|line| !line.trim().is_empty()) {
             page_lines += 1;
             let Some((hash, subject)) = line.split_once(' ') else {
@@ -849,6 +857,7 @@ pub(crate) fn kite_save_stack() -> Result<Option<SaveStack>> {
 
             if is_save_subject(subject) {
                 count += 1;
+                last_hash = Some(hash);
             } else if count == 0 {
                 return Ok(None);
             } else {
@@ -859,9 +868,11 @@ pub(crate) fn kite_save_stack() -> Result<Option<SaveStack>> {
             }
         }
 
-        if page_lines < LOG_PAGE_SIZE {
+        if page_lines < page_size {
             break; // reached the root commit
         }
+        last_read = last_hash.map(str::to_string);
+        page_size *= 2;
     }
 
     if count > 0 {
@@ -877,7 +888,9 @@ pub(crate) fn kite_save_stack() -> Result<Option<SaveStack>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{acquire_cwd_lock, git, init_repo, with_repo_cwd, write_file};
+    use crate::test_support::{
+        TempDir, acquire_cwd_lock, git, init_repo, with_repo_cwd, write_file,
+    };
 
     #[test]
     fn compact_command_output_keeps_last_lines_and_truncates_noise() {
@@ -1288,6 +1301,54 @@ mod tests {
 
         assert_eq!(stack.count, 2);
         assert_eq!(stack.base, KiteBase::Commit(base_sha.trim().to_string()));
+    }
+
+    #[test]
+    fn save_stack_pages_resume_without_recounting_saves() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        let base_sha = git(&repo.path, &["rev-parse", "HEAD"]);
+        for save in 0..5 {
+            git(
+                &repo.path,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    &format!("[kite] save {save}"),
+                ],
+            );
+        }
+
+        // Pages of 1, 2 and 4 cross two resumptions before reaching the base.
+        let stack = with_repo_cwd(&repo.path, || save_stack_in_pages(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stack.count, 5);
+        assert_eq!(stack.base, KiteBase::Commit(base_sha.trim().to_string()));
+
+        // A stack down to the root fills its pages exactly, so the last page
+        // resumes from the root commit and finds nothing past it.
+        let root = TempDir::new("kite-root-saves");
+        git(&root.path, &["init"]);
+        git(&root.path, &["config", "user.name", "Kite Test"]);
+        git(&root.path, &["config", "user.email", "kite@example.com"]);
+        for save in 0..3 {
+            git(
+                &root.path,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    &format!("[kite] save {save}"),
+                ],
+            );
+        }
+        let stack = with_repo_cwd(&root.path, || save_stack_in_pages(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stack.count, 3);
+        assert_eq!(stack.base, KiteBase::Root);
     }
 
     #[test]

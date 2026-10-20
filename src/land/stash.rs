@@ -97,6 +97,10 @@ pub(super) fn restore() -> Result<bool> {
     let Some(stash) = find_stash(&pending)? else {
         // Stashing never completed, or the user already restored its entry.
         fs::remove_file(path)?;
+        println!(
+            "{} The interrupted land left no stashed work to restore; cleared its marker",
+            "·".yellow()
+        );
         return Ok(true);
     };
     let original_tree = execute_git(&["rev-parse", "HEAD^{tree}"])?.trim() == pending.tree;
