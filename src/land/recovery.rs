@@ -7,7 +7,7 @@ use crate::git::{
     has_head_commit, has_remote, head_position, head_symbolic_ref, is_ancestor, is_save_subject,
     short_sha,
 };
-use crate::ui::{Spinner, confirm, pluralize};
+use crate::ui::{Spinner, confirm, flatten_error, pluralize};
 use anyhow::{Context, Result};
 use colored::*;
 
@@ -43,7 +43,7 @@ pub(crate) fn undo() -> Result<()> {
     }
 
     if !has_head_commit() {
-        println!("{} Nothing to undo — no commits yet", "·".yellow());
+        println!("{} Nothing to undo - no commits yet", "·".yellow());
         return Ok(());
     }
 
@@ -92,7 +92,7 @@ pub(super) fn undo_last_save(subject: &str) -> Result<()> {
         "{} Undid {} {}",
         "✓".green(),
         subject.bold(),
-        "— your changes are back in the working tree".dimmed()
+        "- your changes are back in the working tree".dimmed()
     );
     Ok(())
 }
@@ -141,7 +141,7 @@ pub(super) fn recover_interrupted_land() -> Result<bool> {
     let recovered_position = head_position().unwrap_or(restore_target);
 
     println!(
-        "{} Recovered interrupted land — back on {} with every save intact",
+        "{} Recovered interrupted land - back on {} with every save intact",
         "✓".green(),
         recovered_position.describe()
     );
@@ -155,7 +155,7 @@ pub(super) fn undo_last_land() -> Result<()> {
             println!(
                 "{} {}",
                 "·".yellow(),
-                "Nothing to undo — no quicksave on top and no land recorded".dimmed()
+                "Nothing to undo - no quicksave on top and no land recorded".dimmed()
             );
             return Ok(());
         }
@@ -191,39 +191,88 @@ pub(super) fn undo_last_land() -> Result<()> {
 
     restore_completed_land(&transaction)?;
     finish_completed_undo(&transaction)?;
+    println!("{} Restored pre-land saves", "✓".green());
 
+    // A detached land was never publishable, so only a branch can need this.
     if target != DETACHED_TARGET && has_remote() {
-        let branch = target;
-        let pre_land_sha = &transaction.land.pre_land_sha;
-        let spinner = Spinner::start("Reverting remote");
-        let reverted = execute_git(&[
-            "push",
-            &format!(
-                "--force-with-lease=refs/heads/{branch}:{}",
-                transaction.land.landed_head
-            ),
-            "origin",
-            &format!("{pre_land_sha}:refs/heads/{branch}"),
-        ]);
-        spinner.stop();
-        if reverted.is_err() {
+        revert_published_land(&target, &transaction.land);
+    }
+    Ok(())
+}
+
+/// Puts `origin` back on the saves when it holds exactly what this land
+/// published. A land that was never published leaves nothing to revert, and
+/// newer remote work is left alone. The lease rejects a remote that moved
+/// after the last fetch, so a stale tracking ref cannot authorize a clobber.
+fn revert_published_land(branch: &str, land: &CompletedLand) {
+    let remote = match remote_branch_tip(branch) {
+        Ok(Some(remote)) => remote,
+        Ok(None) => return,
+        Err(error) => {
             println!(
-                "{} Remote not reverted — it may have diverged",
-                "·".yellow()
+                "{} Could not check `origin/{branch}`, so it was left untouched: {}",
+                "!".yellow(),
+                flatten_error(&format!("{error:#}"))
+            );
+            return;
+        }
+    };
+    if remote != land.landed_head {
+        if is_ancestor(&land.landed_head, &remote) {
+            println!(
+                "{} `origin/{branch}` has commits on top of the land, so it was left untouched",
+                "!".yellow()
             );
         }
-    } else if has_remote() {
-        // Nothing to revert: a detached land was never publishable, so the
-        // remote cannot be holding the history it produced.
-        println!(
-            "{} {}",
-            "·".dimmed(),
-            "Remote untouched — a detached HEAD has no branch to revert".dimmed()
-        );
+        return;
     }
 
-    println!("{} Restored pre-land saves", "✓".green());
-    Ok(())
+    let spinner = Spinner::start(format!("Restoring origin/{branch}"));
+    let reverted = execute_git(&[
+        "push",
+        &format!(
+            "--force-with-lease=refs/heads/{branch}:{}",
+            land.landed_head
+        ),
+        "origin",
+        &format!("{}:refs/heads/{branch}", land.pre_land_sha),
+    ]);
+    spinner.stop();
+    match reverted {
+        Ok(_) => println!("{} Restored the saves on `origin/{branch}`", "✓".green()),
+        Err(error) => {
+            let detail = flatten_error(&format!("{error:#}"));
+            if detail.contains("stale info") {
+                println!(
+                    "{} `origin/{branch}` moved since it was last fetched, so it was left untouched",
+                    "!".yellow()
+                );
+            } else {
+                println!(
+                    "{} Could not restore `origin/{branch}`: {detail}",
+                    "!".yellow()
+                );
+            }
+        }
+    }
+}
+
+/// Where `origin` has `branch`, from its tracking ref when there is one.
+/// Without one, origin is asked directly: a fetch refspec limited to other
+/// branches never creates the ref, even after the land was published.
+fn remote_branch_tip(branch: &str) -> Result<Option<String>> {
+    if let Some(tracked) = check_ref(&format!("refs/remotes/origin/{branch}")) {
+        return Ok(Some(tracked));
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    let spinner = Spinner::start(format!("Checking origin/{branch}"));
+    let listed = execute_git(&["ls-remote", "origin", &branch_ref]);
+    spinner.stop();
+    // The pattern also matches longer names ending in it, so take the exact ref.
+    Ok(listed?.lines().find_map(|line| {
+        let (sha, name) = line.split_once('\t')?;
+        (name == branch_ref).then(|| sha.to_string())
+    }))
 }
 
 /// `refs/kite/pre_land` is a single repo-wide ref, so on its own it says
@@ -233,7 +282,7 @@ pub(super) fn undo_last_land() -> Result<()> {
 pub(super) fn guard_undo_target(head: &Head, recorded: &CompletedMarker) -> Result<String> {
     if recorded.target != head.land_key() {
         anyhow::bail!(
-            "The last land was on {}, but you are on {}. {} — undoing here would reset unrelated history.",
+            "The last land was on {}, but you are on {}. {} - undoing here would reset unrelated history.",
             describe_landed_target(&recorded.target),
             head.describe(),
             recover_landed_target(&recorded.target, Some(recorded.landed_head.as_str()))
@@ -292,7 +341,7 @@ pub(super) fn guard_undo_target(head: &Head, recorded: &CompletedMarker) -> Resu
     ))? {
         return Ok(current_head.trim().to_string());
     }
-    anyhow::bail!("Undo cancelled — nothing changed")
+    anyhow::bail!("Undo cancelled - nothing changed")
 }
 
 /// Claims a completed marker before moving any history. The CAS means a

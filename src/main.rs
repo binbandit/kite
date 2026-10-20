@@ -6,7 +6,9 @@ mod pr;
 mod synth;
 mod ui;
 
+// Shared with the integration tests, which use a different subset of it.
 #[cfg(test)]
+#[allow(dead_code)]
 mod test_support;
 
 use anyhow::{Context, Result};
@@ -218,7 +220,7 @@ fn save() -> Result<()> {
     if status.trim().is_empty() {
         let note = match kite_save_stack()? {
             Some(stack) => format!(
-                "nothing new — {} ready to land",
+                "nothing new - {} ready to land",
                 pluralize(stack.count, "save")
             ),
             None => "nothing to save".to_string(),

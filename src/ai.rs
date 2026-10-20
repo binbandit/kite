@@ -553,8 +553,8 @@ pub(crate) fn truncate_for_prompt(text: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{accept_ai_request, respond_json};
     use serde_json::json;
-    use std::io::{Read, Write};
 
     #[test]
     fn truncate_for_prompt_respects_char_boundaries() {
@@ -567,33 +567,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0];
-            while !request.ends_with(b"\r\n\r\n") {
-                socket.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
-            let length = String::from_utf8(request)
-                .unwrap()
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap();
-            socket.read_exact(&mut vec![0; length]).unwrap();
-            let body = payload.to_string();
-            write!(
-                socket,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
+            respond_json(accept_ai_request(&listener), &payload);
         });
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()

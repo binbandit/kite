@@ -23,7 +23,7 @@ const MAX_DROPPED_COMMITS_SHOWN: usize = 10;
 /// sha to give is the one case worth a round trip to resolve.
 pub(crate) fn publish_current_branch() -> Result<()> {
     if !has_remote() {
-        println!("{} No remote — history stays local", "·".dimmed());
+        println!("{} No remote - history stays local", "·".dimmed());
         return Ok(());
     }
 
@@ -72,7 +72,7 @@ pub(crate) fn publish_current_branch() -> Result<()> {
             .any(|marker| detail.contains(marker))
         {
             anyhow!(
-                "Push rejected — `origin/{branch}` has moved since you last fetched it. Run `git fetch origin {branch}` to see what changed, then rerun `kt publish`."
+                "Push rejected - `origin/{branch}` has moved since you last fetched it. Run `git fetch origin {branch}` to see what changed, then rerun `kt publish`."
             )
         } else {
             error.context(format!("Could not publish `{branch}`"))
@@ -109,6 +109,6 @@ fn confirm_discarding_remote_commits(branch: &str, remote_sha: &str) -> Result<(
     }
 
     anyhow::bail!(
-        "Publish cancelled — `origin/{branch}` untouched. Run `git fetch origin {branch}` and reconcile if you want to keep those commits."
+        "Publish cancelled - `origin/{branch}` untouched. Run `git fetch origin {branch}` and reconcile if you want to keep those commits."
     )
 }

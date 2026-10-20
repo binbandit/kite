@@ -100,87 +100,95 @@ pub(crate) async fn land(options: LandOptions) -> Result<()> {
     let Some(status) = land_preflight(push)? else {
         return Ok(());
     };
+    let expected_target = head_position()?;
+    let expected_head = execute_git(&["rev-parse", "HEAD"])?;
+    let Some(scope) = collect_land_scope(allow_dirty, Some(&status))? else {
+        return Ok(());
+    };
 
-    let stashed = allow_dirty && stash::save()?;
-
-    let land_result = (async {
-        let expected_target = head_position()?;
-        let expected_head = execute_git(&["rev-parse", "HEAD"])?;
-        // The preflight status predates the stash, so it only describes the
-        // tree the clean-worktree check cares about.
-        let Some(scope) = collect_land_scope(allow_dirty, Some(&status))? else {
-            return Ok(());
-        };
-
-        let Some(mut plan) = plan_land(&scope, granularity, auto_confirm).await? else {
-            return Ok(());
-        };
-
-        if let Some(tag) = tag.as_deref().filter(|s| !s.trim().is_empty()) {
-            for commit in plan.commits_mut() {
-                commit.message = append_tag_to_message(&commit.message, tag);
-            }
+    let Some(mut plan) = plan_land(&scope, granularity, auto_confirm).await? else {
+        return Ok(());
+    };
+    if let Some(tag) = tag.as_deref() {
+        for commit in plan.commits_mut() {
+            commit.message = append_tag_to_message(&commit.message, tag);
         }
-
-        if scope.files.paths().is_empty() {
-            let outcome = if scope.base == KiteBase::Root { "replace them with one empty initial commit" } else { "remove them" };
-            println!("{} These {} cancel out; {outcome} without changing any files.", "·".cyan(), pluralize(scope.save_count, "save"));
-        }
-        print!("{}", plan.render(scope.save_count));
-
-        let question = if push {
-            "Rewrite history and publish?"
-        } else {
-            "Rewrite history?"
-        };
-        if !auto_confirm && !confirm(question)? {
-            println!("{} Aborted — no history changed", "·".red());
-            return Ok(());
-        }
-
-        if head_position()? != expected_target
-            || execute_git(&["rev-parse", "HEAD"])? != expected_head
-        {
-            anyhow::bail!("HEAD changed while planning the land. No history was rewritten; run `kt land` again to review the current saves.");
-        }
-        plan.execute(&scope.base, hooks)?;
-
-        if push {
-            println!("{} Landed", "✓".green());
-            publish_current_branch().context("Landed locally, but publishing failed")?;
-        } else if has_remote() {
-            if matches!(head_position(), Ok(Head::Detached(_))) {
-                println!(
-                    "{} Landed — HEAD is detached; create a branch with {} to publish",
-                    "✓".green(),
-                    "git switch -c <name>".bold()
-                );
-            } else {
-                println!(
-                    "{} Landed — review, then {} or {}",
-                    "✓".green(),
-                    "kt publish".bold(),
-                    "kt pr".bold()
-                );
-            }
-        } else {
-            println!("{} Landed", "✓".green());
-        }
-
-        Ok(())
-    })
-    .await;
-
-    if stashed && let Err(restore_error) = stash::restore() {
-        return match land_result {
-            Ok(_) => Err(restore_error),
-            Err(land_error) => Err(anyhow!(
-                "{land_error}\n\nIn addition, restoring your stashed changes failed: {restore_error}"
-            )),
-        };
     }
 
-    land_result
+    if scope.files.paths().is_empty() {
+        let outcome = if scope.base == KiteBase::Root {
+            "replaces them with one empty initial commit"
+        } else {
+            "removes them"
+        };
+        println!(
+            "{} These {} cancel out. Landing {outcome} without changing any files.",
+            "·".cyan(),
+            pluralize(scope.save_count, "save")
+        );
+    }
+    print!("{}", plan.render(scope.save_count));
+
+    let question = if push {
+        "Rewrite history and publish?"
+    } else {
+        "Rewrite history?"
+    };
+    if !auto_confirm && !confirm(question)? {
+        println!("{} Aborted - no history changed", "·".red());
+        return Ok(());
+    }
+
+    if head_position()? != expected_target || execute_git(&["rev-parse", "HEAD"])? != expected_head
+    {
+        anyhow::bail!(
+            "HEAD changed while planning the land. No history was rewritten; run `kt land` again to review the current saves."
+        );
+    }
+
+    // Stashed only once the plan is confirmed: uncommitted work stays in place
+    // while the plan is drafted and reviewed, and a land that never happens
+    // never touches it.
+    let stashed = allow_dirty && stash::save()?;
+    let landed = plan.execute(&scope.base, hooks);
+    if stashed && let Err(restore_error) = stash::restore() {
+        return Err(match landed {
+            Ok(()) => restore_error.context("Landed, but your uncommitted work was not restored"),
+            Err(land_error) => anyhow!(
+                "{land_error:#}\n\nIn addition, restoring your uncommitted work failed: {restore_error:#}"
+            ),
+        });
+    }
+    landed?;
+
+    if push {
+        println!("{} Landed", "✓".green());
+        publish_current_branch().context("Landed locally, but publishing failed")?;
+    } else if !has_remote() {
+        println!("{} Landed", "✓".green());
+    } else if matches!(head_position(), Ok(Head::Detached(_))) {
+        println!(
+            "{} Landed - HEAD is detached; create a branch with {} to publish",
+            "✓".green(),
+            "git switch -c <name>".bold()
+        );
+    } else {
+        println!(
+            "{} Landed - review, then {} or {}",
+            "✓".green(),
+            "kt publish".bold(),
+            "kt pr".bold()
+        );
+    }
+    Ok(())
+}
+
+/// An unborn branch still needs one commit to represent an empty tree.
+fn empty_initial_commit() -> CommitGroup {
+    CommitGroup {
+        message: EMPTY_INITIAL_MESSAGE.to_string(),
+        files: Vec::new(),
+    }
 }
 
 /// Saves that cancel out need no AI at any granularity, so they keep the
@@ -201,10 +209,7 @@ async fn plan_land(
         return Ok(None);
     };
     if commits.is_empty() && scope.base == KiteBase::Root {
-        commits.push(CommitGroup {
-            message: EMPTY_INITIAL_MESSAGE.to_string(),
-            files: Vec::new(),
-        });
+        commits.push(empty_initial_commit());
     }
     Ok(Some(LandPlan::Whole(commits)))
 }
@@ -246,7 +251,7 @@ async fn plan_commits(
 fn land_preflight(push: bool) -> Result<Option<String>> {
     if !has_head_commit() {
         println!(
-            "{} No commits yet — make an initial commit before landing",
+            "{} No commits yet - make an initial commit before landing",
             "·".yellow()
         );
         return Ok(None);
@@ -278,7 +283,7 @@ fn land_preflight(push: bool) -> Result<Option<String>> {
 fn collect_land_scope(allow_dirty: bool, status: Option<&str>) -> Result<Option<LandScope>> {
     if !has_head_commit() {
         println!(
-            "{} No commits yet — make an initial commit before landing",
+            "{} No commits yet - make an initial commit before landing",
             "·".yellow()
         );
         return Ok(None);
@@ -304,7 +309,7 @@ fn collect_land_scope(allow_dirty: bool, status: Option<&str>) -> Result<Option<
         println!(
             "{} {}",
             "·".dimmed(),
-            "nothing to land — create saves with `kt` first".dimmed()
+            "nothing to land - create saves with `kt` first".dimmed()
         );
         return Ok(None);
     };
@@ -371,14 +376,16 @@ fn render_land_plan(commits: &[CommitGroup], save_count: usize) -> String {
             plan.push_str(&format!("     {}\n", note.dimmed()));
         }
 
-        for (position, file) in commit.files.iter().take(MAX_PLAN_FILES_SHOWN).enumerate() {
-            let last = position + 1 == commit.files.len();
+        // A truncated list closes the tree on its overflow note instead.
+        let overflow = overflow_note(commit.files.len(), MAX_PLAN_FILES_SHOWN);
+        let shown = commit.files.len().min(MAX_PLAN_FILES_SHOWN);
+        for (position, file) in commit.files[..shown].iter().enumerate() {
+            let last = position + 1 == shown && overflow.is_none();
             let glyph = if last { "└─" } else { "├─" };
             plan.push_str(&format!("     {} {}\n", glyph.dimmed(), file));
         }
-
-        if let Some(note) = overflow_note(commit.files.len(), MAX_PLAN_FILES_SHOWN) {
-            plan.push_str(&format!("     {}\n", note.dimmed()));
+        if let Some(note) = overflow {
+            plan.push_str(&format!("     {} {}\n", "└─".dimmed(), note.dimmed()));
         }
     }
 
@@ -393,11 +400,7 @@ fn execute_land(base: &KiteBase, commits: &[CommitGroup], hooks: Hooks) -> Resul
 
     run_land_transaction(|pre_land_sha, transaction_ref| {
         prepare_landing_head(base, pre_land_sha, transaction_ref)?;
-        // An unborn branch still needs one commit to represent an empty tree.
-        let empty_root = [CommitGroup {
-            message: EMPTY_INITIAL_MESSAGE.to_string(),
-            files: Vec::new(),
-        }];
+        let empty_root = [empty_initial_commit()];
         let groups = if *base == KiteBase::Root && commits.is_empty() {
             &empty_root
         } else {
@@ -439,7 +442,7 @@ fn run_land_transaction(build: impl FnOnce(&str, &str) -> Result<HashSet<String>
     // already happened.
     let target = head_position()?;
     let worktree = current_worktree_key()?;
-    let pre_land_sha = execute_git(&["rev-parse", "HEAD"])?;
+    let pre_land_sha = execute_git(&["rev-parse", "HEAD"])?.trim().to_string();
     // Hooks see a normal branch, and recovery can identify its exact ref.
     let transaction_ref = unique_kite_ref(TRANSACTION_REF_PREFIX);
 
@@ -448,17 +451,17 @@ fn run_land_transaction(build: impl FnOnce(&str, &str) -> Result<HashSet<String>
     let previous_marker = PreLandMarker::capture();
     let transaction = install_in_progress_marker(
         &previous_marker,
-        pre_land_sha.trim(),
+        &pre_land_sha,
         &target.land_key(),
         &worktree,
         &transaction_ref,
     )?;
 
     let rewrite = (|| -> Result<()> {
-        let hook_changes = build(pre_land_sha.trim(), &transaction_ref)?;
-        verify_saved_tree(pre_land_sha.trim(), &hook_changes)?;
+        let hook_changes = build(&pre_land_sha, &transaction_ref)?;
+        verify_saved_tree(&pre_land_sha, &hook_changes)?;
         stash::record_landed_head(execute_git(&["rev-parse", "HEAD"])?.trim())?;
-        finalize_landed_head(&target, pre_land_sha.trim(), &transaction_ref)?;
+        finalize_landed_head(&target, &pre_land_sha, &transaction_ref)?;
         let landed_head =
             execute_git(&["rev-parse", "HEAD"]).context("Could not resolve the landed HEAD")?;
         record_landed_head(&transaction, landed_head.trim())
@@ -478,7 +481,7 @@ fn run_land_transaction(build: impl FnOnce(&str, &str) -> Result<HashSet<String>
     let Err(error) = rewrite else {
         return Ok(());
     };
-    if let Err(restore_error) = restore_head(&target, pre_land_sha.trim(), &transaction_ref) {
+    if let Err(restore_error) = restore_head(&target, &pre_land_sha, &transaction_ref) {
         anyhow::bail!(
             "{error:#}\n\nKite could not restore {}: {restore_error:#}\nYour saves are retained at `{PRE_LAND_REF}`. Resolve the problem above, then run `kt undo` in this worktree.",
             target.describe()

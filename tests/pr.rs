@@ -4,12 +4,10 @@
 #[allow(dead_code)]
 mod support;
 
-use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
-use support::{TempDir, git, init_repo, write_file};
+use support::{TempDir, accept_ai_request, git, init_repo, respond_with_model_output, write_file};
 
 struct PrRepo {
     repo: TempDir,
@@ -577,10 +575,9 @@ fn commits_made_during_ai_drafting_stop_pr_creation() {
     let repo = PrRepo::new();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    listener.set_nonblocking(true).unwrap();
     let path = repo.repo.path.clone();
     let server = std::thread::spawn(move || {
-        let mut stream = accept_model_request(&listener);
+        let stream = accept_ai_request(&listener);
         git(
             &path,
             &[
@@ -590,11 +587,12 @@ fn commits_made_during_ai_drafting_stop_pr_creation() {
                 "feat: added while drafting",
             ],
         );
-        let body = serde_json::json!({"output_text": serde_json::json!({
-            "title": "feat: initial feature", "body": "Describes the original commit."
-        }).to_string()})
-        .to_string();
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        respond_with_model_output(
+            stream,
+            &serde_json::json!({
+                "title": "feat: initial feature", "body": "Describes the original commit."
+            }),
+        );
     });
     let output = repo
         .pr_command(&repo.base, "[]", false)
@@ -615,48 +613,13 @@ fn commits_made_during_ai_drafting_stop_pr_creation() {
     );
 }
 
-fn accept_model_request(listener: &TcpListener) -> std::net::TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < deadline, "CLI never requested AI output");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("{error}"),
-        }
-    };
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut reader = BufReader::new(&stream);
-    let mut length = 0;
-    loop {
-        let mut line = String::new();
-        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-        if line == "\r\n" {
-            break;
-        }
-        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-            length = value.trim().parse().unwrap();
-        }
-    }
-    reader.read_exact(&mut vec![0; length]).unwrap();
-    stream
-}
-
 /// A bounded local Responses endpoint, used for the land and PR in one CLI run.
 fn model_server(replies: Vec<serde_json::Value>) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    listener.set_nonblocking(true).unwrap();
     let server = std::thread::spawn(move || {
         for reply in replies {
-            let mut stream = accept_model_request(&listener);
-            let body = serde_json::json!({"output_text": reply.to_string()}).to_string();
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            respond_with_model_output(accept_ai_request(&listener), &reply);
         }
     });
     (url, server)

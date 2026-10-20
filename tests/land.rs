@@ -2,12 +2,15 @@
 #[allow(dead_code)]
 mod support;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
-use support::{TempDir, git, init_repo, write_file};
+use support::{
+    TempDir, accept_ai_request, git, init_repo, read_ai_request, respond_with_model_output,
+    write_file,
+};
 
 fn kt(repo: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kt"));
@@ -21,45 +24,11 @@ fn save(repo: &Path) {
     git(repo, &["commit", "-qm", "[kite] save 12:00:00"]);
 }
 
-fn read_plan_request(listener: &TcpListener) -> TcpStream {
-    listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let (stream, _) = loop {
-        match listener.accept() {
-            Ok(connection) => break connection,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < deadline, "CLI never requested a plan");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("{error}"),
-        }
-    };
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut reader = BufReader::new(&stream);
-    let mut length = 0;
-    loop {
-        let mut line = String::new();
-        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-        if line == "\r\n" {
-            break;
-        }
-        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-            length = value.trim().parse().unwrap();
-        }
-    }
-    reader.read_exact(&mut vec![0; length]).unwrap();
-    stream
-}
-
-fn send_plan(mut stream: TcpStream) {
-    let body = serde_json::json!({"output_text": serde_json::json!({"groups": [
-        {"message": "feat: landed", "files": ["tracked.txt"]}
-    ]}).to_string()})
-    .to_string();
-    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+fn send_plan(stream: TcpStream) {
+    respond_with_model_output(
+        stream,
+        &serde_json::json!({"groups": [{"message": "feat: landed", "files": ["tracked.txt"]}]}),
+    );
 }
 
 // Mutate the repository while the actual CLI is waiting for its AI response.
@@ -67,7 +36,7 @@ fn land(repo: &Path, dirty: bool, during_request: impl FnOnce() + Send + 'static
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        let stream = read_plan_request(&listener);
+        let stream = accept_ai_request(&listener);
         during_request();
         send_plan(stream);
     });
@@ -183,23 +152,38 @@ fn cancelled_root_saves_land_as_one_empty_commit_and_remain_undoable() {
     assert_eq!(git(&repo.path, &["status", "--porcelain"]), "");
 }
 
+/// Uncommitted work `kt land --allow-dirty` has to carry: a staged edit with
+/// an unstaged edit on top of it, and an untracked file. Returns its status.
+fn make_dirty_work(repo: &Path) -> String {
+    write_file(repo, "other.txt", "staged work\n");
+    git(repo, &["add", "other.txt"]);
+    write_file(repo, "other.txt", "unstaged work\n");
+    write_file(repo, "pending.txt", "untracked work\n");
+    git(repo, &["status", "--porcelain"])
+}
+
+fn assert_dirty_work_intact(repo: &Path, status: &str) {
+    assert_eq!(git(repo, &["status", "--porcelain"]), status);
+    assert_eq!(git(repo, &["show", ":other.txt"]), "staged work\n");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("other.txt")).unwrap(),
+        "unstaged work\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("pending.txt")).unwrap(),
+        "untracked work\n"
+    );
+}
+
+/// Kills `kt land --allow-dirty --yes` while it waits for the AI, or once it
+/// is inside a pre-commit hook after the plan was accepted.
 #[cfg(unix)]
-fn interrupted_dirty_land_recovers(in_hook: bool) {
+fn kill_dirty_land(repo: &Path, in_hook: bool) {
     use std::os::unix::{fs::PermissionsExt, process::CommandExt};
     use std::process::Stdio;
 
-    let repo = init_repo();
-    save(&repo.path);
-    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
-    let branch = git(&repo.path, &["symbolic-ref", "HEAD"]);
-    write_file(&repo.path, "other.txt", "staged work\n");
-    git(&repo.path, &["add", "other.txt"]);
-    write_file(&repo.path, "other.txt", "unstaged work\n");
-    write_file(&repo.path, "pending.txt", "untracked work\n");
-    let status = git(&repo.path, &["status", "--porcelain"]);
-
-    let hook = repo.path.join(".git/hooks/pre-commit");
-    let hook_ready = repo.path.join(".git/kite-test-hook-ready");
+    let hook = repo.join(".git/hooks/pre-commit");
+    let hook_ready = repo.join(".git/kite-test-hook-ready");
     if in_hook {
         std::fs::write(
             &hook,
@@ -210,7 +194,7 @@ fn interrupted_dirty_land_recovers(in_hook: bool) {
     }
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut command = kt(&repo.path, &["land", "--allow-dirty", "--yes"]);
+    let mut command = kt(repo, &["land", "--allow-dirty", "--yes"]);
     let child = command
         .env(
             "KITE_OPENAI_URL",
@@ -226,7 +210,7 @@ fn interrupted_dirty_land_recovers(in_hook: bool) {
 
     // Always clean up this child's isolated process group, even if setup fails.
     let reached_interruption = std::panic::catch_unwind(|| {
-        let stream = read_plan_request(&listener);
+        let stream = accept_ai_request(&listener);
         if in_hook {
             send_plan(stream);
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -250,6 +234,36 @@ fn interrupted_dirty_land_recovers(in_hook: bool) {
     if in_hook {
         std::fs::remove_file(hook).unwrap();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn dirty_work_stays_in_place_when_planning_is_interrupted() {
+    let repo = init_repo();
+    save(&repo.path);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    let status = make_dirty_work(&repo.path);
+
+    kill_dirty_land(&repo.path, false);
+
+    // Nothing is stashed until the plan is accepted, so there is nothing to
+    // recover and nothing blocks the next command.
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+    assert_dirty_work_intact(&repo.path, &status);
+    assert_eq!(git(&repo.path, &["stash", "list"]), "");
+    assert_success(&kt(&repo.path, &[]).output().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn dirty_work_recovers_after_interruption_during_a_hook() {
+    let repo = init_repo();
+    save(&repo.path);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    let branch = git(&repo.path, &["symbolic-ref", "HEAD"]);
+    let status = make_dirty_work(&repo.path);
+
+    kill_dirty_land(&repo.path, true);
 
     let blocked = kt(&repo.path, &[]).output().unwrap();
     assert!(
@@ -260,29 +274,56 @@ fn interrupted_dirty_land_recovers(in_hook: bool) {
     assert_success(&kt(&repo.path, &["undo"]).output().unwrap());
     assert_eq!(git(&repo.path, &["symbolic-ref", "HEAD"]), branch);
     assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
-    assert_eq!(git(&repo.path, &["status", "--porcelain"]), status);
-    assert_eq!(git(&repo.path, &["show", ":other.txt"]), "staged work\n");
-    assert_eq!(
-        std::fs::read_to_string(repo.path.join("other.txt")).unwrap(),
-        "unstaged work\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(repo.path.join("pending.txt")).unwrap(),
-        "untracked work\n"
-    );
+    assert_dirty_work_intact(&repo.path, &status);
     assert!(git(&repo.path, &["stash", "list"]).contains("kt land temporary work"));
 }
 
-#[cfg(unix)]
+/// Finding nothing to land, or answering no, must not cycle the work through
+/// `git stash` and leave a backup entry behind for a land that never happened.
 #[test]
-fn dirty_work_recovers_after_interruption_during_planning() {
-    interrupted_dirty_land_recovers(false);
-}
+fn a_dirty_land_that_rewrites_nothing_never_stashes() {
+    let unsaved = init_repo();
+    let status = make_dirty_work(&unsaved.path);
+    let nothing_to_land = kt(&unsaved.path, &["land", "--allow-dirty"])
+        .output()
+        .unwrap();
+    assert_success(&nothing_to_land);
+    assert!(String::from_utf8_lossy(&nothing_to_land.stdout).contains("nothing to land"));
+    assert_dirty_work_intact(&unsaved.path, &status);
+    assert_eq!(git(&unsaved.path, &["stash", "list"]), "");
 
-#[cfg(unix)]
-#[test]
-fn dirty_work_recovers_after_interruption_during_a_hook() {
-    interrupted_dirty_land_recovers(true);
+    let repo = init_repo();
+    save(&repo.path);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    let status = make_dirty_work(&repo.path);
+    let mut command = kt(&repo.path, &["land", "--allow-dirty"]);
+    for key in [
+        "KITE_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        "KITE_API_KEY",
+        "OPENAI_KEY",
+        "AI_GATEWAY_API_KEY",
+    ] {
+        command.env_remove(key);
+    }
+    let mut declined = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Without AI: a manual commit message, then "no" at the plan.
+    declined
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"feat: manual\nn\n")
+        .unwrap();
+    let declined = declined.wait_with_output().unwrap();
+    assert_success(&declined);
+    assert!(String::from_utf8_lossy(&declined.stdout).contains("Aborted"));
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+    assert_dirty_work_intact(&repo.path, &status);
+    assert_eq!(git(&repo.path, &["stash", "list"]), "");
 }
 
 #[test]
@@ -323,41 +364,13 @@ fn commits_made_while_planning_are_not_rewritten() {
 }
 
 #[test]
-fn dirty_land_restores_its_own_stash_when_another_is_added() {
-    let repo = init_repo();
-    save(&repo.path);
-    write_file(&repo.path, "pending.txt", "my pending work\n");
-    let path = repo.path.clone();
-    let output = land(&repo.path, true, move || {
-        write_file(&path, "unrelated.txt", "another stash\n");
-        git(&path, &["stash", "push", "-u", "-m", "unrelated stash"]);
-    });
-    assert_success(&output);
-    assert_eq!(
-        std::fs::read_to_string(repo.path.join("pending.txt")).unwrap(),
-        "my pending work\n"
-    );
-    assert!(!repo.path.join("unrelated.txt").exists());
-    assert!(git(&repo.path, &["stash", "list", "-1"]).contains("unrelated stash"));
-}
-
-#[test]
 fn dirty_land_restores_staging_and_keeps_a_named_backup() {
     let repo = init_repo();
     save(&repo.path);
-    write_file(&repo.path, "other.txt", "staged\n");
-    git(&repo.path, &["add", "other.txt"]);
-    write_file(&repo.path, "other.txt", "unstaged\n");
-    write_file(&repo.path, "pending.txt", "untracked\n");
-    let status = git(&repo.path, &["status", "--porcelain"]);
+    let status = make_dirty_work(&repo.path);
     let output = land(&repo.path, true, || {});
     assert_success(&output);
-    assert_eq!(git(&repo.path, &["status", "--porcelain"]), status);
-    assert_eq!(git(&repo.path, &["show", ":other.txt"]), "staged\n");
-    assert_eq!(
-        std::fs::read_to_string(repo.path.join("other.txt")).unwrap(),
-        "unstaged\n"
-    );
+    assert_dirty_work_intact(&repo.path, &status);
     assert!(git(&repo.path, &["stash", "list"]).contains("kt land temporary work"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("Backup retained in `git stash`"));
 }
@@ -391,11 +404,12 @@ fn dirty_land_cleanup_cannot_discard_another_worktrees_pending_work() {
         .unwrap();
     let wrappers = TempDir::new("kite-stash-race");
     let wrapper = wrappers.path.join("git");
-    // Interleave a linked-worktree stash after the lookup the old cleanup used
-    // to authorize dropping stash@{0}. Safe cleanup must preserve this work
-    // whether it remains in the peer checkout or has moved into its stash.
+    // Push a linked-worktree stash on top of Kite's own each time Kite looks
+    // its entry up, so stash@{0} is never Kite's. Restoring must still apply
+    // Kite's entry, and must preserve the peer's work whether it remains in
+    // the peer checkout or has moved into its stash.
     std::fs::write(&wrapper, r#"#!/bin/sh
-if [ "$1" = rev-parse ] && [ "$2" = --verify ] && [ "$3" = refs/stash ]; then
+if [ "$1" = stash ] && [ "$2" = list ]; then
   "$KITE_TEST_REAL_GIT" "$@" || exit $?
   "$KITE_TEST_REAL_GIT" -C "$KITE_TEST_PEER" stash push -u -m 'concurrent peer backup' >/dev/null || exit $?
   exit 0
@@ -408,7 +422,7 @@ exec "$KITE_TEST_REAL_GIT" "$@"
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let server = std::thread::spawn(move || send_plan(read_plan_request(&listener)));
+    let server = std::thread::spawn(move || send_plan(accept_ai_request(&listener)));
     let output = kt(&repo.path, &["land", "--yes", "--allow-dirty"])
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env("KITE_TEST_REAL_GIT", real_git)
@@ -421,23 +435,18 @@ exec "$KITE_TEST_REAL_GIT" "$@"
     server.join().unwrap();
     assert_success(&output);
 
-    let stashes = git(&repo.path, &["stash", "list", "--format=%H %gs"]);
-    let peer_stash = stashes
-        .lines()
-        .find(|line| line.ends_with(": concurrent peer backup"))
-        .and_then(|line| line.split_once(' '))
-        .map(|(oid, _)| oid);
-    let peer_contents = std::fs::read_to_string(peer.join("precious.txt"))
-        .ok()
-        .or_else(|| {
-            peer_stash.map(|oid| git(&repo.path, &["show", &format!("{oid}^3:precious.txt")]))
-        });
-    assert_eq!(
-        peer_contents.as_deref(),
-        Some("unrelated work\n"),
-        "another worktree's work disappeared: {stashes}"
+    let stashes = git(&repo.path, &["stash", "list", "--format=%gs"]);
+    let subjects: Vec<&str> = stashes.lines().collect();
+    assert!(
+        matches!(subjects[..], [peer, kite] if peer.ends_with(": concurrent peer backup")
+            && kite.contains("kt land temporary work")),
+        "{stashes}"
     );
-    assert!(stashes.contains("kt land temporary work"));
+    assert_eq!(
+        git(&repo.path, &["show", "stash@{0}^3:precious.txt"]),
+        "unrelated work\n",
+        "another worktree's work disappeared"
+    );
     assert_eq!(
         std::fs::read_to_string(repo.path.join("pending.txt")).unwrap(),
         "my pending work\n"
@@ -468,9 +477,106 @@ fn undo_does_not_overwrite_fetched_remote_work() {
     git(&repo.path, &["push", "origin", &branch]);
     let newer = git(&repo.path, &["rev-parse", "HEAD"]);
     git(&repo.path, &["reset", "--hard", landed.trim()]);
-    assert_success(&kt(&repo.path, &["undo"]).output().unwrap());
+    let undo = kt(&repo.path, &["undo"]).output().unwrap();
+    assert_success(&undo);
+    assert!(String::from_utf8_lossy(&undo.stdout).contains("left untouched"));
     assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
     assert_eq!(git(&remote.path, &["rev-parse", &branch]), newer);
+}
+
+#[test]
+fn undo_reverts_origin_only_when_it_holds_the_land() {
+    let repo = init_repo();
+    let remote = TempDir::new("kite-undo-remote");
+    git(&remote.path, &["init", "--bare"]);
+    git(
+        &repo.path,
+        &["remote", "add", "origin", remote.path.to_str().unwrap()],
+    );
+    let branch = git(&repo.path, &["branch", "--show-current"])
+        .trim()
+        .to_string();
+    git(&repo.path, &["push", "origin", &branch]);
+    let published = git(&remote.path, &["rev-parse", &branch]);
+    save(&repo.path);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+
+    // A local land never reached origin, so undoing it has nothing to say
+    // about the remote and nothing to push.
+    assert_success(&land(&repo.path, false, || {}));
+    let undo = kt(&repo.path, &["undo"]).output().unwrap();
+    assert_success(&undo);
+    let stdout = String::from_utf8_lossy(&undo.stdout);
+    assert!(
+        stdout.lines().count() == 1 && stdout.contains("Restored pre-land saves"),
+        "{stdout}"
+    );
+    assert_eq!(git(&remote.path, &["rev-parse", &branch]), published);
+
+    // A published land is reverted on origin too, and says so.
+    assert_success(&land(&repo.path, false, || {}));
+    assert_success(&kt(&repo.path, &["publish"]).output().unwrap());
+    let undo = kt(&repo.path, &["undo"]).output().unwrap();
+    assert_success(&undo);
+    assert!(
+        String::from_utf8_lossy(&undo.stdout).contains("Restored the saves on `origin/"),
+        "{}",
+        String::from_utf8_lossy(&undo.stdout)
+    );
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+    assert_eq!(git(&remote.path, &["rev-parse", &branch]), saved);
+}
+
+#[test]
+fn undo_reverts_origin_without_a_tracking_ref() {
+    let repo = init_repo();
+    let remote = TempDir::new("kite-undo-remote");
+    git(&remote.path, &["init", "--bare"]);
+    let base = git(&repo.path, &["branch", "--show-current"])
+        .trim()
+        .to_string();
+    // Fetching only the base branch means publishing `feature` never creates
+    // `origin/feature` locally.
+    git(
+        &repo.path,
+        &[
+            "remote",
+            "add",
+            "-t",
+            &base,
+            "origin",
+            remote.path.to_str().unwrap(),
+        ],
+    );
+    git(&repo.path, &["push", "origin", &base]);
+    git(&repo.path, &["switch", "-c", "feature"]);
+    save(&repo.path);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+
+    // Asking origin finds no `feature`, so an unpublished land stays quiet.
+    assert_success(&land(&repo.path, false, || {}));
+    let undo = kt(&repo.path, &["undo"]).output().unwrap();
+    assert_success(&undo);
+    let stdout = String::from_utf8_lossy(&undo.stdout);
+    assert!(
+        stdout.lines().count() == 1 && stdout.contains("Restored pre-land saves"),
+        "{stdout}"
+    );
+
+    assert_success(&land(&repo.path, false, || {}));
+    assert_success(&kt(&repo.path, &["publish"]).output().unwrap());
+    assert_eq!(
+        git(&repo.path, &["for-each-ref", "refs/remotes/origin/feature"]),
+        ""
+    );
+    let undo = kt(&repo.path, &["undo"]).output().unwrap();
+    assert_success(&undo);
+    assert!(
+        String::from_utf8_lossy(&undo.stdout).contains("Restored the saves on `origin/feature`"),
+        "{}",
+        String::from_utf8_lossy(&undo.stdout)
+    );
+    assert_eq!(git(&remote.path, &["rev-parse", "feature"]), saved);
 }
 
 #[test]
@@ -560,27 +666,14 @@ fn successful_formatter_restores_dirty_work_and_staging() {
     )
     .unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-    write_file(&repo.path, "other.txt", "staged work\n");
-    git(&repo.path, &["add", "other.txt"]);
-    write_file(&repo.path, "other.txt", "unstaged work\n");
-    write_file(&repo.path, "pending.txt", "untracked work\n");
-    let status = git(&repo.path, &["status", "--porcelain"]);
+    let status = make_dirty_work(&repo.path);
 
     assert_success(&land(&repo.path, true, || {}));
     assert_eq!(
         git(&repo.path, &["show", "HEAD:tracked.txt"]),
         "formatted\n"
     );
-    assert_eq!(git(&repo.path, &["status", "--porcelain"]), status);
-    assert_eq!(git(&repo.path, &["show", ":other.txt"]), "staged work\n");
-    assert_eq!(
-        std::fs::read_to_string(repo.path.join("other.txt")).unwrap(),
-        "unstaged work\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(repo.path.join("pending.txt")).unwrap(),
-        "untracked work\n"
-    );
+    assert_dirty_work_intact(&repo.path, &status);
 }
 
 #[cfg(unix)]
@@ -818,24 +911,7 @@ impl FakeModel {
 }
 
 fn answer(stream: TcpStream, status: u16) {
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut reader = BufReader::new(&stream);
-    let mut length = 0;
-    loop {
-        let mut line = String::new();
-        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-        if line == "\r\n" {
-            break;
-        }
-        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-            length = value.trim().parse().unwrap();
-        }
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).unwrap();
+    let body = read_ai_request(&stream);
     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let context: serde_json::Value =
         serde_json::from_str(request["input"].as_str().unwrap()).unwrap();
