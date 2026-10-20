@@ -205,8 +205,17 @@ pub(super) fn undo_last_land() -> Result<()> {
 /// newer remote work is left alone. The lease rejects a remote that moved
 /// after the last fetch, so a stale tracking ref cannot authorize a clobber.
 fn revert_published_land(branch: &str, land: &CompletedLand) {
-    let Some(remote) = check_ref(&format!("refs/remotes/origin/{branch}")) else {
-        return;
+    let remote = match remote_branch_tip(branch) {
+        Ok(Some(remote)) => remote,
+        Ok(None) => return,
+        Err(error) => {
+            println!(
+                "{} Could not check `origin/{branch}`, so it was left untouched: {}",
+                "!".yellow(),
+                flatten_error(&format!("{error:#}"))
+            );
+            return;
+        }
     };
     if remote != land.landed_head {
         if is_ancestor(&land.landed_head, &remote) {
@@ -246,6 +255,24 @@ fn revert_published_land(branch: &str, land: &CompletedLand) {
             }
         }
     }
+}
+
+/// Where `origin` has `branch`, from its tracking ref when there is one.
+/// Without one, origin is asked directly: a fetch refspec limited to other
+/// branches never creates the ref, even after the land was published.
+fn remote_branch_tip(branch: &str) -> Result<Option<String>> {
+    if let Some(tracked) = check_ref(&format!("refs/remotes/origin/{branch}")) {
+        return Ok(Some(tracked));
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    let spinner = Spinner::start(format!("Checking origin/{branch}"));
+    let listed = execute_git(&["ls-remote", "origin", &branch_ref]);
+    spinner.stop();
+    // The pattern also matches longer names ending in it, so take the exact ref.
+    Ok(listed?.lines().find_map(|line| {
+        let (sha, name) = line.split_once('\t')?;
+        (name == branch_ref).then(|| sha.to_string())
+    }))
 }
 
 /// `refs/kite/pre_land` is a single repo-wide ref, so on its own it says

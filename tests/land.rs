@@ -528,6 +528,58 @@ fn undo_reverts_origin_only_when_it_holds_the_land() {
 }
 
 #[test]
+fn undo_reverts_origin_without_a_tracking_ref() {
+    let repo = init_repo();
+    let remote = TempDir::new("kite-undo-remote");
+    git(&remote.path, &["init", "--bare"]);
+    let base = git(&repo.path, &["branch", "--show-current"])
+        .trim()
+        .to_string();
+    // Fetching only the base branch means publishing `feature` never creates
+    // `origin/feature` locally.
+    git(
+        &repo.path,
+        &[
+            "remote",
+            "add",
+            "-t",
+            &base,
+            "origin",
+            remote.path.to_str().unwrap(),
+        ],
+    );
+    git(&repo.path, &["push", "origin", &base]);
+    git(&repo.path, &["switch", "-c", "feature"]);
+    save(&repo.path);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+
+    // Asking origin finds no `feature`, so an unpublished land stays quiet.
+    assert_success(&land(&repo.path, false, || {}));
+    let undo = kt(&repo.path, &["undo"]).output().unwrap();
+    assert_success(&undo);
+    let stdout = String::from_utf8_lossy(&undo.stdout);
+    assert!(
+        stdout.lines().count() == 1 && stdout.contains("Restored pre-land saves"),
+        "{stdout}"
+    );
+
+    assert_success(&land(&repo.path, false, || {}));
+    assert_success(&kt(&repo.path, &["publish"]).output().unwrap());
+    assert_eq!(
+        git(&repo.path, &["for-each-ref", "refs/remotes/origin/feature"]),
+        ""
+    );
+    let undo = kt(&repo.path, &["undo"]).output().unwrap();
+    assert_success(&undo);
+    assert!(
+        String::from_utf8_lossy(&undo.stdout).contains("Restored the saves on `origin/feature`"),
+        "{}",
+        String::from_utf8_lossy(&undo.stdout)
+    );
+    assert_eq!(git(&remote.path, &["rev-parse", "feature"]), saved);
+}
+
+#[test]
 fn interrupted_undo_preserves_edits_made_after_the_interruption() {
     let repo = init_repo();
     save(&repo.path);
