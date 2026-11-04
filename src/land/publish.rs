@@ -96,13 +96,16 @@ pub(super) fn remote_moved(push_error: &anyhow::Error) -> bool {
 }
 
 /// The remote has commits this branch does not. When the last land on this
-/// branch started from them, they are the saves it just rewrote, and
-/// replacing them is the whole point. Saves pushed from another machine or by
-/// someone else look the same but are not in that land, so anything else
-/// needs an explicit yes.
+/// branch started from them and the branch still holds what it landed, they
+/// are the saves it just rewrote, and replacing them is the whole point.
+/// Saves pushed from another machine look the same but are not in that land,
+/// and a branch reset below the land would also drop the commits beneath its
+/// saves, so anything else needs an explicit yes.
 fn confirm_discarding_remote_commits(branch: &str, remote_sha: &str) -> Result<()> {
     if matches!(pre_land_state(), PreLandState::Completed(land)
-        if land.target == branch && is_ancestor(remote_sha, &land.pre_land_sha))
+        if land.target == branch
+            && is_ancestor(remote_sha, &land.pre_land_sha)
+            && is_ancestor(&land.landed_head, "HEAD"))
     {
         return Ok(());
     }

@@ -1417,3 +1417,43 @@ fn publish_asks_before_discarding_saves_the_land_did_not_replace() {
     assert!(stdout.contains("Publishing will discard them"), "{stdout}");
     assert_eq!(git(&remote.path, &["rev-parse", "feature"]), theirs);
 }
+
+/// A completed land vouches for the remote saves only while the branch still
+/// holds what it landed. Reset below the land, and replacing origin would also
+/// drop the human commits under those saves, so publishing must ask again.
+#[test]
+fn publish_asks_again_once_the_branch_no_longer_holds_the_land() {
+    let repo = init_repo();
+    let remote = TempDir::new("kite-reset-publish");
+    git(&remote.path, &["init", "--bare"]);
+    git(
+        &repo.path,
+        &["remote", "add", "origin", remote.path.to_str().unwrap()],
+    );
+    let base_branch = git(&repo.path, &["branch", "--show-current"]);
+    git(&repo.path, &["push", "-q", "origin", base_branch.trim()]);
+    git(&repo.path, &["switch", "-q", "-c", "feature"]);
+    let base = git(&repo.path, &["rev-parse", "HEAD"]);
+    write_file(&repo.path, "human.txt", "a teammate's work\n");
+    git(&repo.path, &["add", "human.txt"]);
+    git(&repo.path, &["commit", "-qm", "feat: human work"]);
+    save(&repo.path);
+    git(&repo.path, &["push", "-q", "-u", "origin", "feature"]);
+    let published = git(&remote.path, &["rev-parse", "feature"]);
+    assert_success(&land(&repo.path, false, || {}));
+    git(&repo.path, &["reset", "-q", "--hard", base.trim()]);
+
+    let mut publish = kt(&repo.path, &["publish"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    publish.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let output = publish.wait_with_output().unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("feat: human work"), "{stdout}");
+    assert_eq!(git(&remote.path, &["rev-parse", "feature"]), published);
+}

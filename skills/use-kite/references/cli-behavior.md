@@ -66,7 +66,7 @@
 
 - If no `origin` remote exists, print a note and exit successfully.
 - Require a branch: `git push` has to be told which remote ref to write, so a detached `HEAD` is refused with the commit it is on and a `git switch -c <name>` hint.
-- Push the current branch with `--set-upstream origin <branch>`. Fast-forward pushes are ordinary pushes; rewrites use a lease pinned to the reviewed remote commit. Remote commits replace without confirmation only when the last land on this branch started from them; anything else, including saves pushed from another machine, requires confirmation. Without a tracking ref (single-branch or shallow clones), the remote tip comes from fetching the branch. Never rebase onto stale saves first.
+- Push the current branch with `--set-upstream origin <branch>`. Fast-forward pushes are ordinary pushes; rewrites use a lease pinned to the reviewed remote commit. Remote commits replace without confirmation only when the last land on this branch started from them and the branch still contains that land; anything else, including saves pushed from another machine, requires confirmation. Without a tracking ref (single-branch or shallow clones), the remote tip comes from fetching the branch. Never rebase onto stale saves first.
 - A rejected lease (someone else pushed) is reported as an error for the user to reconcile manually.
 
 ### `kt pr [--draft] [--base <branch>] [--yes|-y]`

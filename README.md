@@ -230,7 +230,7 @@ Publishes the current branch after you review the rewritten local history.
 - Pushes with `--set-upstream origin <current-branch>`. Uses the current remote-tracking ref when available, otherwise fetches the branch first, which also works in single-branch and shallow clones that keep no tracking ref for it.
 - Forces only when it has to. If the remote is already an ancestor of your branch, the push is an ordinary fast-forward and nothing is forced.
 - Deliberately no `git pull --rebase` first: after a land, the remote still holds the old saves, and rebasing onto them would resurrect the history you just rewrote.
-- When the remote holds commits your branch does not, Kite looks at what a force would discard. Saves your last land on this branch started from are the history you just rewrote, so those go without ceremony. Anything else is someone's work, including saves pushed from another machine: Kite lists the commits and asks before touching them.
+- When the remote holds commits your branch does not, Kite looks at what a force would discard. Saves your last land on this branch started from are the history you just rewrote, so while your branch still holds that land, those go without ceremony. Anything else is someone's work, including saves pushed from another machine: Kite lists the commits and asks before touching them.
 - If no remote exists, Kite exits without error and leaves the history local.
 - Requires a branch. `git push` has to be told which remote ref to write, and a detached `HEAD` supplies no name, so Kite names the commit you are on and points you at `git switch -c <name>`.
 
