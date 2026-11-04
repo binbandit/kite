@@ -1304,8 +1304,12 @@ fn a_repository_git_refuses_is_reported_instead_of_showing_help() {
     let repo = init_repo();
     write_file(&repo.path, "tracked.txt", "work\n");
 
+    // `safe.directory`, which CI images often set to `*`, lifts the check, and
+    // Git reads it only from system and global config.
     let output = kt(&repo.path, &[])
         .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .output()
         .unwrap();
 
