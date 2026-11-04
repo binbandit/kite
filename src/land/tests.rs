@@ -1,6 +1,6 @@
 use super::recovery::*;
 use super::*;
-use crate::git::{DETACHED_TARGET, config_get, head_symbolic_ref, short_sha};
+use crate::git::{DETACHED_TARGET, execute_git_with, head_symbolic_ref, short_sha};
 use crate::test_support::{
     TempDir, acquire_cwd_lock, git, init_repo, init_root_kite_repo, with_repo_cwd, write_file,
 };
@@ -22,7 +22,9 @@ pub(super) fn collect_land_scope_in_repo(
     repo: &std::path::Path,
     allow_dirty: bool,
 ) -> Result<Option<LandScope>> {
-    with_repo_cwd(repo, || collect_land_scope(allow_dirty, None))
+    with_repo_cwd(repo, || {
+        collect_land_scope(allow_dirty, &execute_git(&["status", "--porcelain"])?)
+    })
 }
 
 fn execute_land_in_repo(
@@ -44,7 +46,7 @@ fn leave_interrupted_land(repo: &std::path::Path, base: &KiteBase) -> LandTransa
         let pre_land_sha =
             execute_git(&["rev-parse", "HEAD"]).expect("pre-land HEAD should resolve");
         let transaction_ref = unique_kite_ref(TRANSACTION_REF_PREFIX);
-        let previous = PreLandMarker::capture();
+        let previous = PreLandMarker::capture(pre_land_state()).unwrap();
         let transaction = install_in_progress_marker(
             &previous,
             pre_land_sha.trim(),
@@ -60,6 +62,12 @@ fn leave_interrupted_land(repo: &std::path::Path, base: &KiteBase) -> LandTransa
             .expect("partial commit should be created");
         transaction
     })
+}
+
+/// Whether this worktree owns an interrupted land that needs `kt undo`.
+fn heal_interrupted_land() -> bool {
+    current_worktree_key()
+        .is_ok_and(|owner| pre_land_state().recovery_owner() == Some(owner.as_str()))
 }
 
 fn files_commit(message: &str, files: &[&str]) -> CommitGroup {
@@ -1494,7 +1502,11 @@ fn another_worktree_cannot_consume_an_interrupted_branch_land() {
     assert_eq!(git(&worktree_b, &["rev-parse", "HEAD"]), head_before);
     assert_eq!(git(&worktree_b, &["status", "--porcelain"]), status_before);
     assert_eq!(git(&worktree_b, &["rev-parse", PRE_LAND_REF]), saves_head);
-    assert!(config_get_in(&worktree_b, PRE_LAND_HEAD_KEY).is_none());
+    assert!(
+        with_repo_cwd(&worktree_b, LegacyMarkerConfig::read)
+            .head
+            .is_none()
+    );
 }
 
 #[test]
@@ -1678,10 +1690,6 @@ fn check_ref_in(repo: &std::path::Path, name: &str) -> Option<String> {
     with_repo_cwd(repo, || check_ref(name))
 }
 
-fn config_get_in(repo: &std::path::Path, key: &str) -> Option<String> {
-    with_repo_cwd(repo, || config_get(key))
-}
-
 #[test]
 fn execute_land_supports_root_only_kite_history() {
     let _lock = acquire_cwd_lock();
@@ -1721,7 +1729,7 @@ fn execute_land_succeeds_from_a_nested_directory() {
     git(&repo.path, &["add", "nested/feature.txt"]);
     git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
 
-    let scope = with_repo_cwd(&nested, || collect_land_scope(false, None))
+    let scope = collect_land_scope_in_repo(&nested, false)
         .expect("land scope should collect")
         .expect("kite saves should be landable");
 
@@ -1960,7 +1968,7 @@ fn interrupted_detached_root_land_recovers_before_its_first_commit() {
     let pre_land_sha = git(&repo.path, &["rev-parse", "HEAD"]);
 
     let transaction = with_repo_cwd(&repo.path, || {
-        let previous = PreLandMarker::capture();
+        let previous = PreLandMarker::capture(pre_land_state()).unwrap();
         let owner = current_worktree_key().expect("worktree should resolve");
         let transaction_ref = unique_kite_ref(TRANSACTION_REF_PREFIX);
         let transaction = install_in_progress_marker(
@@ -2108,7 +2116,9 @@ fn marker_setup_failure_preserves_the_previous_completed_marker() {
         &[files_commit("feat: first", &["tracked.txt"])],
     )
     .expect("first land should succeed");
-    let previous = with_repo_cwd(&repo.path, PreLandMarker::capture);
+    let previous = with_repo_cwd(&repo.path, || {
+        PreLandMarker::capture(pre_land_state()).unwrap()
+    });
 
     write_file(&repo.path, "tracked.txt", "second save\n");
     git(&repo.path, &["add", "tracked.txt"]);
@@ -2143,12 +2153,11 @@ fn marker_setup_failure_preserves_the_previous_completed_marker() {
     );
     assert!(format!("{error:#}").contains("Could not install rollback state"));
 
-    let after = with_repo_cwd(&repo.path, PreLandMarker::capture);
+    let after = with_repo_cwd(&repo.path, || {
+        PreLandMarker::capture(pre_land_state()).unwrap()
+    });
     assert_eq!(after.state_oid, previous.state_oid);
     assert_eq!(after.sha, previous.sha);
-    assert_eq!(after.branch, previous.branch);
-    assert_eq!(after.head, previous.head);
-    assert_eq!(after.worktree, previous.worktree);
     assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saves_head);
 }
 
@@ -2169,7 +2178,9 @@ fn completion_marker_failure_undoes_the_rewrite_and_restores_the_previous_marker
         &[files_commit("feat: first", &["tracked.txt"])],
     )
     .expect("first land should succeed");
-    let previous = with_repo_cwd(&repo.path, PreLandMarker::capture);
+    let previous = with_repo_cwd(&repo.path, || {
+        PreLandMarker::capture(pre_land_state()).unwrap()
+    });
 
     write_file(&repo.path, "tracked.txt", "second save\n");
     git(&repo.path, &["add", "tracked.txt"]);
@@ -2193,11 +2204,10 @@ fn completion_marker_failure_undoes_the_rewrite_and_restores_the_previous_marker
         "[kite] save 13:00:00"
     );
 
-    let after = with_repo_cwd(&repo.path, PreLandMarker::capture);
+    let after = with_repo_cwd(&repo.path, || {
+        PreLandMarker::capture(pre_land_state()).unwrap()
+    });
     assert_eq!(after.sha, previous.sha);
-    assert_eq!(after.branch, previous.branch);
-    assert_eq!(after.head, previous.head);
-    assert_eq!(after.worktree, previous.worktree);
 }
 
 #[test]
@@ -2275,4 +2285,127 @@ fn failed_land_keeps_files_a_hook_rewrote() {
     let content =
         std::fs::read_to_string(repo.path.join("tracked.txt")).expect("worktree file should exist");
     assert_eq!(content, "reformatted by a hook\n");
+}
+
+/// A file replaced by a directory: staging the old path also stages the new
+/// files beneath it. Splitting them across commits must stop the land rather
+/// than let the first commit absorb the second's files.
+#[test]
+fn a_file_replaced_by_a_directory_cannot_be_split_across_commits() {
+    let _lock = acquire_cwd_lock();
+    let repo = init_repo();
+    std::fs::remove_file(repo.path.join("tracked.txt")).expect("file should be removed");
+    write_file(&repo.path, "tracked.txt/nested.txt", "now a directory\n");
+    git(&repo.path, &["add", "-A"]);
+    git(&repo.path, &["commit", "-m", "[kite] save 12:00:00"]);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    let scope = collect_land_scope_in_repo(&repo.path, false)
+        .expect("scope should collect")
+        .expect("save should be landable");
+    assert_eq!(
+        scope.files.paths(),
+        ["tracked.txt", "tracked.txt/nested.txt"]
+    );
+
+    let error = execute_land_in_repo(
+        &repo.path,
+        &scope.base,
+        &[
+            files_commit("refactor: remove the file", &["tracked.txt"]),
+            files_commit("feat: add the directory", &["tracked.txt/nested.txt"]),
+        ],
+    )
+    .expect_err("the first commit would have absorbed the second's file");
+
+    assert!(
+        format!("{error:#}").contains("Staging included"),
+        "{error:#}"
+    );
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+    assert_eq!(git(&repo.path, &["status", "--porcelain"]), "");
+}
+
+fn install_hook(repo: &std::path::Path, name: &str, script: &str) {
+    let path = format!(".git/hooks/{name}");
+    write_file(repo, &path, script);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(repo.join(path), std::fs::Permissions::from_mode(0o755))
+            .expect("hook should be executable");
+    }
+}
+
+/// A post-checkout hook's exit status becomes checkout's, even under
+/// `--no-verify`. git-lfs installs one that fails wherever `git-lfs` itself
+/// is missing; it must not undo a land that already succeeded, nor turn a
+/// finished recovery into a reported failure.
+#[test]
+fn a_failing_post_checkout_hook_neither_undoes_a_land_nor_fails_recovery() {
+    let _lock = acquire_cwd_lock();
+    let repo = init_repo();
+    let branch = git(&repo.path, &["branch", "--show-current"]);
+    install_hook(&repo.path, "post-checkout", "#!/bin/sh\nexit 1\n");
+    write_file(&repo.path, "tracked.txt", "landed change\n");
+    git(&repo.path, &["commit", "-qam", "[kite] save 12:00:00"]);
+    let scope = collect_land_scope_in_repo(&repo.path, false)
+        .expect("scope should collect")
+        .expect("save should be landable");
+
+    with_repo_cwd(&repo.path, || {
+        execute_land(
+            &scope.base,
+            &[files_commit(
+                "feat: land despite the hook",
+                &["tracked.txt"],
+            )],
+            Hooks::Skip,
+        )
+    })
+    .expect("a land that succeeded must stay landed");
+    assert_eq!(
+        git(&repo.path, &["log", "-1", "--format=%s"]).trim(),
+        "feat: land despite the hook"
+    );
+    assert_eq!(git(&repo.path, &["branch", "--show-current"]), branch);
+
+    write_file(&repo.path, "tracked.txt", "rejected change\n");
+    git(&repo.path, &["commit", "-qam", "[kite] save 12:01:00"]);
+    let saved = git(&repo.path, &["rev-parse", "HEAD"]);
+    install_pre_commit_hook(&repo.path, "#!/bin/sh\nexit 1\n");
+    let scope = collect_land_scope_in_repo(&repo.path, false)
+        .expect("scope should collect")
+        .expect("save should be landable");
+    let error = execute_land_in_repo(
+        &repo.path,
+        &scope.base,
+        &[files_commit("feat: rejected", &["tracked.txt"])],
+    )
+    .expect_err("the pre-commit hook rejects this land");
+    assert!(
+        format!("{error:#}").contains("The rewrite was undone"),
+        "{error:#}"
+    );
+    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), saved);
+    assert_eq!(git(&repo.path, &["branch", "--show-current"]), branch);
+}
+
+/// A marker written by a newer Kite must say so, not just "incomplete".
+#[test]
+fn an_unreadable_marker_says_what_is_wrong_with_it() {
+    let _lock = acquire_cwd_lock();
+    let repo = init_repo();
+    let record = r#"{"version":99,"phase":"empty"}"#;
+    let blob = with_repo_cwd(&repo.path, || {
+        execute_git_with(&["hash-object", "-w", "--stdin"], &[], Some(record))
+    })
+    .expect("marker should be written");
+    git(&repo.path, &["update-ref", LAND_STATE_REF, blob.trim()]);
+
+    let error = with_repo_cwd(&repo.path, recovery_blocks_commands)
+        .expect_err("an unusable marker blocks commands");
+
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("version 99"), "{rendered}");
+    assert!(rendered.contains("kt undo"), "{rendered}");
 }

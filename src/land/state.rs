@@ -3,7 +3,7 @@
 //! A land moves from Landing to Completed; undo moves through Undoing to Empty.
 //! The old commits remain reachable until the corresponding transition finishes.
 
-use crate::git::{check_ref, config_get, config_unset, execute_git, execute_git_with};
+use crate::git::{check_ref, execute_git, execute_git_with};
 use anyhow::{Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -87,12 +87,17 @@ pub(super) struct CompletedMarker {
 
 #[derive(Debug)]
 pub(super) enum PreLandState {
-    Empty { state_oid: Option<String> },
+    Empty {
+        state_oid: Option<String>,
+    },
     Completed(CompletedMarker),
     InProgress(LandTransaction),
     Undoing(UndoTransaction),
-    LegacyInProgress { owner: String },
-    Inconsistent,
+    LegacyInProgress {
+        owner: String,
+    },
+    /// A marker Kite cannot use, with what is wrong with it.
+    Inconsistent(String),
 }
 
 impl PreLandState {
@@ -141,18 +146,23 @@ pub(super) fn pre_land_state() -> PreLandState {
             from_head,
         }),
         Ok(None) => read_legacy_land_state(),
-        Err(_) => PreLandState::Inconsistent,
+        Err(error) => PreLandState::Inconsistent(format!("{error:#}")),
     }
 }
 
 pub(super) fn read_legacy_land_state() -> PreLandState {
-    let sha = check_ref(PRE_LAND_REF);
-    let target = config_get(PRE_LAND_BRANCH_KEY);
-    let landed_head = config_get(PRE_LAND_HEAD_KEY);
-    let owner = config_get(PRE_LAND_WORKTREE_KEY);
-    match (sha, target, landed_head, owner) {
-        // Old versions could leave a bare rollback ref with no land metadata.
-        (_, None, None, None) => PreLandState::Empty { state_oid: None },
+    let config = LegacyMarkerConfig::read();
+    // Old versions could leave a bare rollback ref with no land metadata, so
+    // without the config there is no marker and no reason to read the ref.
+    if config.is_empty() {
+        return PreLandState::Empty { state_oid: None };
+    }
+    match (
+        check_ref(PRE_LAND_REF),
+        config.branch,
+        config.head,
+        config.worktree,
+    ) {
         (Some(pre_land_sha), Some(target), Some(landed_head), owner) => {
             PreLandState::Completed(CompletedMarker {
                 state_oid: None,
@@ -164,21 +174,86 @@ pub(super) fn read_legacy_land_state() -> PreLandState {
             })
         }
         (Some(_), Some(_), None, Some(owner)) => PreLandState::LegacyInProgress { owner },
-        _ => PreLandState::Inconsistent,
+        _ => PreLandState::Inconsistent("Kite's rollback marker is incomplete".to_string()),
+    }
+}
+
+/// The local config keys written by Kite versions before rollback state moved
+/// into one atomic ref-backed object.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct LegacyMarkerConfig {
+    pub(super) branch: Option<String>,
+    pub(super) head: Option<String>,
+    pub(super) worktree: Option<String>,
+}
+
+impl LegacyMarkerConfig {
+    /// Every key in one `git config` call: each command checks for a legacy
+    /// marker, and almost no repository has one.
+    pub(super) fn read() -> Self {
+        let mut config = Self::default();
+        // No matching key exits non-zero, which just means no marker.
+        let Ok(listed) = execute_git(&[
+            "config",
+            "--local",
+            "-z",
+            "--get-regexp",
+            r"^kite\.preland\.",
+        ]) else {
+            return config;
+        };
+        for entry in listed.split('\0') {
+            let Some((key, value)) = entry.split_once('\n') else {
+                continue;
+            };
+            let slot = match key {
+                PRE_LAND_BRANCH_KEY => &mut config.branch,
+                PRE_LAND_HEAD_KEY => &mut config.head,
+                PRE_LAND_WORKTREE_KEY => &mut config.worktree,
+                _ => continue,
+            };
+            let value = value.trim();
+            if !value.is_empty() {
+                *slot = Some(value.to_string());
+            }
+        }
+        config
+    }
+
+    fn is_empty(&self) -> bool {
+        self.branch.is_none() && self.head.is_none() && self.worktree.is_none()
     }
 }
 
 pub(super) fn read_atomic_land_record() -> Result<Option<(String, AtomicLandPhase)>> {
-    let Some(state_oid) = check_ref(LAND_STATE_REF) else {
+    // One process reads both the marker's object id, which every update
+    // compares against, and its contents. Every command reads the marker.
+    let output = execute_git_with(
+        &["cat-file", "--batch"],
+        &[],
+        Some(&format!("{LAND_STATE_REF}\n")),
+    )
+    .context("Could not read Kite's atomic land marker")?;
+    let (header, json) = output.split_once('\n').unwrap_or((&output, ""));
+    if header.ends_with(" missing") {
         return Ok(None);
+    }
+    let mut fields = header.split(' ');
+    let (Some(state_oid), Some("blob")) = (fields.next(), fields.next()) else {
+        anyhow::bail!("Kite's atomic land marker is not a blob");
     };
-    let json = execute_git(&["cat-file", "blob", &state_oid])
-        .context("Could not read Kite's atomic land marker")?;
+    let state_oid = state_oid.to_string();
     let record: AtomicLandRecord =
-        serde_json::from_str(&json).context("Kite's atomic land marker is not valid JSON")?;
+        serde_json::from_str(json).context("Kite's atomic land marker is not valid JSON")?;
 
-    if record.version != LAND_STATE_VERSION || !valid_atomic_phase(&record.phase) {
-        anyhow::bail!("Kite's atomic land marker has an unsupported or incomplete shape");
+    if record.version != LAND_STATE_VERSION {
+        anyhow::bail!(
+            "Kite's rollback marker has version {}, but this Kite reads version {LAND_STATE_VERSION}; use the Kite that wrote it",
+            record.version
+        );
+    }
+    if !valid_atomic_phase(&record.phase) {
+        anyhow::bail!("Kite's rollback marker is incomplete");
     }
 
     Ok(Some((state_oid, record.phase)))
@@ -256,13 +331,8 @@ pub(super) fn record_landed_head(transaction: &LandTransaction, landed_head: &st
         },
     };
     let completed_oid = write_land_record(&completed)?;
-    let transaction_tip = check_ref(&transaction.landing.transaction_ref)
-        .context("Kite's land transaction ref disappeared before completion")?;
-    if transaction_tip != landed_head {
-        anyhow::bail!(
-            "Kite's land transaction ref moved unexpectedly; refusing to record a different landed HEAD"
-        );
-    }
+    // Deleting the transaction ref at `landed_head` in the same transaction
+    // refuses to record a landed HEAD the ref has since moved away from.
 
     let mut edits = vec![
         RefEdit::Update {
@@ -282,7 +352,6 @@ pub(super) fn record_landed_head(transaction: &LandTransaction, landed_head: &st
         });
     }
     commit_ref_transaction(&edits)?;
-    clear_legacy_marker_config();
     Ok(())
 }
 
@@ -302,7 +371,7 @@ pub(super) fn install_in_progress_marker(
         .context("Kite generated an invalid land transaction ref")?;
     let keepalive_ref = format!("refs/kite/keepalive/{transaction_id}");
     let previous_keepalive_ref = format!("{keepalive_ref}-previous");
-    let (stable, create_previous_keepalive) = previous.stable(&previous_keepalive_ref)?;
+    let (stable, create_previous_keepalive) = previous.stable(&previous_keepalive_ref);
 
     let landing = LandingLand {
         pre_land_sha: pre_land_sha.to_string(),
@@ -360,7 +429,10 @@ pub(super) fn install_in_progress_marker(
 
     commit_ref_transaction(&edits)
         .context("Could not install rollback state; no history changed")?;
-    clear_legacy_marker_config();
+    // The first atomic record supersedes any marker an older Kite kept in config.
+    if previous.state_oid.is_none() {
+        clear_legacy_marker_config();
+    }
 
     Ok(LandTransaction { state_oid, landing })
 }
@@ -369,42 +441,36 @@ pub(super) fn install_in_progress_marker(
 pub(super) struct PreLandMarker {
     pub(super) state_oid: Option<String>,
     pub(super) sha: Option<String>,
-    pub(super) branch: Option<String>,
-    pub(super) head: Option<String>,
-    pub(super) worktree: Option<String>,
     pub(super) recorded: Option<CompletedMarker>,
 }
 
 impl PreLandMarker {
-    pub(super) fn capture() -> Self {
-        let state = pre_land_state();
+    /// The marker a land is about to replace, from `state` as
+    /// `ensure_no_land_in_progress` just read it.
+    pub(super) fn capture(state: PreLandState) -> Result<Self> {
         let (state_oid, recorded) = match state {
             PreLandState::Empty { state_oid } => (state_oid, None),
             PreLandState::Completed(recorded) => (recorded.state_oid.clone(), Some(recorded)),
             PreLandState::InProgress(_)
             | PreLandState::Undoing(_)
             | PreLandState::LegacyInProgress { .. }
-            | PreLandState::Inconsistent => (None, None),
+            | PreLandState::Inconsistent(_) => {
+                anyhow::bail!("Kite's rollback marker is not settled; no history changed")
+            }
         };
-        Self {
+        Ok(Self {
             state_oid,
             sha: check_ref(PRE_LAND_REF),
-            branch: config_get(PRE_LAND_BRANCH_KEY),
-            head: config_get(PRE_LAND_HEAD_KEY),
-            worktree: config_get(PRE_LAND_WORKTREE_KEY),
             recorded,
-        }
+        })
     }
 
-    fn stable(&self, legacy_keepalive_ref: &str) -> Result<(StableLand, Option<String>)> {
+    fn stable(&self, legacy_keepalive_ref: &str) -> (StableLand, Option<String>) {
+        // Nothing recorded, at most a bare `pre_land` pointer an older Kite
+        // left: there is no land to carry forward, and the install that
+        // follows overwrites the pointer itself.
         let Some(recorded) = &self.recorded else {
-            // A bare `pre_land` pointer is not a marker either: with nothing
-            // recorded beside it there is no land to carry forward, and the
-            // install that follows overwrites the pointer itself.
-            if self.branch.is_none() && self.head.is_none() && self.worktree.is_none() {
-                return Ok((StableLand::Empty, None));
-            }
-            anyhow::bail!("Kite's previous rollback marker is incomplete");
+            return (StableLand::Empty, None);
         };
 
         let landed_head = recorded.landed_head.clone();
@@ -415,7 +481,7 @@ impl PreLandMarker {
                 Some(recorded.pre_land_sha.clone()),
             ),
         };
-        Ok((
+        (
             StableLand::Completed {
                 land: CompletedLand {
                     pre_land_sha: recorded.pre_land_sha.clone(),
@@ -426,7 +492,7 @@ impl PreLandMarker {
                 },
             },
             create_keepalive,
-        ))
+        )
     }
 }
 
@@ -548,13 +614,11 @@ pub(super) fn restore_previous_marker(transaction: &LandTransaction) -> Result<(
         _ => anyhow::bail!("Kite's rollback ref moved during recovery; it was left untouched"),
     }
 
-    commit_ref_transaction(&edits)?;
-    clear_legacy_marker_config();
-    Ok(())
+    commit_ref_transaction(&edits)
 }
 
+/// Best effort, in one call. Git refuses when the section does not exist,
+/// which is the usual case.
 pub(super) fn clear_legacy_marker_config() {
-    let _ = config_unset(PRE_LAND_BRANCH_KEY);
-    let _ = config_unset(PRE_LAND_HEAD_KEY);
-    let _ = config_unset(PRE_LAND_WORKTREE_KEY);
+    let _ = execute_git(&["config", "--local", "--remove-section", "kite.preland"]);
 }

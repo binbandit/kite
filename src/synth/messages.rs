@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 
 use super::{
-    FALLBACK_COMMIT_MESSAGE, commit_subject, complete_validated, message_rules,
+    FALLBACK_COMMIT_MESSAGE, MAX_SYNTHESIS_ATTEMPTS, commit_subject, message_rules,
     sanitize_commit_message, validate_new_subjects,
 };
 use crate::ai::{self, extract_json_block};
@@ -57,8 +57,9 @@ pub(crate) async fn describe_saves(
         schema_name: "save_messages".to_string(),
         schema: messages_schema(),
     };
-    let reply = complete_validated(
+    let reply = ai::complete_validated(
         request,
+        MAX_SYNTHESIS_ATTEMPTS,
         parse_messages,
         |reply: &Vec<SaveMessage>| {
             validate_messages(reply, saves.len()).and_then(|()| {

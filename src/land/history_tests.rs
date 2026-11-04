@@ -377,7 +377,7 @@ fn a_land_that_stopped_with_its_private_checkout_is_cleaned_up_by_undo() {
     let folder = with_repo_cwd(&repo.path, || {
         let transaction_ref = unique_kite_ref(TRANSACTION_REF_PREFIX);
         install_in_progress_marker(
-            &PreLandMarker::capture(),
+            &PreLandMarker::capture(pre_land_state()).unwrap(),
             &tip,
             &head_position().unwrap().land_key(),
             &current_worktree_key().unwrap(),

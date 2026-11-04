@@ -95,6 +95,8 @@ struct Repository {
     url: String,
     name_with_owner: String,
     parent: Option<ParentRepository>,
+    /// Null for a repository with no commits yet.
+    default_branch_ref: Option<Named>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -103,7 +105,7 @@ struct ParentRepository {
     owner: Login,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Named {
     name: String,
 }
@@ -226,7 +228,12 @@ fn prepare_pull_request(options: &PrOptions) -> Result<PreparedPr> {
     let base = match (&options.base, &existing) {
         (Some(base), _) => base.clone(),
         (None, Some(existing)) => existing.base.clone(),
-        (None, None) => get_default_branch()?,
+        // GitHub's own answer, which a local `origin/HEAD` recorded before a
+        // default-branch rename would contradict.
+        (None, None) => match &target.repository.default_branch_ref {
+            Some(default) => default.name.clone(),
+            None => get_default_branch(Some(&target.remote))?,
+        },
     };
     execute_git(&["check-ref-format", &format!("refs/heads/{base}")])
         .with_context(|| format!("Invalid base branch `{base}`"))?;
@@ -265,7 +272,8 @@ async fn create_prepared_pull_request(prepared: PreparedPr, options: PrOptions) 
         existing,
         is_fork,
     } = prepared;
-    ensure_branch_unchanged(&branch, &head)?;
+    // The context is read at `head` itself; the branch is checked again
+    // before anything is published.
     let context = collect_pr_context(branch, base, &target.remote, &head)?;
 
     let destination = if is_fork {
@@ -383,7 +391,7 @@ fn gh(args: &[&str]) -> Result<String> {
         );
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(String::from_utf8_lossy_owned(output.stdout))
 }
 
 fn remote_url(remote: &str) -> Result<String> {
@@ -393,7 +401,13 @@ fn remote_url(remote: &str) -> Result<String> {
 }
 
 fn view_repository(url: &str) -> Result<Repository> {
-    let raw = gh(&["repo", "view", url, "--json", "url,nameWithOwner,parent"])?;
+    let raw = gh(&[
+        "repo",
+        "view",
+        url,
+        "--json",
+        "url,nameWithOwner,parent,defaultBranchRef",
+    ])?;
     serde_json::from_str(&raw).context("Could not read repository details from GitHub CLI")
 }
 
@@ -442,6 +456,10 @@ fn open_pr(repository: &str, branch: &str, origin: &Repository) -> Result<Option
         "open",
         "--head",
         branch,
+        // `--head` matches the name in every fork and gh returns 30 by
+        // default, so a common name could crowd out origin's own pull request.
+        "--limit",
+        "1000",
         "--json",
         "url,title,body,baseRefName,headRepository,headRepositoryOwner",
         "--repo",
@@ -558,33 +576,27 @@ async fn draft_with_ai(
     title_examples: &[String],
     existing: Option<&ExistingPr>,
 ) -> Result<PrDraft> {
-    let input = build_pr_input(context, title_examples, existing);
-    let mut request = ai::Request {
+    let request = ai::Request {
         system: SYSTEM_PROMPT.to_string(),
-        user: input.clone(),
+        user: build_pr_input(context, title_examples, existing),
         schema_name: "pull_request".to_string(),
         schema: draft_schema(),
     };
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        let drafted = ai::complete(&request).await.and_then(|raw| {
-            let draft = parse_draft(&raw)?;
-            validate_draft_against_template(&draft, context.template.as_ref(), existing)?;
-            Ok(draft)
-        });
-        match drafted {
-            Ok(draft) => return Ok(draft),
-            Err(error) => {
-                if attempts == MAX_PR_DRAFT_ATTEMPTS || !ai::is_retryable(&error) {
-                    return Err(error);
-                }
-                request.user = format!(
-                    "{input}\n\nThe previous draft was rejected: {error:#}. Return a corrected title and body, using only the supplied evidence and filling or removing empty template sections."
-                );
-            }
-        }
-    }
+    let validate = |draft: &PrDraft| {
+        validate_draft_against_template(draft, context.template.as_ref(), existing)
+    };
+    let draft = ai::complete_validated(
+        request,
+        MAX_PR_DRAFT_ATTEMPTS,
+        parse_draft,
+        validate,
+        "Return a corrected title and body, using only the supplied evidence and filling or removing empty template sections.",
+    )
+    .await?;
+    // Unlike a commit plan, an unfilled template has no safe repair, so a
+    // draft that never validated is refused rather than posted.
+    validate(&draft)?;
+    Ok(draft)
 }
 
 /// No `minLength`, for the same reason as `groups_schema`: keywords outside

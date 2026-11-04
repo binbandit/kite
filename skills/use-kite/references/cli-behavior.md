@@ -66,7 +66,7 @@
 
 - If no `origin` remote exists, print a note and exit successfully.
 - Require a branch: `git push` has to be told which remote ref to write, so a detached `HEAD` is refused with the commit it is on and a `git switch -c <name>` hint.
-- Push the current branch with `--set-upstream origin <branch>`. Fast-forward pushes are ordinary pushes; rewrites use a lease pinned to the reviewed remote commit. Remote non-save commits require confirmation. Never rebase onto stale saves first.
+- Push the current branch with `--set-upstream origin <branch>`. Fast-forward pushes are ordinary pushes; rewrites use a lease pinned to the reviewed remote commit. Remote commits replace without confirmation only when the last land on this branch started from them and the branch still contains that land; anything else, including saves pushed from another machine, requires confirmation. Without a tracking ref (single-branch or shallow clones), the remote tip comes from fetching the branch. Never rebase onto stale saves first.
 - A rejected lease (someone else pushed) is reported as an error for the user to reconcile manually.
 
 ### `kt pr [--draft] [--base <branch>] [--yes|-y]`
@@ -87,12 +87,12 @@
 - Read at most three skills, 4 KB each, and a 6 KB template. Do not follow referenced files. Exclude incidental PR mentions in operational skills such as `use-kite`; skill instructions control writing only, never command execution. Do not claim tests passed merely because tests were added.
 - Previews the draft and asks for confirmation before running `gh pr create` (skip with `--yes`).
 - The branch is already published when the preview appears. Declining prevents PR creation or editing, not the earlier push.
-- `--draft` creates a draft pull request and does not convert an existing PR. The base defaults to the existing PR's base when one exists, otherwise the repository default. `--base` overrides the default for new PRs; a mismatch with an existing PR's base is an error. Multiple matching open PRs also stop the command.
+- `--draft` creates a draft pull request and does not convert an existing PR. The base defaults to the existing PR's base when one exists, otherwise the default branch GitHub reports for the target repository (falling back to the base remote's recorded `HEAD`). `--base` overrides the default for new PRs; a mismatch with an existing PR's base is an error. Multiple matching open PRs also stop the command.
 
 ### `kt ship [--draft] [--base <branch>] [--tag|-t <tag>] [--no-verify] [--granularity|-g coarse|fine|per-save]`
 
 - Combine quicksave, land, publish, and PR creation or refresh. Equivalent workflow to `kt && kt land -yp && kt pr -y`, but validate the PR destination before saving and publish once through the PR step after checking the landed history.
-- Automatically accept land and PR previews; there is no `--yes` flag. Keep the normal hooks, explicit push leases, and confirmation before discarding remote non-save commits.
+- Automatically accept land and PR previews; there is no `--yes` flag. Keep the normal hooks, explicit push leases, and confirmation before discarding remote commits the land did not replace.
 - Require an existing commit, `origin`, an attached branch other than the PR base, and working GitHub access. Reuse `kt pr` destination, fork, existing-PR, and base validation.
 - Use the ordinary quicksave rules. An existing staged subset is respected; leftover changes block landing. There is no `--allow-dirty` option.
 - Land with `--yes`. Forward `--tag`, `--no-verify`, and `--granularity` to landing, and `--draft` and `--base` to PR handling. `--no-verify` does not skip pre-push hooks.

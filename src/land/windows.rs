@@ -128,9 +128,9 @@ fn read_windows(
     let mut from = base.tree_ish()?;
     let mut windows = Vec::with_capacity(ranges.len());
     for range in ranges {
+        spinner.set_message(format!("Reading {}", name_saves(&range)));
         let save = saves[range.end - 1].commit.clone();
         let (paths, diff) = changes_between(&from, &save)?;
-        spinner.set_message(format!("Reading saves {}", describe_range(&range)));
         windows.push(WindowChanges {
             saves: range,
             save: save.clone(),
@@ -186,12 +186,12 @@ async fn group_each_window(
             count: planned.len(),
             saves: window.saves.len(),
         };
-        let label = describe_range(&window.saves);
+        let label = name_saves(&window.saves);
         let job = async move {
             synthesize_slice(&files, &examples, slice)
                 .await
                 .map(|groups| normalize_groups(groups, &files))
-                .with_context(|| format!("AI planning failed for saves {label}"))
+                .with_context(|| format!("AI planning failed for {label}"))
         };
         (window.saves.len(), job)
     });
@@ -222,14 +222,14 @@ async fn describe_each_save(
     let jobs = batch_saves(&described).into_iter().map(|batch| {
         let saves: Vec<ChangedFiles> = batch.iter().map(|window| window.files.clone()).collect();
         let examples = Arc::clone(examples);
-        let label = describe_range(
+        let label = name_saves(
             &(batch.first().map_or(0, |window| window.saves.start)
                 ..batch.last().map_or(0, |window| window.saves.end)),
         );
         let job = async move {
             describe_saves(&saves, &examples)
                 .await
-                .with_context(|| format!("AI planning failed for saves {label}"))
+                .with_context(|| format!("AI planning failed for {label}"))
         };
         (batch.len(), job)
     });
@@ -314,6 +314,12 @@ pub(super) fn describe_range(saves: &Range<usize>) -> String {
     } else {
         format!("{}-{}", saves.start + 1, saves.end)
     }
+}
+
+/// The saves as a sentence names them: `save 3` or `saves 3-9`.
+pub(super) fn name_saves(saves: &Range<usize>) -> String {
+    let noun = if saves.len() <= 1 { "save" } else { "saves" };
+    format!("{noun} {}", describe_range(saves))
 }
 
 /// Renders the plan with one heading per window, so the preview shows where
@@ -468,6 +474,8 @@ mod tests {
     fn ranges_are_described_one_based() {
         assert_eq!(describe_range(&(0..1)), "1");
         assert_eq!(describe_range(&(12..24)), "13-24");
+        assert_eq!(name_saves(&(2..3)), "save 3");
+        assert_eq!(name_saves(&(2..9)), "saves 3-9");
     }
 
     #[test]

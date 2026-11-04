@@ -54,7 +54,7 @@ pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    String::from_utf8_lossy(&output.stdout).to_string()
+    String::from_utf8_lossy_owned(output.stdout)
 }
 
 pub(crate) fn write_file(root: &Path, path: &str, contents: &str) {
@@ -145,11 +145,30 @@ pub(crate) fn respond_with_model_output(stream: TcpStream, reply: &serde_json::V
     );
 }
 
+/// Creates a repository that ignores the developer's own Git setup: commit
+/// signing, a global hooks directory, or an init template would otherwise
+/// change what every test observes.
+pub(crate) fn init_isolated_repo(path: &Path) {
+    git(path, &["init", "-q", "--template="]);
+    // Empty, as an ordinary repository's would be without its sample hooks.
+    let hooks = path.join(".git/hooks");
+    fs::create_dir_all(&hooks).expect("hooks directory should be created");
+    let hooks = hooks.display().to_string();
+    let hooks = hooks.replace('\\', "\\\\").replace('"', "\\\"");
+    let config = format!(
+        "[user]\n\tname = Kite Test\n\temail = kite@example.com\n[commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false\n[core]\n\thooksPath = \"{hooks}\"\n"
+    );
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path.join(".git/config"))
+        .expect("repository config should open");
+    std::io::Write::write_all(&mut file, config.as_bytes())
+        .expect("repository config should be written");
+}
+
 pub(crate) fn init_repo() -> TempDir {
     let repo = TempDir::new("kite-test");
-    git(&repo.path, &["init"]);
-    git(&repo.path, &["config", "user.name", "Kite Test"]);
-    git(&repo.path, &["config", "user.email", "kite@example.com"]);
+    init_isolated_repo(&repo.path);
 
     write_file(&repo.path, "tracked.txt", "base\n");
     write_file(&repo.path, "other.txt", "base\n");
@@ -194,9 +213,7 @@ pub(crate) fn init_repo_with_remote_branch(remote_branch: &str) -> (TempDir, Tem
 
 pub(crate) fn init_root_kite_repo() -> TempDir {
     let repo = TempDir::new("kite-test");
-    git(&repo.path, &["init"]);
-    git(&repo.path, &["config", "user.name", "Kite Test"]);
-    git(&repo.path, &["config", "user.email", "kite@example.com"]);
+    init_isolated_repo(&repo.path);
 
     write_file(&repo.path, "tracked.txt", "base\n");
     git(&repo.path, &["add", "tracked.txt"]);

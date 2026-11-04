@@ -50,6 +50,17 @@ enum OptionalField {
     Reasoning,
 }
 
+impl AiError {
+    fn new(message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            message: message.into(),
+            retryable,
+            rejected: None,
+            retry_after: None,
+        }
+    }
+}
+
 impl std::fmt::Display for AiError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
@@ -99,28 +110,30 @@ pub(crate) fn concurrency() -> Result<usize> {
 }
 
 /// One client for the process; timeouts vary per request, connections pool.
-fn http_client() -> &'static reqwest::Client {
+fn http_client() -> Result<&'static reqwest::Client> {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .expect("HTTP client should initialize")
-    })
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("Could not initialize the HTTP client")?;
+    Ok(CLIENT.get_or_init(|| client))
 }
 
 pub(crate) async fn complete(request: &Request) -> Result<String> {
-    let (base_url, model, api_key) = openai_env_config()?;
-    let timeout = env_duration_secs("KITE_OPENAI_TIMEOUT_SECS", DEFAULT_OPENAI_TIMEOUT_SECS)?;
-    let responses_url = format!("{}/responses", base_url.trim_end_matches('/'));
+    // A missing key or a bad setting stays wrong however often it is retried.
+    let setup = OpenAiConfig::from_env().and_then(|config| Ok((config, http_client()?)));
+    let (config, client) = setup.map_err(|error| AiError::new(format!("{error:#}"), false))?;
 
     // Start with everything that helps and drop only what the provider refuses.
     // Each field is dropped at most once, so this ends after three requests.
     let mut native_schema = true;
     let mut effort = Some(reasoning_effort());
     loop {
-        let body = request_body(&model, request, native_schema, effort.as_deref());
-        match send_responses(&responses_url, &api_key, timeout, body).await {
+        let body = request_body(&config.model, request, native_schema, effort.as_deref());
+        match send_responses(client, &config, body).await {
             Err(failure) if failure.rejected == Some(OptionalField::Format) && native_schema => {
                 // Describe the schema in the prompt instead.
                 native_schema = false;
@@ -132,6 +145,57 @@ pub(crate) async fn complete(request: &Request) -> Result<String> {
             }
             other => return other.map_err(Into::into),
         }
+    }
+}
+
+/// Asks up to `attempts` times until a reply parses and validates, feeding
+/// each rejection back with `correction`. When no reply validates, the last
+/// parsed one is returned for the caller to repair or refuse. Provider
+/// failures that cannot succeed on a retry end the attempts early; throttling
+/// and outages wait before the next one.
+pub(crate) async fn complete_validated<T>(
+    mut request: Request,
+    attempts: usize,
+    parse: impl Fn(&str) -> Result<T>,
+    validate: impl Fn(&T) -> Result<()>,
+    correction: &str,
+) -> Result<T> {
+    let input = request.user.clone();
+    let mut last_parsed = None;
+    let mut last_error = anyhow::anyhow!("synthesis was not attempted");
+
+    for attempt in 0..attempts {
+        let reply = match complete(&request).await.and_then(|raw| parse(&raw)) {
+            Ok(reply) => reply,
+            Err(error) => {
+                let retryable = is_retryable(&error);
+                let delay = retry_delay(&error, attempt);
+                last_error = error;
+                if !retryable {
+                    break;
+                }
+                if attempt + 1 < attempts {
+                    tokio::time::sleep(delay).await;
+                }
+                continue;
+            }
+        };
+
+        match validate(&reply) {
+            Ok(()) => return Ok(reply),
+            Err(error) => {
+                request.user = format!(
+                    "{input}\n\nYour previous reply was rejected: {error:#}.\n{correction}"
+                );
+                last_parsed = Some(reply);
+                last_error = error;
+            }
+        }
+    }
+
+    match last_parsed {
+        Some(reply) => Ok(reply),
+        None => Err(last_error),
     }
 }
 
@@ -190,15 +254,15 @@ fn prompt_schema_body(model: &str, request: &Request) -> serde_json::Value {
 }
 
 async fn send_responses(
-    responses_url: &str,
-    api_key: &str,
-    timeout: Duration,
+    client: &reqwest::Client,
+    config: &OpenAiConfig,
     body: serde_json::Value,
 ) -> std::result::Result<String, AiError> {
-    let mut http_request = http_client()
+    let responses_url = &config.responses_url;
+    let mut http_request = client
         .post(responses_url)
-        .timeout(timeout)
-        .bearer_auth(api_key)
+        .timeout(config.timeout)
+        .bearer_auth(&config.api_key)
         .json(&body);
     if url_uses_portkey(responses_url)
         && let Some(portkey_api_key) = first_non_empty_env(&["PORTKEY_API_KEY"])
@@ -206,12 +270,15 @@ async fn send_responses(
         http_request = http_request.header("x-portkey-api-key", portkey_api_key);
     }
 
-    let response = http_request.send().await.map_err(|error| AiError {
-        message: format!("Could not reach {responses_url}: {error}"),
-        // Timeouts, connection resets and DNS blips are all worth another go.
-        retryable: true,
-        rejected: None,
-        retry_after: None,
+    // Timeouts, connection resets and DNS blips are all worth another go.
+    let response = http_request.send().await.map_err(|error| {
+        AiError::new(
+            format!(
+                "Could not reach {responses_url}: {}",
+                transport_cause(error)
+            ),
+            true,
+        )
     })?;
 
     let status = response.status();
@@ -220,31 +287,42 @@ async fn send_responses(
         // Preserve the provider's explanation, not just its HTTP status.
         let body = response.text().await.unwrap_or_default();
         return Err(AiError {
-            message: describe_api_failure(status, &body),
-            retryable: is_retryable_status(status),
             rejected: rejected_field(status, &body),
             retry_after,
+            ..AiError::new(
+                describe_api_failure(status, &body),
+                is_retryable_status(status),
+            )
         });
     }
 
-    let body = response.text().await.map_err(|error| AiError {
-        message: format!("Could not read the reply from {responses_url}: {error}"),
-        retryable: true,
-        rejected: None,
-        retry_after: None,
+    let body = response.text().await.map_err(|error| {
+        AiError::new(
+            format!(
+                "Could not read the reply from {responses_url}: {}",
+                transport_cause(error)
+            ),
+            true,
+        )
     })?;
 
-    let json: serde_json::Value = serde_json::from_str(&body).map_err(|error| AiError {
-        message: format!(
-            "{responses_url} returned a non-JSON reply ({error}): {}",
-            elide(&body, MAX_ERROR_BODY_CHARS)
-        ),
-        retryable: true,
-        rejected: None,
-        retry_after: None,
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+        AiError::new(
+            format!(
+                "{responses_url} returned a non-JSON reply ({error}): {}",
+                elide(&body, MAX_ERROR_BODY_CHARS)
+            ),
+            true,
+        )
     })?;
 
     extract_openai_output_text(&json)
+}
+
+/// The whole cause chain: reqwest's own message names only the URL, not the
+/// timeout, DNS failure, or refused connection beneath it.
+fn transport_cause(error: reqwest::Error) -> String {
+    format!("{:#}", anyhow::Error::new(error.without_url()))
 }
 
 /// Which optional field a 400 refuses, if any. Unrelated 400s stay fatal.
@@ -283,8 +361,13 @@ fn mentions_reasoning_rejection(body: &str) -> bool {
 /// output format / extra inputs are not permitted.
 fn mentions_format_rejection(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
+    // A whole word: Pydantic gateways end every message with "For further
+    // information visit ...", which must not read as a rejected `format`.
+    let names_format = body
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word == "format");
     body.contains("output_config.format")
-        || (body.contains("format") && body.contains("extra inputs are not permitted"))
+        || (names_format && body.contains("extra inputs are not permitted"))
 }
 
 /// 4xx means the request itself is wrong and will stay wrong; the throttling
@@ -339,30 +422,45 @@ fn url_uses_portkey(url: &str) -> bool {
     })
 }
 
-fn openai_env_config() -> Result<(String, String, String)> {
-    let base_url = first_non_empty_env(&[
-        "KITE_OPENAI_URL",
-        "KITE_OPENAI_BASE_URL",
-        "OPENAI_URL",
-        "OPENAI_BASE_URL",
-    ])
-    .unwrap_or_else(|| DEFAULT_OPENAI_URL.to_string());
+/// Where requests go, how they authenticate, and how long each may take.
+struct OpenAiConfig {
+    responses_url: String,
+    model: String,
+    api_key: String,
+    timeout: Duration,
+}
 
-    let model = first_non_empty_env(&["KITE_OPENAI_MODEL", "OPENAI_MODEL"])
-        .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
+impl OpenAiConfig {
+    fn from_env() -> Result<Self> {
+        let base_url = first_non_empty_env(&[
+            "KITE_OPENAI_URL",
+            "KITE_OPENAI_BASE_URL",
+            "OPENAI_URL",
+            "OPENAI_BASE_URL",
+        ])
+        .unwrap_or_else(|| DEFAULT_OPENAI_URL.to_string());
 
-    let api_key = first_non_empty_env(&[
-        "KITE_OPENAI_API_KEY",
-        "OPENAI_API_KEY",
-        "KITE_API_KEY",
-        "OPENAI_KEY",
-        "AI_GATEWAY_API_KEY",
-    ])
-    .context(
-        "No OpenAI API key found in KITE_OPENAI_API_KEY, OPENAI_API_KEY, KITE_API_KEY, OPENAI_KEY, or AI_GATEWAY_API_KEY",
-    )?;
+        let model = first_non_empty_env(&["KITE_OPENAI_MODEL", "OPENAI_MODEL"])
+            .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
 
-    Ok((normalize_openai_base_url(&base_url), model, api_key))
+        let api_key = first_non_empty_env(&[
+            "KITE_OPENAI_API_KEY",
+            "OPENAI_API_KEY",
+            "KITE_API_KEY",
+            "OPENAI_KEY",
+            "AI_GATEWAY_API_KEY",
+        ])
+        .context(
+            "No OpenAI API key found in KITE_OPENAI_API_KEY, OPENAI_API_KEY, KITE_API_KEY, OPENAI_KEY, or AI_GATEWAY_API_KEY",
+        )?;
+
+        Ok(Self {
+            responses_url: format!("{}/responses", normalize_openai_base_url(&base_url)),
+            model,
+            api_key,
+            timeout: env_duration_secs("KITE_OPENAI_TIMEOUT_SECS", DEFAULT_OPENAI_TIMEOUT_SECS)?,
+        })
+    }
 }
 
 fn normalize_openai_base_url(base_url: &str) -> String {
@@ -381,15 +479,9 @@ fn normalize_openai_base_url(base_url: &str) -> String {
 /// Pulls the reply text out of a Responses API payload, tolerating structured
 /// output items, plain text items, and chat-completions-shaped proxies.
 fn extract_openai_output_text(json: &serde_json::Value) -> std::result::Result<String, AiError> {
-    let failure = |message: String, retryable| AiError {
-        message,
-        retryable,
-        rejected: None,
-        retry_after: None,
-    };
     if let Some(error) = json.get("error").filter(|error| !error.is_null()) {
         let detail = error.get("message").and_then(|value| value.as_str());
-        return Err(failure(
+        return Err(AiError::new(
             format!(
                 "AI response failed: {}",
                 elide(
@@ -410,7 +502,7 @@ fn extract_openai_output_text(json: &serde_json::Value) -> std::result::Result<S
             .pointer("/incomplete_details/reason")
             .and_then(|value| value.as_str())
             .unwrap_or(status);
-        return Err(failure(
+        return Err(AiError::new(
             format!(
                 "AI response did not complete: {}",
                 elide(reason, MAX_ERROR_BODY_CHARS)
@@ -439,7 +531,7 @@ fn extract_openai_output_text(json: &serde_json::Value) -> std::result::Result<S
                 return Ok(structured.to_string());
             }
             if let Some(refusal) = content.get("refusal").and_then(|v| v.as_str()) {
-                return Err(failure(
+                return Err(AiError::new(
                     format!(
                         "AI refused the request: {}",
                         elide(refusal, MAX_ERROR_BODY_CHARS)
@@ -461,7 +553,7 @@ fn extract_openai_output_text(json: &serde_json::Value) -> std::result::Result<S
         text.push_str(content);
     }
     if text.is_empty() {
-        return Err(failure(
+        return Err(AiError::new(
             "AI response contained no output text".to_string(),
             true,
         ));
@@ -537,31 +629,11 @@ pub(crate) fn extract_json_block(raw: &str, open: char, close: char) -> Option<&
     None
 }
 
-pub(crate) fn truncate_for_prompt(text: &str, max_bytes: usize) -> &str {
-    if text.len() <= max_bytes {
-        return text;
-    }
-
-    let mut cutoff = max_bytes;
-    while cutoff > 0 && !text.is_char_boundary(cutoff) {
-        cutoff -= 1;
-    }
-
-    &text[..cutoff]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{accept_ai_request, respond_json};
     use serde_json::json;
-
-    #[test]
-    fn truncate_for_prompt_respects_char_boundaries() {
-        assert_eq!(truncate_for_prompt("abcdefgh", 8), "abcdefgh");
-        assert_eq!(truncate_for_prompt("abcdefghij", 8), "abcdefgh");
-        assert_eq!(truncate_for_prompt("héllo", 2), "h"); // no mid-codepoint cuts
-    }
 
     fn local_response(payload: serde_json::Value) -> std::result::Result<String, AiError> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -569,18 +641,44 @@ mod tests {
         let server = std::thread::spawn(move || {
             respond_json(accept_ai_request(&listener), &payload);
         });
+        let config = OpenAiConfig {
+            responses_url: url,
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(5),
+        };
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(send_responses(
-                &url,
-                "test-key",
-                Duration::from_secs(5),
-                json!({}),
-            ));
+            .block_on(send_responses(http_client().unwrap(), &config, json!({})));
         server.join().unwrap();
         result
+    }
+
+    /// reqwest's own message names only the URL, which leaves a user unable
+    /// to tell a refused connection from a timeout or a DNS failure.
+    #[test]
+    fn an_unreachable_endpoint_says_why() {
+        let config = OpenAiConfig {
+            responses_url: "http://127.0.0.1:1/v1/responses".to_string(),
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(5),
+        };
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(send_responses(http_client().unwrap(), &config, json!({})))
+            .expect_err("nothing listens on port 1");
+
+        assert!(
+            error.message.to_ascii_lowercase().contains("refused"),
+            "{}",
+            error.message
+        );
+        assert!(error.retryable);
     }
 
     #[test]
@@ -720,10 +818,8 @@ mod tests {
     fn only_provider_failures_wait_before_a_retry() {
         let throttled = |retry_after| -> anyhow::Error {
             AiError {
-                message: "AI request failed (429 Too Many Requests)".to_string(),
-                retryable: true,
-                rejected: None,
                 retry_after,
+                ..AiError::new("AI request failed (429 Too Many Requests)", true)
             }
             .into()
         };
@@ -788,13 +884,8 @@ mod tests {
         let parse_failure = anyhow::anyhow!("Model reply contained no commit groups");
         assert!(is_retryable(&parse_failure));
 
-        let hard_failure: anyhow::Error = AiError {
-            message: "AI request failed (401 Unauthorized)".to_string(),
-            retryable: false,
-            rejected: None,
-            retry_after: None,
-        }
-        .into();
+        let hard_failure: anyhow::Error =
+            AiError::new("AI request failed (401 Unauthorized)", false).into();
         assert!(!is_retryable(&hard_failure));
     }
 
@@ -850,6 +941,13 @@ mod tests {
         assert!(!mentions_format_rejection(
             "reasoning: Extra inputs are not permitted"
         ));
+        // Pydantic's footer mentions "information", which holds "format".
+        let pydantic = "1 validation error for ResponsesRequest\nreasoning\n  Extra inputs are not permitted [type=extra_forbidden, input_value={'effort': 'low'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.9/v/extra_forbidden";
+        assert!(!mentions_format_rejection(pydantic));
+        assert_eq!(
+            rejected_field(reqwest::StatusCode::BAD_REQUEST, pydantic),
+            Some(OptionalField::Reasoning)
+        );
     }
 
     #[test]

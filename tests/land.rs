@@ -66,9 +66,7 @@ fn assert_success(output: &Output) {
 #[test]
 fn undoing_the_root_save_does_not_leave_a_stale_staged_snapshot() {
     let repo = TempDir::new("kite-root-save");
-    git(&repo.path, &["init", "-q"]);
-    git(&repo.path, &["config", "user.name", "Kite Test"]);
-    git(&repo.path, &["config", "user.email", "kite@example.com"]);
+    support::init_isolated_repo(&repo.path);
     write_file(&repo.path, "first.txt", "first snapshot\n");
     assert_success(&kt(&repo.path, &[]).output().unwrap());
 
@@ -1296,4 +1294,166 @@ fn windowed_lands_carry_submodule_pointers() {
         assert_success(&kt(&repo.path, &["undo"]).output().unwrap());
         assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]).trim(), saves[2]);
     }
+}
+
+/// Git refuses a repository another user owns, which is common in
+/// containers. That has to be reported with Git's own fix, not mistaken for
+/// "not a repository" and answered with the help text.
+#[test]
+fn a_repository_git_refuses_is_reported_instead_of_showing_help() {
+    let repo = init_repo();
+    write_file(&repo.path, "tracked.txt", "work\n");
+
+    // `safe.directory`, which CI images often set to `*`, lifts the check, and
+    // Git reads it only from system and global config.
+    let output = kt(&repo.path, &[])
+        .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("dubious ownership"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+}
+
+/// A repository whose `origin` fetches only its default branch, as a
+/// single-branch or shallow clone does, with a published feature branch.
+fn single_branch_clone_with_published_saves() -> (TempDir, TempDir) {
+    let repo = init_repo();
+    let remote = TempDir::new("kite-single-branch");
+    git(&remote.path, &["init", "--bare"]);
+    let base = git(&repo.path, &["branch", "--show-current"]);
+    git(
+        &repo.path,
+        &[
+            "remote",
+            "add",
+            "-t",
+            base.trim(),
+            "origin",
+            remote.path.to_str().unwrap(),
+        ],
+    );
+    git(&repo.path, &["push", "origin", base.trim()]);
+    git(&repo.path, &["switch", "-c", "feature"]);
+    save(&repo.path);
+    git(&repo.path, &["push", "origin", "feature"]);
+    (repo, remote)
+}
+
+/// Without a tracking ref, the saves on origin are only known from the fetch
+/// itself. Missing them made every publish after a land a plain push, which
+/// origin rejects, with advice that a single-branch clone cannot follow.
+#[test]
+fn publish_replaces_landed_saves_without_a_tracking_ref() {
+    let (repo, remote) = single_branch_clone_with_published_saves();
+    assert_eq!(
+        git(&repo.path, &["for-each-ref", "refs/remotes/origin/feature"]),
+        ""
+    );
+    assert_success(&land(&repo.path, false, || {}));
+
+    assert_success(&kt(&repo.path, &["publish"]).output().unwrap());
+
+    assert_eq!(
+        git(&remote.path, &["rev-parse", "feature"]),
+        git(&repo.path, &["rev-parse", "HEAD"])
+    );
+}
+
+/// Saves pushed from another machine look just like the ones a land replaces,
+/// but this land never saw them, so publishing must ask before dropping them.
+#[test]
+fn publish_asks_before_discarding_saves_the_land_did_not_replace() {
+    let (repo, remote) = single_branch_clone_with_published_saves();
+    let other = TempDir::new("kite-other-machine");
+    let clone = other.path.join("clone");
+    git(
+        &other.path,
+        &[
+            "clone",
+            "-q",
+            "--template=",
+            "--branch",
+            "feature",
+            remote.path.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    write_file(&clone, "other.txt", "work from another machine\n");
+    git(&clone, &["add", "other.txt"]);
+    git(
+        &clone,
+        &[
+            "-c",
+            "user.name=Other",
+            "-c",
+            "user.email=other@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "[kite] save 13:00:00",
+        ],
+    );
+    git(&clone, &["push", "-q", "origin", "feature"]);
+    let theirs = git(&remote.path, &["rev-parse", "feature"]);
+    assert_success(&land(&repo.path, false, || {}));
+
+    let mut publish = kt(&repo.path, &["publish"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    publish.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let output = publish.wait_with_output().unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Publishing will discard them"), "{stdout}");
+    assert_eq!(git(&remote.path, &["rev-parse", "feature"]), theirs);
+}
+
+/// A completed land vouches for the remote saves only while the branch still
+/// holds what it landed. Reset below the land, and replacing origin would also
+/// drop the human commits under those saves, so publishing must ask again.
+#[test]
+fn publish_asks_again_once_the_branch_no_longer_holds_the_land() {
+    let repo = init_repo();
+    let remote = TempDir::new("kite-reset-publish");
+    git(&remote.path, &["init", "--bare"]);
+    git(
+        &repo.path,
+        &["remote", "add", "origin", remote.path.to_str().unwrap()],
+    );
+    let base_branch = git(&repo.path, &["branch", "--show-current"]);
+    git(&repo.path, &["push", "-q", "origin", base_branch.trim()]);
+    git(&repo.path, &["switch", "-q", "-c", "feature"]);
+    let base = git(&repo.path, &["rev-parse", "HEAD"]);
+    write_file(&repo.path, "human.txt", "a teammate's work\n");
+    git(&repo.path, &["add", "human.txt"]);
+    git(&repo.path, &["commit", "-qm", "feat: human work"]);
+    save(&repo.path);
+    git(&repo.path, &["push", "-q", "-u", "origin", "feature"]);
+    let published = git(&remote.path, &["rev-parse", "feature"]);
+    assert_success(&land(&repo.path, false, || {}));
+    git(&repo.path, &["reset", "-q", "--hard", base.trim()]);
+
+    let mut publish = kt(&repo.path, &["publish"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    publish.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let output = publish.wait_with_output().unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("feat: human work"), "{stdout}");
+    assert_eq!(git(&remote.path, &["rev-parse", "feature"]), published);
 }

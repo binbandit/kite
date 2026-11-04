@@ -24,7 +24,7 @@ jobs:
       should_release: ${{ steps.meta.outputs.should_release }}
       tag_exists: ${{ steps.meta.outputs.tag_exists }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -42,7 +42,7 @@ jobs:
 
       - name: Upload release metadata
         if: steps.meta.outputs.should_release == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-metadata
           path: |
@@ -75,12 +75,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.source_sha }}
 
       - name: Apply tested release metadata
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-metadata
 
@@ -147,7 +147,7 @@ jobs:
           PY
 
       - name: Upload packaged artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-artifact-${{ matrix.target }}
           path: |
@@ -167,17 +167,17 @@ jobs:
     steps:
       # Use the source that was built. If the default branch advanced during
       # builds, an ordinary push rejects it without overwriting newer changes.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.source_sha }}
 
       - name: Download release metadata
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-metadata
 
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-artifact-*
           path: dist
@@ -200,7 +200,7 @@ jobs:
       # A draft keeps partial uploads private. Retrying uses the existing tag
       # and replaces its draft assets before making the release public.
       - name: Upload release draft
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.release_tag }}
           name: Release ${{ needs.prepare.outputs.release_tag }}

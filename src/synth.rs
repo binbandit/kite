@@ -127,8 +127,9 @@ async fn plan_groups(
         schema_name: "commit_groups".to_string(),
         schema: groups_schema(),
     };
-    complete_validated(
+    ai::complete_validated(
         request,
+        MAX_SYNTHESIS_ATTEMPTS,
         parse_groups,
         |groups: &Vec<CommitGroup>| {
             validate_group_coverage(groups, files.paths()).and_then(|()| {
@@ -138,55 +139,6 @@ async fn plan_groups(
         "Return corrected JSON that assigns every file path from the list exactly once, with messages that describe these changes.",
     )
     .await
-}
-
-/// Asks until a reply parses and validates, feeding each rejection back with
-/// `correction`. When no reply validates, the last parsed one is returned for
-/// the caller to repair. Provider failures that cannot succeed on a retry end
-/// the attempts early; throttling and outages wait before the next one.
-async fn complete_validated<T>(
-    mut request: ai::Request,
-    parse: impl Fn(&str) -> Result<T>,
-    validate: impl Fn(&T) -> Result<()>,
-    correction: &str,
-) -> Result<T> {
-    let input = request.user.clone();
-    let mut last_parsed = None;
-    let mut last_error = anyhow::anyhow!("synthesis was not attempted");
-
-    for attempt in 0..MAX_SYNTHESIS_ATTEMPTS {
-        let reply = match ai::complete(&request).await.and_then(|raw| parse(&raw)) {
-            Ok(reply) => reply,
-            Err(error) => {
-                let retryable = ai::is_retryable(&error);
-                let delay = ai::retry_delay(&error, attempt);
-                last_error = error;
-                if !retryable {
-                    break;
-                }
-                if attempt + 1 < MAX_SYNTHESIS_ATTEMPTS {
-                    tokio::time::sleep(delay).await;
-                }
-                continue;
-            }
-        };
-
-        match validate(&reply) {
-            Ok(()) => return Ok(reply),
-            Err(error) => {
-                request.user = format!(
-                    "{input}\n\nYour previous reply was rejected: {error:#}.\n{correction}"
-                );
-                last_parsed = Some(reply);
-                last_error = error;
-            }
-        }
-    }
-
-    match last_parsed {
-        Some(reply) => Ok(reply),
-        None => Err(last_error),
-    }
 }
 
 /// Keeps the plan to exactly the changed files, once each: unknown and
