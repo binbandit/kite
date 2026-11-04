@@ -3,8 +3,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::ai::truncate_for_prompt;
-
 const MAX_SKILLS: usize = 3;
 const MAX_SKILL_BYTES: usize = 4_000;
 const MAX_TEMPLATE_BYTES: usize = 6_000;
@@ -86,15 +84,16 @@ fn find_pr_skills_in(project_dirs: &[PathBuf], user_dirs: &[PathBuf]) -> Vec<Gui
                 let Some(manifest) = find_entry_case_insensitive(&skill_home, "SKILL.md") else {
                     continue;
                 };
-                let Ok(content) = std::fs::read_to_string(&manifest) else {
+                let Ok(mut content) = std::fs::read_to_string(&manifest) else {
                     continue;
                 };
                 if !seen.insert(name.to_ascii_lowercase()) || !is_pr_writing_skill(name, &content) {
                     continue;
                 }
+                content.truncate(content.floor_char_boundary(MAX_SKILL_BYTES));
                 skills.push(Guidance {
                     label: format!("{scope}: {name}"),
-                    content: truncate_for_prompt(&content, MAX_SKILL_BYTES).to_string(),
+                    content,
                 });
                 if skills.len() == MAX_SKILLS {
                     return skills;
@@ -218,17 +217,15 @@ fn find_entry_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {
 }
 
 fn read_guidance(root: &Path, path: &Path, max_bytes: usize) -> Option<Guidance> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let mut content = std::fs::read_to_string(path).ok()?;
+    content.truncate(content.floor_char_boundary(max_bytes));
     let label = path
         .strip_prefix(root)
         .unwrap_or(path)
         .display()
         .to_string();
 
-    Some(Guidance {
-        label,
-        content: truncate_for_prompt(&content, max_bytes).to_string(),
-    })
+    Some(Guidance { label, content })
 }
 
 #[cfg(test)]

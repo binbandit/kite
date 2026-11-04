@@ -11,12 +11,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::commits::{Staging, changed_paths, create_commits};
+use super::commits::{Staging, Tip, create_commits};
 use super::state::TRANSACTION_REF_PREFIX;
-use super::windows::{WindowPlan, describe_range};
+use super::windows::{WindowPlan, name_saves};
 use crate::git::{
-    Hooks, KiteBase, check_ref, current_worktree_key, empty_tree, execute_git, execute_git_with,
-    short_sha,
+    Hooks, KiteBase, changed_paths, check_ref, current_worktree_key, empty_tree, execute_git,
+    execute_git_with, short_sha,
 };
 
 /// Private checkouts live in a folder named after their land transaction, so
@@ -41,6 +41,10 @@ pub(super) fn land_windows(
     let built = checkout.run(|| build_windows(base, pre_land_sha, transaction_ref, windows, hooks));
     checkout.remove();
     let hook_changes = built?;
+    // Without hook changes the landed tree is the saved one, already in place.
+    if hook_changes.is_empty() {
+        return Ok(hook_changes);
+    }
 
     // A two-way switch from the saved tip to the landed history touches only
     // the files hooks changed, and refuses to overwrite one edited meanwhile.
@@ -92,7 +96,7 @@ fn build_windows(
     // Share the user's checkout's transaction ref, so every commit made here
     // is recorded where recovery already looks for it.
     execute_git(&["symbolic-ref", "HEAD", transaction_ref])?;
-    match base {
+    let mut tip = match base {
         KiteBase::Commit(base_sha) => {
             execute_git(&[
                 "-c",
@@ -102,19 +106,29 @@ fn build_windows(
                 "--hard",
                 base_sha,
             ])?;
+            Tip {
+                commit: Some(base_sha.clone()),
+                tree: execute_git(&["rev-parse", &format!("{base_sha}^{{tree}}")])?
+                    .trim()
+                    .to_string(),
+            }
         }
         // An unborn transaction branch makes the first landed commit a root.
         KiteBase::Root => {
             execute_git(&["update-ref", "-d", transaction_ref, pre_land_sha])?;
+            Tip {
+                commit: None,
+                tree: empty_tree()?,
+            }
         }
-    }
+    };
 
     let mut hook_changes = HashSet::new();
     let mut previous_save = base.tree_ish()?;
     let last = windows.len().saturating_sub(1);
     for (position, window) in windows.iter().enumerate() {
-        let changed = land_window(&previous_save, window, hooks).with_context(|| {
-            let mut context = format!("Could not land saves {}", describe_range(&window.saves));
+        let (landed, changed) = land_window(&previous_save, window, hooks, tip).with_context(|| {
+            let mut context = format!("Could not land {}", name_saves(&window.saves));
             if position < last {
                 context.push_str(
                     ". Earlier saves land exactly as they were made; if a hook rejects work a later save fixed, land with --no-verify or a coarser --granularity",
@@ -122,19 +136,24 @@ fn build_windows(
             }
             context
         })?;
+        tip = landed;
         hook_changes.extend(changed);
         previous_save = window.save.clone();
     }
     Ok(hook_changes)
 }
 
-/// Lands one window: checks out its last save's files, carrying committed
-/// hook edits to files the window leaves alone, then commits its groups
-/// from the save's exact entries.
-fn land_window(previous_save: &str, window: &WindowPlan, hooks: Hooks) -> Result<HashSet<String>> {
+/// Lands one window on `tip`: checks out its last save's files, carrying
+/// committed hook edits to files the window leaves alone, then commits its
+/// groups from the save's exact entries.
+fn land_window(
+    previous_save: &str,
+    window: &WindowPlan,
+    hooks: Hooks,
+    tip: Tip,
+) -> Result<(Tip, HashSet<String>)> {
     let entries = saved_entries(previous_save, &window.save)?;
-    let current = head_tree()?;
-    let target = apply_entries(&current, &entries)?;
+    let target = apply_entries(&tip.tree, &entries)?;
     // `--reset` also discards edits a hook left unstaged in an earlier
     // window. They were never committed, and this checkout is Kite's alone.
     // Submodules stay as they are: their pointers are staged from the save.
@@ -147,13 +166,14 @@ fn land_window(previous_save: &str, window: &WindowPlan, hooks: Hooks) -> Result
         &target,
     ])?;
     // Unstage again: each group stages its own files.
-    match check_ref("HEAD") {
+    match tip.commit {
         Some(_) => execute_git(&["-c", "submodule.recurse=false", "reset", "-q"])?,
         None => execute_git(&["read-tree", "--empty"])?,
     };
 
-    let hook_changes = create_commits(&window.commits, hooks, &Staging::Saved(&entries))?;
-    for path in changed_paths(&target, &head_tree()?)? {
+    let (tip, hook_changes) =
+        create_commits(&window.commits, hooks, &Staging::Saved(&entries), tip)?;
+    for path in changed_paths(&target, &tip.tree)? {
         if !hook_changes.contains(&path) {
             anyhow::bail!(
                 "The landed contents of {path:?} differ from save {} without a committed hook change.",
@@ -161,14 +181,7 @@ fn land_window(previous_save: &str, window: &WindowPlan, hooks: Hooks) -> Result
             );
         }
     }
-    Ok(hook_changes)
-}
-
-fn head_tree() -> Result<String> {
-    match check_ref("HEAD^{tree}") {
-        Some(tree) => Ok(tree),
-        None => empty_tree(),
-    }
+    Ok((tip, hook_changes))
 }
 
 /// Each path that changed between saves `from` and `to`, with the

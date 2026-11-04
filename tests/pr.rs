@@ -186,6 +186,13 @@ fn repository(name_with_owner: &str, parent: Option<&str>) -> String {
     .to_string()
 }
 
+/// `repository` as GitHub reports it when its default branch is `branch`.
+fn with_default_branch(repository: String, branch: &str) -> String {
+    let mut repository: serde_json::Value = serde_json::from_str(&repository).unwrap();
+    repository["defaultBranchRef"] = serde_json::json!({ "name": branch });
+    repository.to_string()
+}
+
 /// An open pull request as `gh pr list` reports it, from the `head` repository.
 fn open_pr(number: u32, title: &str, base: &str, head: &str) -> serde_json::Value {
     let (owner, name) = head.split_once('/').unwrap();
@@ -890,4 +897,46 @@ fn ship_to_parent_publishes_only_to_fork_and_can_skip_commit_hooks() {
         "pushed\n"
     );
     assert!(repo.calls().contains("pr create --head me:feature"));
+}
+
+/// GitHub's own default wins over a local `origin/HEAD` recorded before the
+/// repository renamed its default branch.
+#[test]
+fn pr_defaults_to_the_branch_github_reports_as_default() {
+    let repo = PrRepo::new();
+    let path = &repo.repo.path;
+    git(
+        path,
+        &[
+            "push",
+            repo.remote.path.to_str().unwrap(),
+            "HEAD~:refs/heads/trunk",
+        ],
+    );
+    git(path, &["fetch", "-q", "origin"]);
+    git(
+        path,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            &format!("refs/remotes/origin/{}", repo.base),
+        ],
+    );
+
+    let output = repo
+        .pr_command_with_default_base("[]", false)
+        .env(
+            "FETCH_REPO",
+            with_default_branch(repository("owner/repo", None), "trunk"),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = repo.calls();
+    assert!(calls.contains("--base trunk"), "{calls}");
 }

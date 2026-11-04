@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
-use fs2::FileExt;
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, PoisonError};
 
 const MAX_COMMIT_FAILURE_LINES: usize = 12;
 const FIRST_LOG_PAGE_SIZE: usize = 100;
@@ -25,55 +24,87 @@ pub(crate) struct SaveStack {
     pub(crate) count: usize,
 }
 
-/// Memoizes the repo root for the current working directory so we don't spawn an
-/// extra `git rev-parse --show-toplevel` before every git invocation. The cache is
-/// keyed on the cwd, so it stays correct if the process changes directories (e.g.
-/// across test repositories). Returns `Ok(None)` outside a repository and `Err`
-/// only when git itself could not be run.
-fn find_repo_root() -> Result<Option<PathBuf>> {
-    static CACHE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
+/// The checkout Git reports for the current directory.
+#[derive(Clone)]
+struct Checkout {
+    root: PathBuf,
+    /// The checkout's administrative directory, unique to each linked
+    /// worktree even when several sit on detached commits.
+    git_dir: String,
+}
 
+/// Asked once per directory, in one subprocess: every git call needs the
+/// root, and most commands need the git directory several times. Keyed on the
+/// cwd, so it stays correct when the process changes directories (a windowed
+/// land's private checkout, test repositories). `Ok(None)` only outside a
+/// repository; a repository Git refuses, such as one owned by another user,
+/// is an error that says why.
+fn current_checkout() -> Result<Option<Checkout>> {
+    static CACHE: Mutex<Option<(PathBuf, Checkout)>> = Mutex::new(None);
     let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
-
+    let mut cached = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((cached_cwd, checkout)) = cached.as_ref()
+        && *cached_cwd == cwd
     {
-        let guard = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((cached_cwd, cached_root)) = guard.as_ref()
-            && *cached_cwd == cwd
-        {
-            return Ok(Some(cached_root.clone()));
-        }
+        return Ok(Some(checkout.clone()));
     }
+    let Some(paths) = rev_parse_paths(&["--show-toplevel", "--absolute-git-dir"])? else {
+        return Ok(None);
+    };
+    // One line each, unless a path itself holds a newline; then ask for them
+    // one at a time.
+    let (root, git_dir) = match paths.split_once('\n') {
+        Some((root, git_dir)) if !git_dir.contains('\n') => (root.to_string(), git_dir.to_string()),
+        _ => (
+            rev_parse_paths(&["--show-toplevel"])?.unwrap_or_default(),
+            rev_parse_paths(&["--absolute-git-dir"])?.unwrap_or_default(),
+        ),
+    };
+    if root.is_empty() || git_dir.is_empty() {
+        anyhow::bail!("Could not identify the current Git worktree.");
+    }
+    let checkout = Checkout {
+        root: PathBuf::from(root),
+        git_dir,
+    };
+    *cached = Some((cwd, checkout.clone()));
+    Ok(Some(checkout))
+}
 
+/// `git rev-parse` paths from the current directory, without the final
+/// newline only: a directory name may end in a space. `Ok(None)` outside a
+/// repository. Git's message is matched in English whatever the locale.
+fn rev_parse_paths(args: &[&str]) -> Result<Option<String>> {
     let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
+        .arg("rev-parse")
+        .args(args)
+        .env("LC_ALL", "C")
         .output()
         .context("Failed to run git. Is it installed and on your PATH?")?;
-
     if !output.status.success() {
-        return Ok(None);
+        if String::from_utf8_lossy(&output.stderr).contains("not a git repository") {
+            return Ok(None);
+        }
+        return Err(git_failure(&["rev-parse"], &output));
     }
-
-    let output =
+    let mut paths =
         String::from_utf8(output.stdout).context("The repository path must be valid UTF-8")?;
-    let root = PathBuf::from(output.strip_suffix('\n').unwrap_or(&output));
-
-    let mut guard = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = Some((cwd, root.clone()));
-
-    Ok(Some(root))
+    if paths.ends_with('\n') {
+        paths.pop();
+    }
+    Ok(Some(paths))
 }
 
 pub(crate) fn repo_root() -> Result<PathBuf> {
-    find_repo_root()?.context("Kite must be run inside a Git repository")
+    Ok(checkout()?.root)
 }
 
 pub(crate) fn is_inside_git_repository() -> Result<bool> {
-    Ok(find_repo_root()?.is_some())
+    Ok(current_checkout()?.is_some())
+}
+
+fn checkout() -> Result<Checkout> {
+    current_checkout()?.context("Kite must be run inside a Git repository")
 }
 
 /// An advisory lock held for one complete Kite command in this worktree.
@@ -85,7 +116,7 @@ pub(crate) struct WorktreeCommandLock(File);
 
 impl Drop for WorktreeCommandLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
+        let _ = self.0.unlock();
     }
 }
 
@@ -103,24 +134,24 @@ pub(crate) fn lock_current_worktree() -> Result<WorktreeCommandLock> {
                 lock_path.display()
             )
         })?;
-    file.try_lock_exclusive().with_context(|| {
-        "Another Kite command is already running in this worktree. Wait for it to finish, then retry."
-    })?;
-    Ok(WorktreeCommandLock(file))
+    match file.try_lock() {
+        Ok(()) => Ok(WorktreeCommandLock(file)),
+        Err(TryLockError::WouldBlock) => anyhow::bail!(
+            "Another Kite command is already running in this worktree. Wait for it to finish, then retry."
+        ),
+        Err(TryLockError::Error(error)) => Err(error).with_context(|| {
+            format!(
+                "Could not lock Kite's worktree lock at {}",
+                lock_path.display()
+            )
+        }),
+    }
 }
 
 fn git_command() -> Result<Command> {
     let mut command = Command::new("git");
     command.current_dir(repo_root()?);
     Ok(command)
-}
-
-/// Takes ownership of command output without a second full copy. `git diff`
-/// output can be tens of megabytes, and `from_utf8_lossy(..).to_string()`
-/// would allocate all of it a second time even when it is valid UTF-8.
-fn into_string(bytes: Vec<u8>) -> String {
-    String::from_utf8(bytes)
-        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
 }
 
 pub(crate) fn execute_git(args: &[&str]) -> Result<String> {
@@ -130,13 +161,20 @@ pub(crate) fn execute_git(args: &[&str]) -> Result<String> {
         .with_context(|| format!("Failed 'git {}'", args.join(" ")))?;
 
     if !output.status.success() {
-        anyhow::bail!(
-            "Git error: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        return Err(git_failure(args, &output));
     }
 
-    Ok(into_string(output.stdout))
+    Ok(String::from_utf8_lossy_owned(output.stdout))
+}
+
+/// Git's own explanation, or which command failed when it printed none (as
+/// `check-ref-format` does for an invalid name).
+fn git_failure(args: &[&str], output: &Output) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match stderr.trim() {
+        "" => anyhow::anyhow!("`git {}` failed ({})", args.join(" "), output.status),
+        stderr => anyhow::anyhow!("Git error: {stderr}"),
+    }
 }
 
 /// Like `execute_git`, but with extra environment variables and optional
@@ -193,13 +231,10 @@ pub(crate) fn execute_git_with(
     })?;
 
     if !output.status.success() {
-        anyhow::bail!(
-            "Git error: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        return Err(git_failure(args, &output));
     }
 
-    Ok(into_string(output.stdout))
+    Ok(String::from_utf8_lossy_owned(output.stdout))
 }
 
 pub(crate) fn has_staged_changes(status: &str) -> bool {
@@ -215,16 +250,15 @@ pub(crate) enum Hooks {
     Skip,
 }
 
-pub(crate) fn commit_git(message: &str, hooks: Hooks, allow_empty: bool) -> Result<()> {
+/// Commits the index. An empty commit is allowed: landing removes one a
+/// formatter emptied, and a quicksave only commits once something is staged.
+pub(crate) fn commit_git(message: &str, hooks: Hooks) -> Result<()> {
     let mut args = Vec::new();
     if hooks == Hooks::Skip {
         // --no-verify still runs prepare-commit-msg and post-commit.
         args.extend(["-c", "core.hooksPath=/dev/null"]);
     }
-    args.extend(["commit", "-m", message]);
-    if allow_empty {
-        args.push("--allow-empty");
-    }
+    args.extend(["commit", "--allow-empty", "-m", message]);
 
     let output = git_command()?
         .args(&args)
@@ -291,16 +325,17 @@ fn indent_block(text: &str) -> String {
         .join("\n")
 }
 
-pub(crate) fn get_default_branch() -> Result<String> {
-    if has_remote() {
-        let base = base_remote()?;
-        if let Some(branch) = recorded_default_branch(&base) {
+/// The branch new work starts from: `base`'s default when the repository has
+/// a remote (`base_remote`), else `main`, `master`, or the current branch.
+pub(crate) fn get_default_branch(base: Option<&str>) -> Result<String> {
+    if let Some(base) = base {
+        if let Some(branch) = recorded_default_branch(base) {
             return Ok(branch);
         }
         // `git remote add` only records the remote's HEAD from Git 2.48 on,
         // and a fork's own default can differ from its parent's, so ask.
         if base != "origin" {
-            let advertised = execute_git(&["ls-remote", "--symref", &base, "HEAD"])
+            let advertised = execute_git(&["ls-remote", "--symref", base, "HEAD"])
                 .with_context(|| format!("Could not determine the default branch of {base}"))?;
             return advertised
                 .lines()
@@ -432,21 +467,17 @@ pub(crate) fn branch_to_publish() -> Result<String> {
 /// gives each worktree its own administrative directory even when several
 /// point at detached commits.
 pub(crate) fn current_worktree_key() -> Result<String> {
-    let git_dir = execute_git(&["rev-parse", "--absolute-git-dir"])?;
-    let git_dir = git_dir.trim();
-    if git_dir.is_empty() {
-        anyhow::bail!("Could not identify the current Git worktree.");
-    }
-    Ok(git_dir.to_string())
+    Ok(checkout()?.git_dir)
 }
 
-/// Names an unfinished Git operation in this worktree, if there is one.
+/// Refuses to run `command` during an unfinished Git operation in this
+/// worktree.
 ///
 /// A clean index does not mean Git is idle: an interactive rebase, bisect, or
 /// no-conflict cherry-pick can all leave `HEAD` detached without any unmerged
 /// paths. Kite must not mistake that temporary checkout for an ordinary
 /// detached worktree and start its own history rewrite on top of it.
-pub(crate) fn active_git_operation() -> Result<Option<&'static str>> {
+pub(crate) fn ensure_no_git_operation(command: &str) -> Result<()> {
     let git_dir = PathBuf::from(current_worktree_key()?);
     let markers = [
         ("rebase-merge", "rebase"),
@@ -458,9 +489,15 @@ pub(crate) fn active_git_operation() -> Result<Option<&'static str>> {
         ("sequencer", "sequenced cherry-pick or revert"),
     ];
 
-    Ok(markers
+    if let Some((_, operation)) = markers
         .into_iter()
-        .find_map(|(path, operation)| git_dir.join(path).exists().then_some(operation)))
+        .find(|(path, _)| git_dir.join(path).exists())
+    {
+        anyhow::bail!(
+            "Git has a {operation} in progress. Finish or abort it before running `{command}`."
+        );
+    }
+    Ok(())
 }
 
 /// True when the repository is mid-merge, mid-rebase, or otherwise holding
@@ -483,22 +520,6 @@ pub(crate) fn is_save_subject(subject: &str) -> bool {
         .trim_start()
         .strip_prefix(SAVE_PREFIX)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-}
-
-/// Reads legacy local marker config written by Kite versions before rollback
-/// state moved into one atomic ref-backed object.
-pub(crate) fn config_get(key: &str) -> Option<String> {
-    execute_git(&["config", "--local", "--get", key])
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-pub(crate) fn config_unset(key: &str) -> Result<()> {
-    if config_get(key).is_none() {
-        return Ok(());
-    }
-    execute_git(&["config", "--local", "--unset", key]).map(|_| ())
 }
 
 /// True when `ancestor` is reachable from `descendant`, i.e. pushing
@@ -565,24 +586,26 @@ fn gh_default() -> Option<(String, String)> {
 /// The remote whose URL points to `repository` (`owner/name`). Without one
 /// there is nothing to fetch the chosen repository's branches from.
 fn remote_for_repository(recorded_on: &str, repository: &str) -> Result<String> {
-    let remotes = execute_git(&["remote"])?;
-    for remote in remotes
+    // `name<TAB>url (fetch)` for every remote, with `insteadOf` rewrites applied.
+    let listed = execute_git(&["remote", "-v"])?;
+    let fetch_urls: Vec<(&str, &str)> = listed
         .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        let url = execute_git(&["remote", "get-url", remote])?;
-        if split_repository_url(url.trim())
-            .is_some_and(|(_, path)| path.eq_ignore_ascii_case(repository))
-        {
-            return Ok(remote.to_string());
-        }
+        .filter_map(|line| {
+            let (remote, url) = line.split_once('\t')?;
+            Some((remote, url.strip_suffix(" (fetch)")?))
+        })
+        .collect();
+    if let Some((remote, _)) = fetch_urls.iter().find(|(_, url)| {
+        split_repository_url(url).is_some_and(|(_, path)| path.eq_ignore_ascii_case(repository))
+    }) {
+        return Ok(remote.to_string());
     }
 
-    let example = execute_git(&["remote", "get-url", recorded_on])
-        .ok()
-        .and_then(|url| {
-            split_repository_url(url.trim()).map(|(host, _)| format!("{host}{repository}"))
+    let example = fetch_urls
+        .iter()
+        .find(|(remote, _)| *remote == recorded_on)
+        .and_then(|(_, url)| {
+            split_repository_url(url).map(|(host, _)| format!("{host}{repository}"))
         })
         .unwrap_or_else(|| "<url>".to_string());
     anyhow::bail!(
@@ -692,29 +715,54 @@ pub(crate) fn saved_changes(base: &KiteBase) -> Result<(Vec<String>, String)> {
 /// The exact paths that differ between two commits or trees, and the diff
 /// explaining them.
 ///
-/// They are fetched together because landing stages the paths while the model
-/// only reads the diff. Two independently flagged commands could describe
-/// different changes, and the paths are the half that decides what lands.
+/// One diff produces both, so they describe the same snapshot: landing stages
+/// the paths while the model only reads the patch, and the paths are the half
+/// that decides what lands. Its NUL-separated raw records name each file
+/// exactly; git otherwise C-quotes any path holding a quote, a backslash, or a
+/// newline, and escapes every non-ASCII one.
 pub(crate) fn changes_between(from: &str, to: &str) -> Result<(Vec<String>, String)> {
-    // NUL-separated: git otherwise C-quotes any path holding a quote, a
-    // backslash, or a newline, and escapes every non-ASCII one, none of which
-    // name the file they came from.
-    let listed = diff_between(from, to, &["--name-only", "-z"])?;
-    let paths = listed
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
-
     // Explicit prefixes and colour off keep the patch in the shape the model
     // expects whatever the user's diff configuration says.
-    let diff = diff_between(
+    let mut output = diff_between(
         from,
         to,
-        &["-p", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"],
+        &[
+            "--raw",
+            "-z",
+            "-p",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+        ],
     )?;
+    // Each record is `:<modes, ids, status>\0<path>\0`; an empty field then
+    // separates them from the patch.
+    let mut paths = Vec::new();
+    let mut rest = output.as_str();
+    while let Some(record) = rest.strip_prefix(':') {
+        let (path, after) = record
+            .split_once('\0')
+            .and_then(|(_, after_meta)| after_meta.split_once('\0'))
+            .with_context(|| format!("Unexpected diff record {:?}", elided(record)))?;
+        paths.push(path.to_string());
+        rest = after;
+    }
+    let patch_start = output.len() - rest.strip_prefix('\0').unwrap_or(rest).len();
+    output.drain(..patch_start);
+    Ok((paths, output))
+}
 
-    Ok((paths, diff))
+fn elided(text: &str) -> &str {
+    &text[..text.floor_char_boundary(80)]
+}
+
+/// The exact paths that differ between two commits or trees.
+pub(crate) fn changed_paths(from: &str, to: &str) -> Result<Vec<String>> {
+    Ok(diff_between(from, to, &["--name-only", "-z"])?
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// One `[kite] save` commit, with enough about its size to plan around.
@@ -843,7 +891,9 @@ fn save_stack_in_pages(first_page_size: usize) -> Result<Option<SaveStack>> {
         args.push("--");
         let output = match execute_git(&args) {
             Ok(output) => output,
-            Err(_) if last_read.is_none() => return Ok(None), // no commits yet
+            // Only an unborn branch means there are no saves; other failures
+            // must not read as an empty stack.
+            Err(_) if last_read.is_none() && !has_head_commit() => return Ok(None),
             Err(error) => return Err(error),
         };
 
@@ -989,7 +1039,7 @@ mod tests {
     fn head_position_reads_an_unborn_branch_as_a_branch() {
         let _lock = acquire_cwd_lock();
         let repo = crate::test_support::TempDir::new("kite-test-unborn");
-        git(&repo.path, &["init", "-q"]);
+        crate::test_support::init_isolated_repo(&repo.path);
 
         let expected = git(&repo.path, &["symbolic-ref", "--short", "HEAD"])
             .trim()
@@ -1330,9 +1380,7 @@ mod tests {
         // A stack down to the root fills its pages exactly, so the last page
         // resumes from the root commit and finds nothing past it.
         let root = TempDir::new("kite-root-saves");
-        git(&root.path, &["init"]);
-        git(&root.path, &["config", "user.name", "Kite Test"]);
-        git(&root.path, &["config", "user.email", "kite@example.com"]);
+        crate::test_support::init_isolated_repo(&root.path);
         for save in 0..3 {
             git(
                 &root.path,

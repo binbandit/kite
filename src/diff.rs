@@ -155,6 +155,11 @@ impl<'a> Section<'a> {
                 fits
             })
             .count();
+        // A trimmed marker under no file name tells the model nothing, and the
+        // separate path list already names every file.
+        if kept == 0 {
+            return;
+        }
         let kept_header = kept.min(self.header.len());
         let hunks = &self.hunks[..kept - kept_header];
 
@@ -418,6 +423,28 @@ Binary files a/logo.png and b/logo.png differ
         // An even three-way split would give big.txt 200 bytes; it gets the rest.
         let big = &rendered[..rendered.find("diff --git a/a.txt").unwrap()];
         assert!(big.len() > 450, "{}", big.len());
+    }
+
+    /// Thousands of files leave each one a sliver of the budget. A sliver too
+    /// small for its file name must not become a marker that names nothing.
+    #[test]
+    fn a_file_with_no_room_for_its_name_leaves_no_bare_marker() {
+        let diff: String = (0..40)
+            .map(|index| {
+                let path = format!("a/deeply/nested/directory/for/file-{index:02}.txt");
+                format!(
+                    "diff --git a/{path} b/{path}\n@@ -0,0 +1 @@\n+{}\n",
+                    "x".repeat(200)
+                )
+            })
+            .collect();
+        let files = ChangedFiles::new(Vec::new(), diff);
+
+        let rendered = files.render_diff(COMPACTED.len() + 40 * (TRIMMED.len() + 20));
+
+        assert!(!rendered.contains(TRIMMED), "{rendered}");
+        // With room for the names, trimmed files still say so.
+        assert!(files.render_diff(10_000).contains(TRIMMED));
     }
 
     #[test]

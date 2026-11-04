@@ -18,7 +18,7 @@ use colored::*;
 use std::process::ExitCode;
 
 use crate::git::{
-    Hooks, SAVE_PREFIX, active_git_operation, base_remote, check_ref, commit_git, execute_git,
+    Hooks, SAVE_PREFIX, base_remote, check_ref, commit_git, ensure_no_git_operation, execute_git,
     get_default_branch, has_remote, has_staged_changes, has_unmerged_paths,
     is_inside_git_repository, kite_save_stack, lock_current_worktree,
 };
@@ -144,10 +144,7 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        None if !inside_repo => {
-            print!("{}", render_help());
-            Ok(())
-        }
+        None if !inside_repo => Ok(Cli::command().print_help()?),
         None => save(),
         Some(Commands::Go { name }) => go(&name),
         Some(Commands::Land {
@@ -196,24 +193,24 @@ fn block_on(future: impl Future<Output = Result<()>>) -> Result<()> {
         .block_on(future)
 }
 
-fn render_help() -> String {
-    let mut command = Cli::command();
-    format!("{}\n", command.render_help())
-}
-
 fn save() -> Result<()> {
-    if let Some(operation) = active_git_operation()? {
-        anyhow::bail!("Git has a {operation} in progress. Finish or abort it before running `kt`.");
-    }
+    ensure_no_git_operation("kt")?;
 
-    // -uall lists files inside untracked directories, so the count is honest.
-    let status = execute_git(&["status", "--porcelain", "--ignore-submodules=none", "-uall"])?;
+    let status = execute_git(&[
+        "status",
+        "--porcelain",
+        "--ignore-submodules=none",
+        // `add -A` takes untracked files whatever `status.showUntrackedFiles`
+        // says, so they must count as something to save.
+        "--untracked-files=normal",
+    ])?;
 
     // Committing here would either fail with a wall of git hints or record the
-    // conflict markers as if they were real content.
+    // conflict markers as if they were real content. An unfinished merge was
+    // refused above, so these come from something like a conflicted stash pop.
     if has_unmerged_paths(&status) {
         anyhow::bail!(
-            "This repository has unresolved merge conflicts. Fix the conflicted files, `git add` them, and finish the merge before saving."
+            "This repository has unresolved conflicts. Fix the conflicted files and `git add` them before saving."
         );
     }
 
@@ -249,7 +246,7 @@ fn save() -> Result<()> {
     }
 
     let msg = format!("{SAVE_PREFIX} {}", Local::now().format("%H:%M:%S"));
-    commit_git(&msg, Hooks::Skip, false)?;
+    commit_git(&msg, Hooks::Skip)?;
 
     println!(
         "{} {}",
@@ -260,11 +257,7 @@ fn save() -> Result<()> {
 }
 
 fn go(name: &str) -> Result<()> {
-    if let Some(operation) = active_git_operation()? {
-        anyhow::bail!(
-            "Git has a {operation} in progress. Finish or abort it before running `kt go`."
-        );
-    }
+    ensure_no_git_operation("kt go")?;
 
     let local_ref = format!("refs/heads/{name}");
     if name.starts_with('-') {
@@ -310,7 +303,7 @@ fn go(name: &str) -> Result<()> {
         return Ok(());
     }
 
-    let default_branch = get_default_branch()?;
+    let default_branch = get_default_branch(has_remote.then_some(base_remote.as_str()))?;
     let remote_base = format!("refs/remotes/{base_remote}/{default_branch}");
     let base = if has_remote && check_ref(&remote_base).is_some() {
         remote_base
@@ -348,7 +341,7 @@ mod tests {
     fn run_default_in_cwd(path: &std::path::Path) -> Result<Option<String>> {
         crate::test_support::with_repo_cwd(path, || {
             if !is_inside_git_repository()? {
-                return Ok(Some(render_help()));
+                return Ok(Some(Cli::command().render_help().to_string()));
             }
 
             save()?;
@@ -482,14 +475,46 @@ mod tests {
         let directory = TempDir::new("kite-test-whitespace");
         let repo = directory.path.join("repository ");
         std::fs::create_dir(&repo).expect("repository should be created");
-        git(&repo, &["init", "-q"]);
-        git(&repo, &["config", "user.name", "Kite Test"]);
-        git(&repo, &["config", "user.email", "kite@example.com"]);
+        crate::test_support::init_isolated_repo(&repo);
         write_file(&repo, "saved.txt", "work\n");
 
         run_save_in_repo(&repo).expect("the repository path must retain its trailing space");
 
         assert!(git(&repo, &["log", "-1", "--format=%s"]).starts_with(SAVE_PREFIX));
+    }
+
+    /// `add -A` takes untracked files whatever `status.showUntrackedFiles`
+    /// says, so hiding them from status must not hide them from a save.
+    #[test]
+    fn save_includes_new_files_when_status_hides_untracked_ones() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+        git(&repo.path, &["config", "status.showUntrackedFiles", "no"]);
+        write_file(&repo.path, "new.txt", "brand new\n");
+
+        run_save_in_repo(&repo.path).expect("save should succeed");
+
+        assert_eq!(
+            git(&repo.path, &["show", "--name-only", "--format=", "HEAD"]).trim(),
+            "new.txt"
+        );
+    }
+
+    /// `check-ref-format` explains nothing on stderr, so the failure has to
+    /// name the command rather than end on an empty "Git error: ".
+    #[test]
+    fn go_explains_an_invalid_branch_name() {
+        let _lock = acquire_cwd_lock();
+        let repo = init_repo();
+
+        let error = run_go_in_repo(&repo.path, "a..b").expect_err("`a..b` is not a branch name");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("Invalid branch name `a..b`"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("check-ref-format"), "{rendered}");
     }
 
     #[test]
@@ -568,12 +593,7 @@ mod tests {
             git(&repo.path, &["branch", "--show-current"]).trim(),
             "new-work"
         );
-        assert!(
-            crate::test_support::with_repo_cwd(&repo.path, || crate::git::config_get(
-                "branch.new-work.remote"
-            ))
-            .is_none()
-        );
+        assert!(!git(&repo.path, &["config", "--list"]).contains("branch.new-work.remote"));
     }
 
     #[test]
@@ -746,7 +766,12 @@ mod tests {
             Some(Commands::Publish)
         ));
         // Visible, so it shows up for someone reading `kt --help`.
-        assert!(render_help().contains("[alias: push]"));
+        assert!(
+            Cli::command()
+                .render_help()
+                .to_string()
+                .contains("[alias: push]")
+        );
     }
 
     /// Every other command points at `kt undo` when recovery state is

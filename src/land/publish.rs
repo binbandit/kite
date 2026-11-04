@@ -1,10 +1,10 @@
 //! Publish a reviewed branch using an explicit lease when history diverges.
 
+use super::state::{PreLandState, pre_land_state};
 use crate::git::{
-    branch_to_publish, check_ref, execute_git, has_remote, is_ancestor, is_save_subject,
-    subjects_missing_from_head,
+    branch_to_publish, check_ref, execute_git, has_remote, is_ancestor, subjects_missing_from_head,
 };
-use crate::ui::{Spinner, confirm, flatten_error, overflow_note, pluralize};
+use crate::ui::{Spinner, confirm, overflow_note, pluralize};
 use anyhow::{Result, anyhow};
 use colored::*;
 
@@ -35,12 +35,7 @@ pub(crate) fn publish_current_branch() -> Result<()> {
     // stale causes a safe rejection, never a clobber. Only when there is no
     // tracking ref at all — nothing to lease against, which is precisely the
     // dangerous case — is it worth a round trip to find out what is there.
-    let remote_sha = check_ref(&remote_ref).or_else(|| {
-        let spinner = Spinner::start(format!("Checking origin/{branch}"));
-        let _ = execute_git(&["fetch", "origin", &branch]);
-        spinner.stop();
-        check_ref(&remote_ref)
-    });
+    let remote_sha = check_ref(&remote_ref).or_else(|| fetch_remote_tip(&branch));
 
     let force = match &remote_sha {
         // Nothing on the remote yet, or the remote is already an ancestor:
@@ -64,13 +59,9 @@ pub(crate) fn publish_current_branch() -> Result<()> {
 
     pushed.map_err(|error| {
         // A rejected lease has one cause and one fix, and git's four lines of
-        // remote URLs and ref arrows only bury them. Everything else — auth,
-        // a missing remote, a hook — still needs git's own words.
-        let detail = flatten_error(&format!("{error:#}"));
-        if ["stale info", "fetch first", "non-fast-forward"]
-            .iter()
-            .any(|marker| detail.contains(marker))
-        {
+        // remote URLs and ref arrows only bury them. Everything else - auth,
+        // a missing remote, a hook - still needs git's own words.
+        if remote_moved(&error) {
             anyhow!(
                 "Push rejected - `origin/{branch}` has moved since you last fetched it. Run `git fetch origin {branch}` to see what changed, then rerun `kt publish`."
             )
@@ -82,14 +73,40 @@ pub(crate) fn publish_current_branch() -> Result<()> {
     Ok(())
 }
 
-/// The remote has commits this branch does not. When they are all Kite saves
-/// they are the ones we just landed, so replacing them is the whole point.
-/// Anything else is someone's work and needs an explicit yes.
+/// Fetches `branch`'s tip from origin when no tracking ref records it. A
+/// single-branch or shallow clone has no fetch refspec for the branch, so the
+/// fetch only writes `FETCH_HEAD`; reading it there keeps the user's refspecs
+/// as they are. A branch origin does not have fails to fetch, which leaves
+/// nothing to lease against.
+fn fetch_remote_tip(branch: &str) -> Option<String> {
+    let spinner = Spinner::start(format!("Checking origin/{branch}"));
+    let fetched = execute_git(&["fetch", "origin", &format!("refs/heads/{branch}")]);
+    spinner.stop();
+    fetched.ok()?;
+    check_ref(&format!("refs/remotes/origin/{branch}")).or_else(|| check_ref("FETCH_HEAD"))
+}
+
+/// Whether a push was refused because the remote ref no longer matches what
+/// this clone last saw, as opposed to auth, network, or hook failures.
+pub(super) fn remote_moved(push_error: &anyhow::Error) -> bool {
+    let detail = format!("{push_error:#}");
+    ["stale info", "fetch first", "non-fast-forward"]
+        .iter()
+        .any(|marker| detail.contains(marker))
+}
+
+/// The remote has commits this branch does not. When the last land on this
+/// branch started from them, they are the saves it just rewrote, and
+/// replacing them is the whole point. Saves pushed from another machine or by
+/// someone else look the same but are not in that land, so anything else
+/// needs an explicit yes.
 fn confirm_discarding_remote_commits(branch: &str, remote_sha: &str) -> Result<()> {
-    let dropped = subjects_missing_from_head(remote_sha)?;
-    if dropped.iter().all(|subject| is_save_subject(subject)) {
+    if matches!(pre_land_state(), PreLandState::Completed(land)
+        if land.target == branch && is_ancestor(remote_sha, &land.pre_land_sha))
+    {
         return Ok(());
     }
+    let dropped = subjects_missing_from_head(remote_sha)?;
 
     println!(
         "{} `origin/{branch}` has {} that {} does not:",

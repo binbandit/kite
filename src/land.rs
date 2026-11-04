@@ -7,14 +7,9 @@ mod replay;
 mod stash;
 mod state;
 mod windows;
-use commits::{Staging, create_commits, verify_saved_tree};
+use commits::{Staging, Tip, create_commits, verify_saved_tree};
 pub(crate) use publish::publish_current_branch;
-#[cfg(test)]
-pub(crate) use recovery::heal_interrupted_land;
-use recovery::{
-    branch_checked_out_elsewhere, ensure_no_git_operation_in_progress, ensure_no_land_in_progress,
-    restore_head,
-};
+use recovery::{branch_checked_out_elsewhere, ensure_no_land_in_progress, restore_head};
 pub(crate) use recovery::{recovery_blocks_commands, undo};
 use state::*;
 pub(crate) use windows::Granularity;
@@ -26,8 +21,9 @@ use std::collections::HashSet;
 
 use crate::diff::ChangedFiles;
 use crate::git::{
-    Head, Hooks, KiteBase, branch_to_publish, check_ref, current_worktree_key, execute_git,
-    has_head_commit, has_remote, has_unmerged_paths, head_position, kite_save_stack, saved_changes,
+    Head, Hooks, KiteBase, branch_to_publish, changed_paths, check_ref, current_worktree_key,
+    ensure_no_git_operation, execute_git, has_head_commit, has_remote, has_unmerged_paths,
+    head_position, kite_save_stack, saved_changes,
 };
 use crate::synth::{CommitGroup, normalize_groups, sanitize_commit_message, synthesize_groups};
 use crate::ui::{Spinner, confirm, overflow_note, pluralize, print_ai_unavailable, prompt_line};
@@ -102,7 +98,7 @@ pub(crate) async fn land(options: LandOptions) -> Result<()> {
     };
     let expected_target = head_position()?;
     let expected_head = execute_git(&["rev-parse", "HEAD"])?;
-    let Some(scope) = collect_land_scope(allow_dirty, Some(&status))? else {
+    let Some(scope) = collect_land_scope(allow_dirty, &status)? else {
         return Ok(());
     };
 
@@ -257,7 +253,7 @@ fn land_preflight(push: bool) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    ensure_no_git_operation_in_progress("kt land")?;
+    ensure_no_git_operation("kt land")?;
     ensure_no_land_in_progress()?;
 
     // Landing itself works on a detached HEAD — it moves HEAD onto the landed
@@ -278,31 +274,13 @@ fn land_preflight(push: bool) -> Result<Option<String>> {
     Ok(Some(status))
 }
 
-/// `land_preflight` has already run when this is reached from `land`; the
-/// `status` it read is passed along so a large worktree is not walked twice.
-fn collect_land_scope(allow_dirty: bool, status: Option<&str>) -> Result<Option<LandScope>> {
-    if !has_head_commit() {
-        println!(
-            "{} No commits yet - make an initial commit before landing",
-            "·".yellow()
+/// Runs after `land_preflight`, which has confirmed there is a commit and read
+/// `status`, so a large worktree is not walked twice.
+fn collect_land_scope(allow_dirty: bool, status: &str) -> Result<Option<LandScope>> {
+    if !allow_dirty && !status.trim().is_empty() {
+        anyhow::bail!(
+            "Working directory must be clean before `kt land`. Run `kt` to snapshot current work, or use `kt land --allow-dirty` to stash it temporarily."
         );
-        return Ok(None);
-    }
-
-    if !allow_dirty {
-        let owned;
-        let status = match status {
-            Some(status) => status,
-            None => {
-                owned = execute_git(&["status", "--porcelain"])?;
-                &owned
-            }
-        };
-        if !status.trim().is_empty() {
-            anyhow::bail!(
-                "Working directory must be clean before `kt land`. Run `kt` to snapshot current work, or use `kt land --allow-dirty` to stash it temporarily."
-            );
-        }
     }
 
     let Some(stack) = kite_save_stack()? else {
@@ -393,20 +371,17 @@ fn render_land_plan(commits: &[CommitGroup], save_count: usize) -> String {
     plan
 }
 
+/// `plan_land` gives saves that cancel out at the root their one empty
+/// commit, so an empty plan here only ever removes saves.
 fn execute_land(base: &KiteBase, commits: &[CommitGroup], hooks: Hooks) -> Result<()> {
-    if commits.is_empty() && !saved_changes(base)?.0.is_empty() {
+    if commits.is_empty() && !changed_paths(&base.tree_ish()?, "HEAD")?.is_empty() {
         anyhow::bail!("Refusing to land an empty plan - that would discard the saves.");
     }
 
     run_land_transaction(|pre_land_sha, transaction_ref| {
         prepare_landing_head(base, pre_land_sha, transaction_ref)?;
-        let empty_root = [empty_initial_commit()];
-        let groups = if *base == KiteBase::Root && commits.is_empty() {
-            &empty_root
-        } else {
-            commits
-        };
-        create_commits(groups, hooks, &Staging::Worktree)
+        create_commits(commits, hooks, &Staging::Worktree, Tip::current()?)
+            .map(|(_, hook_changes)| hook_changes)
     })
 }
 
@@ -425,10 +400,12 @@ fn execute_windowed_land(base: &KiteBase, windows: &[WindowPlan], hooks: Hooks) 
 /// ref, and returns the files commit hooks changed. Whatever it leaves
 /// behind, a failure puts the user back where they started.
 fn run_land_transaction(build: impl FnOnce(&str, &str) -> Result<HashSet<String>>) -> Result<()> {
-    // Most callers pass through preflight, but keep the history-mutating core
-    // safe when invoked directly by tests or future commands.
-    ensure_no_git_operation_in_progress("kt land")?;
-    ensure_no_land_in_progress()?;
+    // Preflight checked these before planning, but the plan can take minutes
+    // to draft and review, and another worktree may land meanwhile.
+    ensure_no_git_operation("kt land")?;
+    // Kept so a land that fails cannot overwrite the rollback marker left by
+    // the last one that succeeded.
+    let previous_marker = PreLandMarker::capture(ensure_no_land_in_progress()?)?;
 
     if !execute_git(&["status", "--porcelain"])?.trim().is_empty() {
         anyhow::bail!(
@@ -446,9 +423,6 @@ fn run_land_transaction(build: impl FnOnce(&str, &str) -> Result<HashSet<String>
     // Hooks see a normal branch, and recovery can identify its exact ref.
     let transaction_ref = unique_kite_ref(TRANSACTION_REF_PREFIX);
 
-    // Kept so a land that fails cannot overwrite the rollback marker left by
-    // the last one that succeeded.
-    let previous_marker = PreLandMarker::capture();
     let transaction = install_in_progress_marker(
         &previous_marker,
         &pre_land_sha,
@@ -460,11 +434,11 @@ fn run_land_transaction(build: impl FnOnce(&str, &str) -> Result<HashSet<String>
     let rewrite = (|| -> Result<()> {
         let hook_changes = build(&pre_land_sha, &transaction_ref)?;
         verify_saved_tree(&pre_land_sha, &hook_changes)?;
-        stash::record_landed_head(execute_git(&["rev-parse", "HEAD"])?.trim())?;
-        finalize_landed_head(&target, &pre_land_sha, &transaction_ref)?;
-        let landed_head =
-            execute_git(&["rev-parse", "HEAD"]).context("Could not resolve the landed HEAD")?;
-        record_landed_head(&transaction, landed_head.trim())
+        let landed_head = check_ref(&transaction_ref)
+            .context("Kite's land transaction produced no commit to finalize")?;
+        stash::record_landed_head(&landed_head)?;
+        finalize_landed_head(&target, &pre_land_sha, &landed_head)?;
+        record_landed_head(&transaction, &landed_head)
             .context("Could not record the landed HEAD for `kt undo`")?;
         if !hook_changes.is_empty() {
             println!(
@@ -512,8 +486,8 @@ fn prepare_landing_head(base: &KiteBase, pre_land_sha: &str, transaction_ref: &s
 
     match base {
         KiteBase::Commit(base_sha) => {
-            execute_git(&["reset", "--soft", base_sha])?;
-            execute_git(&["reset"])?;
+            // Moves the transaction ref and the index; the files keep the saves.
+            execute_git(&["reset", "-q", base_sha])?;
         }
         KiteBase::Root => {
             // Deleting the ref while HEAD points to it creates an unborn
@@ -525,10 +499,10 @@ fn prepare_landing_head(base: &KiteBase, pre_land_sha: &str, transaction_ref: &s
     Ok(())
 }
 
-fn finalize_landed_head(target: &Head, pre_land_sha: &str, transaction_ref: &str) -> Result<()> {
-    let new_head = check_ref(transaction_ref)
-        .context("Kite's land transaction produced no commit to finalize")?;
-
+/// Moves the target onto the landed commits. The index and files already hold
+/// them, so only `HEAD` itself changes: a checkout would rescan the worktree
+/// and run post-checkout hooks, whose failure would undo a finished land.
+fn finalize_landed_head(target: &Head, pre_land_sha: &str, new_head: &str) -> Result<()> {
     match target {
         Head::Branch(branch) => {
             if branch_checked_out_elsewhere(branch)? {
@@ -536,23 +510,26 @@ fn finalize_landed_head(target: &Head, pre_land_sha: &str, transaction_ref: &str
                     "`{branch}` was checked out in another worktree while Kite was landing; it was left untouched"
                 );
             }
-            execute_git(&[
-                "update-ref",
-                &format!("refs/heads/{branch}"),
-                &new_head,
-                pre_land_sha,
-            ])
+            let branch_ref = format!("refs/heads/{branch}");
+            execute_git(&["update-ref", &branch_ref, new_head, pre_land_sha])
             .with_context(|| {
                 format!(
                     "`{branch}` moved while Kite was landing; its newer value was left untouched"
                 )
             })?;
-            execute_git(&["checkout", branch])?;
+            execute_git(&["symbolic-ref", "-m", "kt land", "HEAD", &branch_ref])?;
         }
         // Leave the landed result detached, not symbolically attached to
         // Kite's internal transaction ref.
         Head::Detached(_) => {
-            execute_git(&["checkout", "--detach", &new_head])?;
+            execute_git(&[
+                "update-ref",
+                "-m",
+                "kt land",
+                "--no-deref",
+                "HEAD",
+                new_head,
+            ])?;
         }
     }
     Ok(())

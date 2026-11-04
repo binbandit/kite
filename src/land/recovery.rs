@@ -1,9 +1,10 @@
 //! Undo saves and lands, or finish recovery after an interrupted command.
 
+use super::publish::remote_moved;
 use super::replay::remove_abandoned_checkout;
 use super::{stash, state::*};
 use crate::git::{
-    DETACHED_TARGET, Head, active_git_operation, check_ref, current_worktree_key, execute_git,
+    DETACHED_TARGET, Head, check_ref, current_worktree_key, ensure_no_git_operation, execute_git,
     has_head_commit, has_remote, head_position, head_symbolic_ref, is_ancestor, is_save_subject,
     short_sha,
 };
@@ -18,7 +19,7 @@ use colored::*;
 /// Running it repeatedly walks back through saves and then the land, which is
 /// the order they happened in.
 pub(crate) fn undo() -> Result<()> {
-    ensure_no_git_operation_in_progress("kt undo")?;
+    ensure_no_git_operation("kt undo")?;
 
     // An interrupted rewrite takes precedence over the save commit that Kite
     // was in the middle of replacing. Otherwise `kt undo` would peel saves
@@ -32,8 +33,8 @@ pub(crate) fn undo() -> Result<()> {
             }
         }
         PreLandState::Undoing(_) => return undo_last_land(),
-        PreLandState::Inconsistent => anyhow::bail!(
-            "Kite's rollback marker is incomplete, so it cannot be undone safely. Inspect `{PRE_LAND_REF}` and `{LAND_STATE_REF}`."
+        PreLandState::Inconsistent(problem) => anyhow::bail!(
+            "{problem}, so it cannot be undone safely. Inspect `{PRE_LAND_REF}` and `{LAND_STATE_REF}`."
         ),
         PreLandState::Empty { .. } | PreLandState::Completed(_) => {}
     }
@@ -184,8 +185,8 @@ pub(super) fn undo_last_land() -> Result<()> {
         PreLandState::InProgress(_) | PreLandState::LegacyInProgress { .. } => {
             anyhow::bail!("Recover the interrupted land before undoing a completed one")
         }
-        PreLandState::Inconsistent => anyhow::bail!(
-            "Kite's rollback marker is incomplete, so it cannot be undone safely. Inspect `{PRE_LAND_REF}` and `refs/kite/land_state`."
+        PreLandState::Inconsistent(problem) => anyhow::bail!(
+            "{problem}, so it cannot be undone safely. Inspect `{PRE_LAND_REF}` and `{LAND_STATE_REF}`."
         ),
     };
 
@@ -240,20 +241,15 @@ fn revert_published_land(branch: &str, land: &CompletedLand) {
     spinner.stop();
     match reverted {
         Ok(_) => println!("{} Restored the saves on `origin/{branch}`", "✓".green()),
-        Err(error) => {
-            let detail = flatten_error(&format!("{error:#}"));
-            if detail.contains("stale info") {
-                println!(
-                    "{} `origin/{branch}` moved since it was last fetched, so it was left untouched",
-                    "!".yellow()
-                );
-            } else {
-                println!(
-                    "{} Could not restore `origin/{branch}`: {detail}",
-                    "!".yellow()
-                );
-            }
-        }
+        Err(error) if remote_moved(&error) => println!(
+            "{} `origin/{branch}` moved since it was last fetched, so it was left untouched",
+            "!".yellow()
+        ),
+        Err(error) => println!(
+            "{} Could not restore `origin/{branch}`: {}",
+            "!".yellow(),
+            flatten_error(&format!("{error:#}"))
+        ),
     }
 }
 
@@ -285,7 +281,7 @@ pub(super) fn guard_undo_target(head: &Head, recorded: &CompletedMarker) -> Resu
             "The last land was on {}, but you are on {}. {} - undoing here would reset unrelated history.",
             describe_landed_target(&recorded.target),
             head.describe(),
-            recover_landed_target(&recorded.target, Some(recorded.landed_head.as_str()))
+            recover_landed_target(&recorded.target, &recorded.landed_head)
         );
     }
 
@@ -296,7 +292,7 @@ pub(super) fn guard_undo_target(head: &Head, recorded: &CompletedMarker) -> Resu
         let Some(landed_worktree) = recorded.owner.as_deref() else {
             anyhow::bail!(
                 "The last detached land has no worktree recorded, so Kite cannot undo it safely. {} and inspect it before retrying.",
-                recover_landed_target(&recorded.target, Some(recorded.landed_head.as_str()))
+                recover_landed_target(&recorded.target, &recorded.landed_head)
             );
         };
         let current_worktree = current_worktree_key()?;
@@ -325,14 +321,10 @@ pub(super) fn guard_undo_target(head: &Head, recorded: &CompletedMarker) -> Resu
         );
     }
 
-    let added = execute_git(&["log", "--format=%s", &format!("{landed_head}..HEAD")])
-        .map(|output| {
-            output
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count()
-        })
-        .unwrap_or(0);
+    let added: usize = execute_git(&["rev-list", "--count", &format!("{landed_head}..HEAD")])?
+        .trim()
+        .parse()
+        .context("Could not count the commits made since the land")?;
 
     if confirm(&format!(
         "{} has moved since that land. Undo will discard {} made since. Continue?",
@@ -379,6 +371,8 @@ pub(super) fn begin_completed_undo(
         },
     };
     let state_oid = write_land_record(&undoing)?;
+    // The first atomic record supersedes a marker an older Kite kept in config.
+    let replaces_legacy_marker = recorded.state_oid.is_none();
     let mut edits = vec![match recorded.state_oid {
         Some(old) => RefEdit::Update {
             name: LAND_STATE_REF.to_string(),
@@ -397,7 +391,9 @@ pub(super) fn begin_completed_undo(
         });
     }
     commit_ref_transaction(&edits).context("Could not reserve the completed land for undo")?;
-    clear_legacy_marker_config();
+    if replaces_legacy_marker {
+        clear_legacy_marker_config();
+    }
 
     Ok(UndoTransaction {
         state_oid,
@@ -507,12 +503,10 @@ pub(super) fn finish_completed_undo(transaction: &UndoTransaction) -> Result<()>
         Some(_) => anyhow::bail!("Kite's rollback ref moved; undo state was preserved"),
     }
     commit_ref_transaction(&edits)
-        .context("History was restored, but undo state could not be cleared")?;
-    clear_legacy_marker_config();
-    Ok(())
+        .context("History was restored, but undo state could not be cleared")
 }
 
-/// A recorded land target read back from config, which is a branch name or
+/// A recorded land target, which is a branch name or
 /// `DETACHED_TARGET` — never a `Head`, because the commit a detached land
 /// started from is not what the marker keeps.
 pub(super) fn describe_landed_target(landed_target: &str) -> String {
@@ -523,50 +517,31 @@ pub(super) fn describe_landed_target(landed_target: &str) -> String {
     }
 }
 
-/// How to get back to where a land happened. For a detached land that is the
-/// commit it left `HEAD` on, which the marker records; without it there is no
-/// name to offer, so the instruction stays honest about that.
-pub(super) fn recover_landed_target(landed_target: &str, landed_head: Option<&str>) -> String {
-    if landed_target != DETACHED_TARGET {
-        return format!("Run `git switch {landed_target}` first");
+/// How to get back to where a land happened: its branch, or for a detached
+/// land the commit it left `HEAD` on.
+pub(super) fn recover_landed_target(landed_target: &str, landed_head: &str) -> String {
+    if landed_target == DETACHED_TARGET {
+        format!("Check that commit out again with `git switch --detach {landed_head}`")
+    } else {
+        format!("Run `git switch {landed_target}` first")
     }
-
-    match landed_head {
-        Some(landed_head) => {
-            format!("Check that commit out again with `git switch --detach {landed_head}`")
-        }
-        None => "Check out the commit that land left behind first".to_string(),
-    }
-}
-
-/// Checks for a land that stopped after installing its rollback marker.
-///
-/// Returns `true` when this worktree owns an interrupted rewrite that requires
-/// an explicit `kt undo`. The owner identifies the worktree, but not its
-/// current detached history, so an arbitrary next command must never trigger a
-/// reset.
-#[cfg(test)]
-pub(crate) fn heal_interrupted_land() -> bool {
-    current_worktree_key()
-        .is_ok_and(|owner| pre_land_state().recovery_owner() == Some(owner.as_str()))
 }
 
 /// Other worktrees can keep working, but only the owner can recover a rewrite.
 pub(crate) fn recovery_blocks_commands() -> Result<bool> {
     let state = pre_land_state();
-    if matches!(state, PreLandState::Inconsistent) {
-        anyhow::bail!(
-            "Kite's rollback marker is incomplete. Run `kt undo` to inspect it before doing anything else."
-        );
+    if let PreLandState::Inconsistent(problem) = &state {
+        anyhow::bail!("{problem}. Run `kt undo` to inspect it before doing anything else.");
     }
     Ok(stash::is_pending()? || state.recovery_owner() == Some(current_worktree_key()?.as_str()))
 }
 
-pub(super) fn ensure_no_land_in_progress() -> Result<()> {
+/// Returns the settled marker it read, which a land then replaces.
+pub(super) fn ensure_no_land_in_progress() -> Result<PreLandState> {
     let state = pre_land_state();
-    if matches!(state, PreLandState::Inconsistent) {
+    if let PreLandState::Inconsistent(problem) = &state {
         anyhow::bail!(
-            "Kite's rollback marker is incomplete. Inspect `{PRE_LAND_REF}` and `{LAND_STATE_REF}` before continuing."
+            "{problem}. Inspect `{PRE_LAND_REF}` and `{LAND_STATE_REF}` before continuing."
         );
     }
     if let Some(owner) = state.recovery_owner() {
@@ -579,16 +554,7 @@ pub(super) fn ensure_no_land_in_progress() -> Result<()> {
             "An earlier `kt land` is still in progress in {location} ({owner}). Run `kt undo` in its worktree before starting another land."
         );
     }
-    Ok(())
-}
-
-pub(super) fn ensure_no_git_operation_in_progress(command: &str) -> Result<()> {
-    if let Some(operation) = active_git_operation()? {
-        anyhow::bail!(
-            "Git has a {operation} in progress. Finish or abort it before running `{command}`."
-        );
-    }
-    Ok(())
+    Ok(state)
 }
 
 /// Undoes a failed or interrupted landing attempt, leaving the user exactly
@@ -650,23 +616,31 @@ pub(super) fn restore_head(target: &Head, pre_land_sha: &str, transaction_ref: &
             if current_branch == Some(branch) {
                 execute_git(&["reset", "--mixed", pre_land_sha])?;
             } else if branch_checked_out_elsewhere(branch)? {
-                execute_git(&["checkout", "--detach", pre_land_sha])?;
+                checkout(&["--detach", pre_land_sha])?;
                 println!(
                     "{} `{branch}` is checked out in another worktree; recovery left this worktree detached at its saved commit",
                     "·".yellow()
                 );
             } else {
-                execute_git(&["checkout", branch])?;
+                checkout(&[branch])?;
             }
         }
         Head::Detached(_) => {
             if !on_transaction {
                 execute_git(&["reset", "--mixed", pre_land_sha])?;
             }
-            execute_git(&["checkout", "--detach", pre_land_sha])?;
+            checkout(&["--detach", pre_land_sha])?;
         }
     }
     Ok(())
+}
+
+/// Recovery's checkouts can move files, so they stay checkouts, but a failing
+/// post-checkout hook must not report a finished recovery as failed.
+fn checkout(args: &[&str]) -> Result<String> {
+    let mut command = vec!["-c", "core.hooksPath=/dev/null", "checkout"];
+    command.extend(args);
+    execute_git(&command)
 }
 
 pub(super) fn restore_branch_ref(
