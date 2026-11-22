@@ -12,9 +12,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use colored::*;
-use jiff::{Timestamp, tz::TimeZone};
+use jiff::Timestamp;
 
 use crate::ai;
+use crate::clock;
 use crate::diff::{ChangedFiles, MAX_DIFF_BYTES};
 use crate::git::{KiteBase, Save, changes_between, kite_saves};
 use crate::synth::{
@@ -374,11 +375,7 @@ pub(super) fn render_history_plan(plan: &HistoryPlan) -> String {
 
 /// When a window's saves were made, in local time: `Oct 17 22:22-23:05`.
 fn describe_times(saves: &[Save]) -> String {
-    let local = |save: &Save| {
-        Timestamp::from_second(save.time)
-            .ok()
-            .map(|time| time.to_zoned_datetime(TimeZone::system()))
-    };
+    let local = |save: &Save| Timestamp::from_second(save.time).ok().map(clock::local);
     let (Some(first), Some(last)) = (saves.first().and_then(local), saves.last().and_then(local))
     else {
         return String::new();

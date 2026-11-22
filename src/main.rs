@@ -1,4 +1,5 @@
 mod ai;
+mod clock;
 mod diff;
 mod git;
 mod land;
@@ -14,7 +15,6 @@ mod test_support;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use colored::*;
-use jiff::ZonedDateTime;
 use std::process::ExitCode;
 
 use crate::git::{
@@ -245,10 +245,7 @@ fn save() -> Result<()> {
         );
     }
 
-    let msg = format!(
-        "{SAVE_PREFIX} {}",
-        ZonedDateTime::now().strftime("%H:%M:%S")
-    );
+    let msg = format!("{SAVE_PREFIX} {}", clock::now().strftime("%H:%M:%S"));
     commit_git(&msg, Hooks::Skip)?;
 
     println!(
