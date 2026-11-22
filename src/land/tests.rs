@@ -228,7 +228,7 @@ fn collect_land_scope_allows_dirty_worktree_with_allow_dirty() {
         .expect("kite saves should be landable");
     assert!(matches!(scope.base, KiteBase::Commit(_)));
     assert_eq!(scope.save_count, 1);
-    assert!(scope.files.paths().contains(&"tracked.txt".to_string()));
+    assert!(scope.files.paths().iter().any(|path| path == "tracked.txt"));
 }
 
 #[test]

@@ -1,4 +1,5 @@
 mod ai;
+mod clock;
 mod diff;
 mod git;
 mod land;
@@ -12,7 +13,6 @@ mod ui;
 mod test_support;
 
 use anyhow::{Context, Result};
-use chrono::Local;
 use clap::{CommandFactory, Parser, Subcommand};
 use colored::*;
 use std::process::ExitCode;
@@ -245,7 +245,7 @@ fn save() -> Result<()> {
         );
     }
 
-    let msg = format!("{SAVE_PREFIX} {}", Local::now().format("%H:%M:%S"));
+    let msg = format!("{SAVE_PREFIX} {}", clock::now().strftime("%H:%M:%S"));
     commit_git(&msg, Hooks::Skip)?;
 
     println!(

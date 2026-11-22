@@ -3,9 +3,9 @@
 //! A land moves from Landing to Completed; undo moves through Undoing to Empty.
 //! The old commits remain reachable until the corresponding transition finishes.
 
+use crate::clock;
 use crate::git::{check_ref, execute_git, execute_git_with};
 use anyhow::{Context, Result};
-use chrono::Local;
 use serde::{Deserialize, Serialize};
 
 /// Where the pre-land `HEAD` is parked so `kt undo` can restore it, plus the
@@ -300,7 +300,7 @@ pub(super) struct UndoTransaction {
 pub(super) fn unique_kite_ref(prefix: &str) -> String {
     format!(
         "{prefix}{}-{}-{}",
-        Local::now().format("%Y%m%d%H%M%S"),
+        clock::now().strftime("%Y%m%d%H%M%S"),
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
