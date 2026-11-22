@@ -10,9 +10,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Local};
 use clap::ValueEnum;
 use colored::*;
+use jiff::{Timestamp, tz::TimeZone};
 
 use crate::ai;
 use crate::diff::{ChangedFiles, MAX_DIFF_BYTES};
@@ -374,21 +374,28 @@ pub(super) fn render_history_plan(plan: &HistoryPlan) -> String {
 
 /// When a window's saves were made, in local time: `Oct 17 22:22-23:05`.
 fn describe_times(saves: &[Save]) -> String {
-    let local =
-        |save: &Save| DateTime::from_timestamp(save.time, 0).map(|time| time.with_timezone(&Local));
+    let local = |save: &Save| {
+        Timestamp::from_second(save.time)
+            .ok()
+            .map(|time| time.to_zoned_datetime(TimeZone::system()))
+    };
     let (Some(first), Some(last)) = (saves.first().and_then(local), saves.last().and_then(local))
     else {
         return String::new();
     };
     if saves.len() == 1 || first == last {
-        first.format("%b %-d %H:%M").to_string()
-    } else if first.date_naive() == last.date_naive() {
-        format!("{}-{}", first.format("%b %-d %H:%M"), last.format("%H:%M"))
+        first.strftime("%b %-d %H:%M").to_string()
+    } else if first.date() == last.date() {
+        format!(
+            "{}-{}",
+            first.strftime("%b %-d %H:%M"),
+            last.strftime("%H:%M")
+        )
     } else {
         format!(
             "{} - {}",
-            first.format("%b %-d %H:%M"),
-            last.format("%b %-d %H:%M")
+            first.strftime("%b %-d %H:%M"),
+            last.strftime("%b %-d %H:%M")
         )
     }
 }
